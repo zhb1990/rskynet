@@ -1,0 +1,31 @@
+# Rust / Cargo
+/target/
+**/target/
+Cargo.lock.bak
+
+# 调试与性能分析
+*.pdb
+*.profraw
+*.profdata
+perf.data
+perf.data.old
+
+# 环境与本地配置
+.env
+.env.*
+!.env.example
+
+# IDE / 编辑器
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# 备份与临时文件
+*.bak
+*.tmp
+*.temp
+*.log
