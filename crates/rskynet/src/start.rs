@@ -146,7 +146,7 @@ pub fn start(config: Config, registry: Registry) -> Result<()> {
             let weight = WORKER_WEIGHTS.get(id).copied().unwrap_or(0);
             thread::Builder::new()
                 .name(format!("rskynet-worker-{id}"))
-                .spawn_scoped(scope, move || worker_loop(shared, weight))
+                .spawn_scoped(scope, move || worker_loop(shared, id, weight))
                 .expect("worker 线程创建失败");
         }
     });
@@ -162,37 +162,45 @@ pub fn start(config: Config, registry: Registry) -> Result<()> {
 }
 
 /// worker 主循环，对照 C 版 `thread_worker`。
-fn worker_loop(node: &Node, weight: i32) {
+fn worker_loop(node: &Node, id: usize, weight: i32) {
+    // 绑定本线程的运行队列：从此本线程的投递与取活优先走它，取空了才去偷别人的
+    let _worker = node.sched.register_worker(id);
     let mut hold = None;
-    while !node.global.is_quit() {
+    while !node.sched.is_quit() {
+        // 序列号要在**开始找活之前**取，否则「扫完队列」到「睡下」之间的投递会被漏掉
+        let seq = node.sched.notify_seq();
         hold = node.dispatch(hold.take(), weight);
         if hold.is_none() {
-            // 没活干就睡在全局队列的条件变量上，等新消息或退出信号
-            node.global.wait_for_work();
+            node.sched.wait_for_work(seq);
         }
     }
-    // 收工时手里可能还捏着一个服务：它的 in_global 仍是置位的，却已经不在全局
+    // 收工时手里可能还捏着一个服务：它的 in_global 仍是置位的，却已经不在运行
     // 队列里了。必须放回去，否则收尾流程找不到它，它邮箱里的消息（比如最后几条
     // 日志）就永远没人处理。
     if let Some(ctx) = hold {
-        node.global.push(ctx);
+        node.sched.push(ctx);
     }
+    // 本地队列里剩下的服务同理。收尾在主线程上做，而主线程取不到别人的本地队列，
+    // 所以必须由 owner 自己倒进 injector。
+    node.sched.flush_local();
 }
 
 /// 定时器主循环，对照 C 版 `thread_timer`。
 fn timer_loop(node: &Node) {
-    while !node.global.is_quit() {
+    while !node.sched.is_quit() {
         node.fire_timers();
         if node.total() == 0 {
             break;
         }
-        node.global.poke();
+        node.sched.poke();
         thread::sleep(Duration::from_micros(2500));
     }
-    node.global.set_quit();
+    node.sched.set_quit();
 }
 
-/// 在当前线程上把全局队列里剩下的活干完，用于启动失败或退出时刷日志。
+/// 在当前线程上把运行队列里剩下的活干完，用于启动失败或退出时刷日志。
+///
+/// 主线程没有本地队列，只取 injector——此时 worker 都已收工并把本地队列倒进去了。
 fn drain(node: &Node) {
     let mut hold = None;
     loop {

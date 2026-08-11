@@ -3,6 +3,7 @@
 //! 套路是固定的：注册一个「驱动」服务，它在 init 里执行用例逻辑、把观察到的
 //! 现象写进共享记录，最后 `abort` 关停节点；`start` 返回后再断言记录内容。
 
+use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -115,6 +116,48 @@ impl Service for Stillborn {
 
     fn dispatch(self: Arc<Self>, _ctx: Ctx, _msg: Message) -> BoxFuture<'static, ()> {
         Box::pin(async {})
+    }
+}
+
+/// 告诉中转站它在环上的下家是谁。
+const SETUP: MsgType = MsgType(50);
+/// 一个正在环上转圈的令牌，负载是还剩几跳。
+const TOKEN: MsgType = MsgType(51);
+
+/// 调度压测的共享记账。
+#[derive(Default)]
+struct RelayShared {
+    started: Mutex<Option<Instant>>,
+    /// 最后一个令牌停下时由它自己记下总耗时，免得读数被驱动方的轮询精度污染。
+    elapsed: Mutex<Option<std::time::Duration>>,
+    finished: AtomicU64,
+    hops: AtomicU64,
+}
+
+/// 环上的一个中转站：收到令牌就传给下家，直到令牌跑完预定的跳数。
+struct Relay {
+    next: SvcCell<u32>,
+    shared: Arc<RelayShared>,
+}
+
+impl Service for Relay {
+    fn dispatch(self: Arc<Self>, ctx: Ctx, mut msg: Message) -> BoxFuture<'static, ()> {
+        Box::pin(async move {
+            let payload = msg.take_payload();
+            if msg.mtype == SETUP {
+                self.next.set(*payload.downcast::<u32>().unwrap());
+                return;
+            }
+            let left = *payload.downcast::<u64>().unwrap();
+            self.shared.hops.fetch_add(1, SeqCst);
+            if left > 1 {
+                let _ = ctx.send(self.next.get(), TOKEN, Payload::of(left - 1));
+            } else if self.shared.finished.fetch_add(1, SeqCst) == 0 {
+                // 第一个停下的令牌来记时：此刻其余令牌也都到期了，误差在一跳之内
+                let started = self.shared.started.lock().unwrap().unwrap();
+                *self.shared.elapsed.lock().unwrap() = Some(started.elapsed());
+            }
+        })
     }
 }
 
@@ -443,6 +486,90 @@ fn throughput_one_million_messages() {
         })
     });
     assert_eq!(seen, vec![TOTAL.to_string()], "一条都不能丢");
+}
+
+/// 压测：一堆服务同时可运行时的调度吞吐。
+///
+/// 上一条压测只有一个收件人，压的是它那把邮箱锁；这条把 64 个服务串成一个环、
+/// 同时放 64 个令牌进去转圈，每一跳都要把一个服务重新推进运行队列再取出来，
+/// 压的是调度器本身。
+///
+/// 默认跳过，跑法：`cargo test --release -- --ignored --nocapture`
+#[test]
+#[ignore = "压测，请用 cargo test --release -- --ignored 运行"]
+fn scheduling_throughput_across_many_services() {
+    const SERVICES: usize = 64;
+    const TOKENS: usize = 64;
+    const HOPS_PER_TOKEN: u64 = 10_000;
+    /// 固定线程数：令牌数远多于线程数，worker 一直有活干，读数才反映队列本身的
+    /// 开销而不是线程反复挂起唤醒的开销。
+    const THREADS: usize = 4;
+
+    let shared = Arc::new(RelayShared::default());
+    let relay_state = shared.clone();
+    let scenario_state = shared.clone();
+    let journal: Journal = Arc::new(Mutex::new(Vec::new()));
+    let scenario_journal = journal.clone();
+
+    let registry = Registry::new()
+        .with_builtins()
+        .with("relay", move || Relay {
+            next: SvcCell::new(0),
+            shared: relay_state.clone(),
+        })
+        .with("driver", move || Driver {
+            journal: scenario_journal.clone(),
+            scenario: {
+                let shared = scenario_state.clone();
+                Arc::new(move |ctx: Ctx, journal: Journal| {
+                    let shared = shared.clone();
+                    Box::pin(async move {
+                        let mut ring = Vec::with_capacity(SERVICES);
+                        for _ in 0..SERVICES {
+                            ring.push(ctx.launch("relay", "").await.unwrap());
+                        }
+                        // 先把环接好。这些 SETUP 都排在令牌之前进各自的邮箱，
+                        // 所以任何一个中转站收到令牌时一定已经知道下家是谁
+                        for (index, handle) in ring.iter().enumerate() {
+                            let next = ring[(index + 1) % SERVICES];
+                            ctx.send(*handle, SETUP, Payload::of(next)).unwrap();
+                        }
+
+                        *shared.started.lock().unwrap() = Some(Instant::now());
+                        for token in 0..TOKENS {
+                            let entry = ring[token * SERVICES / TOKENS];
+                            ctx.send(entry, TOKEN, Payload::of(HOPS_PER_TOKEN)).unwrap();
+                        }
+                        // 收尾时刻由最后一个令牌自己记下，所以这里的轮询精度不影响读数
+                        while shared.finished.load(SeqCst) < TOKENS as u64 {
+                            ctx.sleep(1).await;
+                        }
+
+                        let elapsed = shared.elapsed.lock().unwrap().unwrap();
+                        let hops = TOKENS as u64 * HOPS_PER_TOKEN;
+                        note(&journal, hops.to_string());
+                        println!(
+                            "{THREADS} 线程 / {SERVICES} 个服务 × {TOKENS} 个令牌共接力 {hops} 跳，耗时 {elapsed:?}，约 {:.2} 万次调度/秒",
+                            hops as f64 / elapsed.as_secs_f64() / 10_000.0
+                        );
+                    })
+                })
+            },
+        });
+
+    rskynet::start(
+        Config::default()
+            .with_thread(THREADS)
+            .with_bootstrap("bootstrap driver"),
+        registry,
+    )
+    .unwrap();
+
+    assert_eq!(
+        shared.hops.load(SeqCst),
+        TOKENS as u64 * HOPS_PER_TOKEN,
+        "一跳都不能丢"
+    );
 }
 
 /// 引导服务不存在时，启动阶段就要报错

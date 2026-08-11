@@ -43,6 +43,7 @@
 //! rskynet::start(config, registry).unwrap();
 //! ```
 
+mod bwos;
 mod context;
 mod error;
 mod handle;

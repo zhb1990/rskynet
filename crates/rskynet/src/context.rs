@@ -285,9 +285,11 @@ impl Ctx {
         self.inner.node.total()
     }
 
-    /// 全局队列里排队的服务数，观察负载用。
+    /// 运行队列里排队的服务数，观察负载用。
+    ///
+    /// 队列按 worker 拆开之后这个数字是各队列长度之和，允许短暂不精确。
     pub fn runnable_services(&self) -> usize {
-        self.inner.node.global.len()
+        self.inner.node.sched.len()
     }
 }
 

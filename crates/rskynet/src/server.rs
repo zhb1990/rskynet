@@ -24,7 +24,7 @@ use crate::error::{Error, Result};
 use crate::handle::HandleStorage;
 use crate::message::{Addr, Message, MsgType, Payload};
 use crate::module::Registry;
-use crate::mq::{GlobalQueue, Mailbox, Work};
+use crate::mq::{Mailbox, Scheduler, Work};
 use crate::session::SessionTable;
 use crate::start::Config;
 use crate::task::TaskSet;
@@ -79,14 +79,14 @@ impl ServiceContext {
     /// 投递一条消息。这是所有消息进入服务的唯一入口。
     pub(crate) fn push(&self, msg: Message) {
         if self.mailbox.push_message(msg) {
-            self.node.global.push(self.arc());
+            self.node.sched.push(self.arc());
         }
     }
 
-    /// 唤醒服务内的某个任务，与消息投递走同一条「进入全局队列」的路径。
+    /// 唤醒服务内的某个任务，与消息投递走同一条「进入运行队列」的路径。
     pub(crate) fn wake_task(&self, task: usize) {
         if self.mailbox.push_ready(task) {
-            self.node.global.push(self.arc());
+            self.node.sched.push(self.arc());
         }
     }
 
@@ -207,14 +207,14 @@ impl ServiceContext {
         let tasks = self.tasks.drain();
         drop(tasks);
         self.sessions.clear();
-        // 让清理之后迟到的消息还能把自己重新推进全局队列，从而被再清一次
+        // 让清理之后迟到的消息还能把自己重新推进运行队列，从而被再清一次
         self.mailbox.reset_in_global();
     }
 }
 
 /// 一个 rskynet 节点。
 pub(crate) struct Node {
-    pub(crate) global: GlobalQueue,
+    pub(crate) sched: Scheduler,
     pub(crate) handles: HandleStorage,
     pub(crate) timer: Timer,
     modules: Registry,
@@ -228,7 +228,7 @@ pub(crate) struct Node {
 impl Node {
     pub(crate) fn new(config: &Config, modules: Registry) -> Arc<Node> {
         Arc::new(Node {
-            global: GlobalQueue::new(),
+            sched: Scheduler::new(config.thread),
             handles: HandleStorage::new(config.harbor),
             timer: Timer::new(),
             modules,
@@ -355,7 +355,7 @@ impl Node {
 
         self.log(handle, format!("LAUNCH {kind} {args}"));
         // in_global 自创建起就是置位的，这里补上真正的入队，服务开始接受调度
-        self.global.push(ctx);
+        self.sched.push(ctx);
         Ok(handle)
     }
 
@@ -372,7 +372,7 @@ impl Node {
                 // 趁请求还记在账上，立刻通知所有等着本服务回话的人
                 ctx.fail_inflight();
                 if ctx.mailbox.mark_in_global() {
-                    self.global.push(ctx);
+                    self.sched.push(ctx);
                 }
                 true
             }
@@ -420,7 +420,7 @@ impl Node {
         }
         if self.total.fetch_sub(1, Ordering::AcqRel) <= 1 {
             // 最后一个服务也走了，通知 worker 收工，对照 C 版的 CHECK_ABORT
-            self.global.set_quit();
+            self.sched.set_quit();
         }
     }
 
@@ -434,11 +434,11 @@ impl Node {
     ) -> Option<Arc<ServiceContext>> {
         let ctx = match hold {
             Some(ctx) => ctx,
-            None => self.global.pop()?,
+            None => self.sched.pop()?,
         };
         if ctx.is_dead() {
             self.destroy(&ctx);
-            return self.global.pop();
+            return self.sched.pop();
         }
 
         // 权重批处理：weight 为负表示一次只处理一条消息，否则处理 len >> weight 条
@@ -447,7 +447,7 @@ impl Node {
         loop {
             match ctx.mailbox.take_work() {
                 // 邮箱和就绪队列都空了，in_global 已被清掉，把这个服务放生
-                None => return self.global.pop(),
+                None => return self.sched.pop(),
                 Some(Work::Task(task)) => ctx.poll_task(task),
                 Some(Work::Message(msg)) => {
                     if handled == 0 && weight >= 0 {
@@ -466,17 +466,17 @@ impl Node {
             }
             if ctx.is_dead() {
                 self.destroy(&ctx);
-                return self.global.pop();
+                return self.sched.pop();
             }
             if handled >= budget {
                 break;
             }
         }
 
-        // 让渡：全局队列里还有别的服务在等，就把自己排到队尾去
-        match self.global.pop() {
+        // 让渡：运行队列里还有别的服务在等，就把自己交回去
+        match self.sched.pop() {
             Some(next) => {
-                self.global.push(ctx);
+                self.sched.push(ctx);
                 Some(next)
             }
             None => Some(ctx),
@@ -541,15 +541,20 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn test_node() -> Arc<Node> {
-        Node::new(
-            &Config::default(),
-            Registry::new().with("null", NullService::default),
-        )
+        test_node_with(Config::default())
+    }
+
+    pub(crate) fn test_node_with(config: Config) -> Arc<Node> {
+        Node::new(&config, Registry::new().with("null", NullService::default))
     }
 
     /// 给 handle 表的单元测试用：造一个不参与调度的空壳上下文。
     pub(crate) fn dummy_context(handle: u32) -> Arc<ServiceContext> {
-        let node = test_node();
+        dummy_context_on(test_node(), handle)
+    }
+
+    /// 同上，但挂在指定节点下，好让一批上下文共用一个调度器。
+    pub(crate) fn dummy_context_on(node: Arc<Node>, handle: u32) -> Arc<ServiceContext> {
         Arc::new_cyclic(|me| ServiceContext {
             handle,
             kind: "null".to_string(),
@@ -599,7 +604,7 @@ pub(crate) mod tests {
         // 销毁由 worker 完成：跑一轮调度即可
         assert!(node.dispatch(None, 0).is_none());
         assert_eq!(node.total(), 0);
-        assert!(node.global.is_quit(), "服务数归零应通知 worker 收工");
+        assert!(node.sched.is_quit(), "服务数归零应通知 worker 收工");
     }
 
     /// 发给不存在的地址应当报错而不是悄悄丢弃
