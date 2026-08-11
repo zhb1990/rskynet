@@ -1,0 +1,16 @@
+[package]
+name = "rskynet"
+description = "用 Rust 复刻 skynet 的 Actor 内核：每服务邮箱 + 全局队列 + worker 线程池，以 Future 取代 Lua 协程"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+futures-util = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }
+slab = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }

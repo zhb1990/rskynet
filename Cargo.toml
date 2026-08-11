@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = ["crates/rskynet"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/zhuhb/rskynet"
+
+# 统一管理依赖版本，后续新增 rskynet-net / rskynet-cluster 等成员时直接复用
+[workspace.dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+slab = "0.4"
+thiserror = "2"
+toml = "0.9"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
