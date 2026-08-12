@@ -180,7 +180,7 @@ impl Echo {
 }
 
 fn main() -> Result<()> {
-    // 日志、定时器、引导这三个内置服务由 rskynet::start 按 feature 挂上
+    // 日志、信号、定时器、引导这些内置服务由 rskynet::start 按 feature 挂上
     let registry = Registry::new().with("echo", || Echo);
     let config = Config::default().with_bootstrap(["echo"]);
     rskynet::start(config, registry)
@@ -282,6 +282,7 @@ impl Calculator {
 | `rskynet-logger` | `service_logger.c` | 日志服务（独占一条线程） |
 | `rskynet-timer` | `skynet_timer.c` + `thread_timer` | 分层时间轮（256 格近期轮 + 4 层 64 格，精度 10ms）与推着它走的定时器服务 |
 | `rskynet-bootstrap` | `bootstrap.lua` | 引导服务 |
+| `rskynet-signal` | OS signal / exception | 普通信号回调、优雅关停与独立崩溃报告进程 |
 | `rskynet-net` | `socket_server.c` | TCP / UDP 网络层、槽位状态机、背压与域名解析 |
 | `rskynet-macros` | `lualib/skynet.lua` 的协议分发样板 | `service` / `exclusive` / `msg` 过程宏 |
 
@@ -305,7 +306,7 @@ struct Counter { hits: SvcCell<u64> }
 
 - **全局队列换成每 worker 一条的窃取队列**：见上文「运行队列」。
 - **专用线程改成独占线程的服务**：C 版的定时器线程与 socket 线程是内核里两块独立代码，这里它们是普通服务，只是各占一条线程，见上文「独占一条线程的服务」。内核因此不必再为「跟着节点起落的线程」单开扩展点。
-- **内置服务全部搬出内核**：日志、定时器、引导各是一个独立 crate，与网络层同一套接入方式；时间也随定时器一起搬走，内核只留一个必须注入的 `Timer` 抽象，见下文「内核里为什么没有服务」。
+- **内置服务全部搬出内核**：日志、信号、定时器、引导各是一个独立 crate，与网络层同一套接入方式；时间也随定时器一起搬走，内核只留一个必须注入的 `Timer` 抽象，见下文「内核里为什么没有服务」。
 - **投递即唤醒**：C 版 `skynet_globalmq_push` 不唤醒 worker，靠定时器线程每 2.5ms 顺手唤醒，代价是所有 worker 都睡着时消息最坏要等一个 tick。这里改成投递方按空闲位图点名叫一个具体的 worker，延迟更低；定时器那记兜底唤醒保留。
 - **消息路径上没有锁**：邮箱、injector、唤醒、handle 表原先各有一把锁，一条消息从发出到被处理要抢四把。现在邮箱与 injector 是无锁队列，唤醒是位图加 `park`/`unpark`，handle 表与名字表用 `arc-swap` 做快照读（`grab()` 常态下连 RMW 都没有，`ctx.request(".pong", …)` 这种每次按名字寻址的写法也不再抢锁）。挂定时器同样不再抢时间轮的锁：投递方把事件压进一条无锁队列，定时器服务每 tick 排空后插进轮子——精度本来就是 10ms，晚一个 tick 插入无影响。`parking_lot` 只留给写者互斥这类冷路径（handle 分配、槽位扩容）。
 - **节点不再是全局单例**：C 版用文件级静态变量，这里收进 `Arc<Node>`，同进程可以跑多个互不干扰的节点，单元测试因此能并行。
@@ -314,7 +315,7 @@ struct Counter { hits: SvcCell<u64> }
 
 ## 现状与边界
 
-已实现：服务生命周期（launch / exit / kill / abort）、消息与自定义协议号、session RPC、服务内并发、本地名字表、分层时间轮、独占线程的服务（日志、定时器与网络层都是）、引导服务、TCP / UDP、过程宏、TOML 配置、worker 权重调度与工作窃取、过载检测、退出时给在途请求回错误。
+已实现：服务生命周期（launch / exit / kill / abort）、消息与自定义协议号、session RPC、服务内并发、本地名字表、分层时间轮、独占线程的服务、引导服务、TCP / UDP、信号回调与默认优雅关停、独立进程 minidump/堆栈报告、过程宏、TOML 配置、worker 权重调度与工作窃取、过载检测、退出时给在途请求回错误。
 
 尚未实现（下一版）：gate / agent、harbor / cluster 跨节点、monitor 死循环检测、debug_console、消息序列化协议。
 
@@ -353,11 +354,12 @@ crates/rskynet-core/       内核
 crates/rskynet/            门面：按 feature 把下面几个拼在一处，使用方只依赖它
   tests/kernel.rs          端到端测试
   tests/exclusive.rs       独占线程服务的端到端验证
-  tests/builtins.rs        三个内置服务与内核的接缝：启动顺序、配置默认值、时间来源
+  tests/builtins.rs        内置服务与内核的接缝：启动顺序、配置默认值、时间来源
 crates/rskynet-logger/     日志服务，一个独占线程的服务
 crates/rskynet-timer/      分层时间轮与定时器服务
 crates/rskynet-bootstrap/  引导服务
-crates/rskynet-macros/     service / exclusive / msg 过程宏
+crates/rskynet-macros/     service / exclusive / msg / signal 过程宏
+crates/rskynet-signal/     进程信号、优雅关停与独立崩溃报告
 crates/rskynet-net/        TCP + UDP 网络层，一个独占线程的服务
 crates/rskynet-examples/   Ping / Pong / Echo 与统一示例入口
 ```
@@ -365,7 +367,7 @@ crates/rskynet-examples/   Ping / Pong / Echo 与统一示例入口
 使用方只写一行依赖，要什么按 feature 开：
 
 ```toml
-rskynet = { version = "0.1", features = ["net"] }   # macros / logger / timer / bootstrap / main 默认已开
+rskynet = { version = "0.1", features = ["net"] }   # macros / logger / timer / bootstrap / signal / main 默认已开
 ```
 
 业务代码不需要放进本仓：`rskynet` 是 lib crate，对外提供 `Service` trait 与 `rskynet::start(config, registry)`，使用方在自己的 app crate 里写 `main` 并注册服务——对应 skynet 里「内核是宿主、服务是外挂模块」的形态。
@@ -394,6 +396,33 @@ fn main() -> std::process::ExitCode {
 }
 ```
 
+标准入口会自动启动同一可执行文件的隐藏 crash helper。自定义入口要在解析自己的
+参数之前安装，并把 guard 留到进程结束：
+
+```rust
+fn main() -> rskynet::Result<()> {
+    let _crash = rskynet::crash::install()?;
+    // 构造 Config / Registry，随后 rskynet::start(...)
+    Ok(())
+}
+```
+
+Unix 的 `SIGINT` 与 `SIGTERM`、Windows 的 Ctrl+C 默认调用 `Ctx::abort()` 优雅
+关停。属性宏可以覆盖某个信号的默认行为：
+
+```rust
+#[rskynet::signal(SIGTERM)]
+fn on_term(ctx: &rskynet::Ctx) {
+    ctx.abort();
+}
+```
+
+回调固定为同步 `fn(&Ctx)`，在信号服务的独占线程上执行，不在 OS signal handler
+里运行。支持 `SIGINT` / `SIGTERM` / `SIGHUP` / `SIGQUIT` / `SIGUSR1` / `SIGUSR2`；
+致命信号由 crash helper 独占。同一信号只能注册一次，重复会产生同名导出符号并
+让编译失败。panic 或原生崩溃会在 `./crash/` 下生成同名的
+`<pid>-<毫秒时间戳>.log` 与 `.dmp`，文本报告也会打印到 stderr。
+
 它要求命令行提供一份 TOML，并从已经链接进当前二进制的服务中构造注册表。配置
 只能选择启动哪些已链接服务，不能动态加载未成为应用依赖的 Rust crate。仓库内示例：
 
@@ -419,9 +448,9 @@ pub trait Timer: Send + Sync + 'static {
 
 `ctx.sleep()` 是往它记一笔账，`ctx.now()` 是问它要个数——都是同步的本地调用，不走消息（日志每写一行都要读时间，走一趟邮箱不划算）。`rskynet-timer` 提供的实现分成配合的两半：**记账**的那一半（`WheelTimer`，注入给内核的就是它）和**推刻度**的那一半（`TimerService`，一个独占线程的服务）。分家的好处是记账那一半在节点建起来之前就存在，于是引导期间挂的表一条都不会丢，哪怕那时推刻度的线程还没上线。
 
-三个系统服务的启动顺序是**日志 → 定时器 → 引导**。日志最先，好让后面每一步的岔子都有人记；定时器排在引导之前，于是引导期间刻度就在走——引导拉起的服务在 `init` 里 `sleep` 立刻开始计时，日志时间戳也不再是一片 0。代价是定时器不能光看「服务数归零」就宣布收工（它出场时服务数本来就是 0），得先问一句 `node.is_booted()`。
+四个系统服务的启动顺序是**日志 → 信号 → 定时器 → 引导**。日志最先，好让后面每一步的岔子都有人记；信号服务在业务服务之前就绪；定时器排在引导之前，于是引导期间刻度就在走——引导拉起的服务在 `init` 里 `sleep` 立刻开始计时，日志时间戳也不再是一片 0。代价是定时器不能光看「服务数归零」就宣布收工（它出场时服务数本来就是 0），得先问一句 `node.is_booted()`。
 
-内核为此保留的只有三个约定名字（`logger` / `timer` / `bootstrap`）与拉起它们的顺序。类型名可以在配置里换成自己的实现，写成空串就是不拉起：
+内核为此保留四个约定名字（`logger` / `signal` / `timer` / `bootstrap`）与拉起顺序。类型名可以在配置里换成自己的实现，写成空串就是不拉起：
 
 ```toml
 [logger]

@@ -38,7 +38,7 @@
 //! rskynet::start(config, registry).unwrap();
 //! ```
 //!
-//! 日志、定时器、引导这三个服务不必自己注册：[`start`] 会按 feature 把它们挂上，
+//! 日志、信号、定时器、引导这些服务不必自己注册：[`start`] 会按 feature 把它们挂上，
 //! 并把时间来源注入节点。想换掉其中某一个，用 [`Builder`] 自己拼，见 [`BuilderExt`]。
 //!
 //! ## crate 构成
@@ -52,6 +52,7 @@
 //! | `rskynet-logger` | 日志服务，一个[独占线程的服务][Exclusive] | `logger`（默认开） |
 //! | `rskynet-timer` | 分层时间轮与定时器服务 | `timer`（默认开） |
 //! | `rskynet-bootstrap` | 引导服务：按清单拉起业务服务 | `bootstrap`（默认开） |
+//! | `rskynet-signal` | 进程信号、优雅关停与独立崩溃报告 | `signal`（默认开） |
 //! | 标准命令行入口 | 读取 TOML 并启动自动注册服务 | `main`（默认开） |
 //! | `rskynet-net` | socket 层，一个[独占线程的服务][Exclusive] | `net` |
 //!
@@ -70,7 +71,7 @@ pub use rskynet_core::*;
 /// `msg` 单独用没有意义（它由前两个宏在展开时摘走），导出它只是为了让写错地方时
 /// 报一句人话。
 #[cfg(feature = "macros")]
-pub use rskynet_macros::{exclusive, msg, service};
+pub use rskynet_macros::{exclusive, msg, service, signal};
 
 /// 网络层：socket / gate / agent。
 #[cfg(feature = "net")]
@@ -80,8 +81,15 @@ pub use rskynet_net as net;
 pub use rskynet_bootstrap as bootstrap;
 #[cfg(feature = "logger")]
 pub use rskynet_logger as logger;
+#[cfg(feature = "signal")]
+pub use rskynet_signal as signal;
 #[cfg(feature = "timer")]
 pub use rskynet_timer as timer;
+
+/// 独立崩溃报告进程。标准 [`main::run`] 会自动安装；自定义入口应在启动节点前
+/// 调用 [`crash::install`] 并把返回的 guard 留到进程结束。
+#[cfg(feature = "signal")]
+pub use rskynet_signal::crash;
 
 /// 标准命令行入口：读取 TOML，并启动所有配置的自动注册服务。
 #[cfg(feature = "main")]
@@ -93,6 +101,14 @@ pub mod main {
 
     /// 使用进程参数启动节点。要求且只接受一个 TOML 配置路径。
     pub fn run() -> ExitCode {
+        #[cfg(feature = "signal")]
+        let _crash = match crate::crash::install() {
+            Ok(guard) => guard,
+            Err(err) => {
+                eprintln!("rskynet: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
         match run_from(std::env::args_os()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
@@ -159,7 +175,7 @@ pub use rskynet_bootstrap::{ConfigExt, ServiceSpec};
 pub trait BuilderExt {
     /// 按 feature 挂上内置服务，并注入时间来源。
     ///
-    /// 挂的都是约定名字（`logger` / `timer` / `bootstrap`），所以配置里不写
+    /// 挂的都是约定名字（`logger` / `signal` / `timer` / `bootstrap`），所以配置里不写
     /// `name` 也能对上号。要换掉其中某一个，在这之后用自己的实现重新注册同名
     /// 类型即可——后注册的覆盖先注册的。
     #[must_use]
@@ -182,6 +198,13 @@ impl BuilderExt for Builder {
             builder = builder.service(
                 rskynet_core::service::BOOTSTRAP,
                 rskynet_bootstrap::Bootstrap::default,
+            );
+        }
+        #[cfg(feature = "signal")]
+        {
+            builder = builder.exclusive_service(
+                rskynet_core::service::SIGNAL,
+                rskynet_signal::SignalService::default,
             );
         }
         // 定时器要一次做两件事：注册服务，并把同一个时钟注入节点

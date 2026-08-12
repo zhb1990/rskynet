@@ -11,7 +11,7 @@
 //!
 //! # 系统服务
 //!
-//! 日志、定时器、引导这三个服务的实现都不在内核里（各是一个独立 crate），内核
+//! 日志、信号、定时器、引导这些服务的实现都不在内核里（各是一个独立 crate），内核
 //! 只做两件事：按配置里那一段的 `name` 把它们拉起来，以及定下先后顺序。顺序是
 //! 日志 → 定时器 → 引导：日志最先，好让后面每一步出的岔子都有人记；定时器排在
 //! 引导之前，于是引导期间刻度就在走，那时挂的表、打的日志时间戳都是准的。
@@ -40,8 +40,8 @@ struct SystemService {
 
 /// 节点配置，对照 skynet 的 `config` 文件。
 ///
-/// 内核认的只有这三个标量，剩下的全是段：`[logger]`、`[timer]`、`[bootstrap]`
-/// 归三个内置服务，`[net]` 之类归各自的服务。内核对系统服务的段只读一个 `name`，
+/// 内核认的只有这三个标量，剩下的全是段：`[logger]`、`[signal]`、`[timer]`、`[bootstrap]`
+/// 归四个内置服务，`[net]` 之类归各自的服务。内核对系统服务的段只读一个 `name`，
 /// 段里其余内容原样留着，由服务自己解析。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -292,7 +292,7 @@ fn run(config: Config, registry: Registry, timer: Arc<dyn Timer>) -> Result<()> 
     Ok(())
 }
 
-/// 按配置拉起三个系统服务，对照 C 版 `skynet_start` 里 worker 之前那一段。
+/// 按配置拉起四个系统服务，对照 C 版 `skynet_start` 里 worker 之前那一段。
 fn boot(node: &Arc<Node>, config: &Config) -> Result<()> {
     // 日志最先：从这里开始，后面每一步的动静都有人记
     let kind = config.system_kind(service::LOGGER, service::LOGGER)?;
@@ -303,6 +303,15 @@ fn boot(node: &Arc<Node>, config: &Config) -> Result<()> {
         // logger 不计入「服务数归零就退出」的判断，并且留到最后才送走，
         // 这样关停过程中产生的日志仍然写得出来
         node.reserve(logger);
+    }
+
+    // 信号服务也必须留到普通服务全部退出之后；否则关停途中再来的信号会落回
+    // 操作系统默认动作，直接截断日志与邮箱的排空。
+    let kind = config.system_kind(service::SIGNAL, service::SIGNAL)?;
+    if !kind.trim().is_empty() {
+        let signal = node.new_service(&kind, "")?;
+        node.handles.register_name(signal, service::SIGNAL);
+        node.reserve(signal);
     }
 
     // 定时器排在引导之前，于是引导期间刻度就在走：那会儿挂的表立刻开始计时，

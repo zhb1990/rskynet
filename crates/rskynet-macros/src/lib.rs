@@ -48,6 +48,7 @@
 //! [`Service`]: https://docs.rs/rskynet-core/latest/rskynet_core/trait.Service.html
 
 mod expand;
+mod signal;
 
 use proc_macro::TokenStream;
 
@@ -150,4 +151,20 @@ pub fn exclusive(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn msg(_attr: TokenStream, _item: TokenStream) -> TokenStream {
     expand::stray_msg().into()
+}
+
+/// 注册一个进程信号回调。
+///
+/// ```ignore
+/// #[rskynet::signal(SIGTERM)]
+/// fn on_term(ctx: &rskynet::Ctx) {
+///     ctx.abort();
+/// }
+/// ```
+///
+/// 回调必须是同步的 `fn(&Ctx)`。同一最终二进制中每种信号只能注册一次；宏会为
+/// 信号生成唯一导出符号，重复注册会让编译或链接失败。
+#[proc_macro_attribute]
+pub fn signal(attr: TokenStream, item: TokenStream) -> TokenStream {
+    signal::expand(attr.into(), item.into()).into()
 }

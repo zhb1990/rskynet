@@ -223,6 +223,9 @@ fn macros_work_against_the_kernel_crate() {
         [logger]
         name = ""
 
+        [signal]
+        name = ""
+
         [timer]
         name = ""
         "#,

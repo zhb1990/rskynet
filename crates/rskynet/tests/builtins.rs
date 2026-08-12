@@ -1,4 +1,4 @@
-//! 三个内置服务与内核的接缝：谁在什么时候被拉起、配置缺席时走什么默认、
+//! 内置服务与内核的接缝：谁在什么时候被拉起、配置缺席时走什么默认、
 //! 时间从哪儿来。
 //!
 //! 这些用例都真的起一个节点跑一遍，因为要验的正是启动顺序本身。
@@ -42,7 +42,7 @@ where
     }
 }
 
-/// 三个段全都不写时，内置服务照样按约定名字被拉起来
+/// 配置段全都不写时，内置服务照样按约定名字被拉起来
 #[test]
 fn builtins_start_without_any_configuration() {
     let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -52,7 +52,7 @@ fn builtins_start_without_any_configuration() {
         Driver::new(move |ctx: Ctx| {
             Box::pin(async move {
                 let mut names = Vec::new();
-                for name in ["logger", "timer"] {
+                for name in ["logger", "signal", "timer"] {
                     if ctx.query_name(name).is_some() {
                         names.push(name.to_string());
                     }
@@ -62,14 +62,18 @@ fn builtins_start_without_any_configuration() {
         })
     });
 
-    // 配置里只写了引导清单，logger 与 timer 两段整个缺席
+    // 配置里只写了引导清单，其余系统服务段整个缺席
     let config = Config::default().with_thread(2).with_bootstrap(["driver"]);
     rskynet::start(config, registry).expect("节点应当正常启动并退出");
 
     assert_eq!(
         *seen.lock().unwrap(),
-        vec!["logger".to_string(), "timer".to_string()],
-        "两个系统服务都该按约定名字注册好"
+        vec![
+            "logger".to_string(),
+            "signal".to_string(),
+            "timer".to_string()
+        ],
+        "系统服务都该按约定名字注册好"
     );
 }
 

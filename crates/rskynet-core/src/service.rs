@@ -11,6 +11,8 @@
 
 /// 日志服务的注册名。
 pub const LOGGER: &str = "logger";
+/// 进程信号服务的注册名。
+pub const SIGNAL: &str = "signal";
 /// 定时器服务的注册名。
 pub const TIMER: &str = "timer";
 /// 引导服务的注册名。

@@ -1,0 +1,26 @@
+[package]
+name = "rskynet-signal"
+description = "rskynet 的进程信号、优雅关停与独立崩溃报告"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+crash-handler = { workspace = true }
+ctrlc = { workspace = true }
+futures-executor = { workspace = true }
+inventory = { workspace = true }
+minidump = { workspace = true }
+minidump-processor = { workspace = true }
+minidump-unwind = { workspace = true }
+minidumper = { workspace = true }
+rskynet-core = { workspace = true }
+rskynet-macros = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+signal-hook = { workspace = true }
