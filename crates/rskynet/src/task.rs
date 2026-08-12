@@ -3,7 +3,7 @@
 //! # 安全契约
 //!
 //! 调度器保证「**同一个服务在任意时刻只会被一个 worker 线程执行**」——这一点由
-//! [`crate::mq::Mailbox`] 的 `in_global` 标志维持：标志置位期间服务要么排在全局
+//! [`crate::mq::Mailbox`] 的状态机维持：状态不为 `IDLE` 期间，服务要么排在运行
 //! 队列里，要么被唯一一个 worker 持有。因此服务内部的状态天生是单线程访问的，
 //! 只是「哪个线程」会随调度变化。
 //!
@@ -14,12 +14,12 @@
 
 use std::cell::{Ref, RefCell, RefMut};
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::task::Waker;
 
 use futures_util::future::BoxFuture;
 use futures_util::task::{ArcWake, waker};
-use parking_lot::Mutex;
 use slab::Slab;
 
 use crate::server::ServiceContext;
@@ -95,6 +95,12 @@ struct TaskSlot {
     /// poll 期间会被取走，避免任务在 poll 中再 spawn 新任务时形成嵌套借用。
     future: Option<BoxFuture<'static, ()>>,
     waker: Waker,
+    /// 这个任务正在处理谁的请求：(请求方, session)。
+    ///
+    /// 服务半途退出时要给这些请求方回一个错误，否则对方的 `call` 永远挂着；
+    /// 对照 `lualib/skynet.lua` 里 `skynet.exit` 遍历 `session_coroutine_id` 的那段。
+    /// 记在任务槽里而不是另开一张表，是因为它的生命周期与任务严丝合缝。
+    request: Option<(u32, i32)>,
 }
 
 /// 任务 waker：被唤醒时把任务 id 塞回服务的就绪队列，并让服务重新进入全局队列。
@@ -115,24 +121,33 @@ impl ArcWake for TaskWaker {
 }
 
 /// 服务持有的任务集合。
+///
+/// 这里用 [`SvcCell`] 而不是 `Mutex`：所有访问点都在「当前执行本服务的那个线程」
+/// 上，加锁只是白付代价。唯一的例外是用户从自己起的 OS 线程调 `Ctx::spawn`，
+/// 那条路走邮箱绕回来（见 [`crate::server::ServiceContext::spawn`]）。
 pub(crate) struct TaskSet {
-    slots: Mutex<Slab<TaskSlot>>,
+    slots: SvcCell<Slab<TaskSlot>>,
+    /// 任务数。只有持有者会改，但 `Ctx::task_count` 允许别的线程看一眼，
+    /// 所以单独记一个原子量，免得为了读个数字就得去借 cell。
+    count: AtomicUsize,
 }
 
 impl TaskSet {
     pub(crate) fn new() -> Self {
         Self {
-            slots: Mutex::new(Slab::new()),
+            slots: SvcCell::new(Slab::new()),
+            count: AtomicUsize::new(0),
         }
     }
 
-    /// 放入一个新任务，返回任务 id。
+    /// 放入一个新任务，返回任务 id。`request` 是它正在处理的那个请求（如果有）。
     pub(crate) fn insert(
         &self,
         owner: &Weak<ServiceContext>,
         future: BoxFuture<'static, ()>,
+        request: Option<(u32, i32)>,
     ) -> usize {
-        let mut slots = self.slots.lock();
+        let mut slots = self.slots.borrow_mut();
         let entry = slots.vacant_entry();
         let task = entry.key();
         let waker = waker(Arc::new(TaskWaker {
@@ -142,13 +157,15 @@ impl TaskSet {
         entry.insert(TaskSlot {
             future: Some(future),
             waker,
+            request,
         });
+        self.count.store(slots.len(), Ordering::Relaxed);
         task
     }
 
     /// 取出任务准备 poll。任务已完成或正被 poll 时返回 `None`。
     pub(crate) fn take(&self, task: usize) -> Option<(BoxFuture<'static, ()>, Waker)> {
-        let mut slots = self.slots.lock();
+        let mut slots = self.slots.borrow_mut();
         let slot = slots.get_mut(task)?;
         let future = slot.future.take()?;
         Some((future, slot.waker.clone()))
@@ -156,31 +173,42 @@ impl TaskSet {
 
     /// poll 返回 `Pending`，把 Future 放回原槽位。
     pub(crate) fn restore(&self, task: usize, future: BoxFuture<'static, ()>) {
-        if let Some(slot) = self.slots.lock().get_mut(task) {
+        if let Some(slot) = self.slots.borrow_mut().get_mut(task) {
             slot.future = Some(future);
         }
     }
 
     pub(crate) fn remove(&self, task: usize) {
-        let mut slots = self.slots.lock();
+        let mut slots = self.slots.borrow_mut();
         if slots.contains(task) {
             slots.remove(task);
         }
+        self.count.store(slots.len(), Ordering::Relaxed);
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.slots.lock().len()
+        self.count.load(Ordering::Relaxed)
+    }
+
+    /// 摘走所有「正在处理中的请求」，摘过就不会再报一遍。
+    pub(crate) fn take_requests(&self) -> Vec<(u32, i32)> {
+        self.slots
+            .borrow_mut()
+            .iter_mut()
+            .filter_map(|(_, slot)| slot.request.take())
+            .collect()
     }
 
     /// 服务销毁时清空任务。Future 的析构可能回调本服务（比如 `Call` 的 Drop 要动
-    /// session 表），所以只在锁内把它们搬出来，实际释放留给调用方在锁外做。
+    /// session 表），所以只在借用期内把它们搬出来，实际释放留给调用方在借用外做。
     pub(crate) fn drain(&self) -> Vec<BoxFuture<'static, ()>> {
-        let mut slots = self.slots.lock();
+        let mut slots = self.slots.borrow_mut();
         let taken: Vec<_> = slots
             .iter_mut()
             .filter_map(|(_, slot)| slot.future.take())
             .collect();
         slots.clear();
+        self.count.store(0, Ordering::Relaxed);
         taken
     }
 }

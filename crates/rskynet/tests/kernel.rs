@@ -440,6 +440,34 @@ fn many_local_tasks_all_get_scheduled() {
     assert_eq!(seen, vec!["在飞任务 true", "全部完成 200"]);
 }
 
+/// `Ctx` 是 `Send` 的，用户从自己起的 OS 线程 spawn 任务也得能跑起来
+///
+/// 那个线程碰不得服务的任务集，所以走的是「把 future 塞进邮箱、由持有者插入」
+/// 这条慢路径。
+#[test]
+fn spawn_from_a_foreign_thread_still_runs() {
+    let seen = run_node("bootstrap driver", |ctx, journal| {
+        Box::pin(async move {
+            let done = Arc::new(AtomicU64::new(0));
+            let outside = ctx.clone();
+            let flag = done.clone();
+            std::thread::spawn(move || {
+                outside.spawn(async move {
+                    flag.fetch_add(1, SeqCst);
+                });
+            })
+            .join()
+            .unwrap();
+
+            while done.load(SeqCst) == 0 {
+                ctx.sleep(1).await;
+            }
+            note(&journal, "外部线程托付的任务跑了");
+        })
+    });
+    assert_eq!(seen, vec!["外部线程托付的任务跑了"]);
+}
+
 /// 对照 skynet.stat 的那几个统计口径都要有值
 #[test]
 fn runtime_stats_are_available() {
@@ -488,28 +516,20 @@ fn throughput_one_million_messages() {
     assert_eq!(seen, vec![TOTAL.to_string()], "一条都不能丢");
 }
 
-/// 压测：一堆服务同时可运行时的调度吞吐。
+/// 起一个节点，把 `services` 个服务串成环、放 `tokens` 个令牌进去转圈，
+/// 返回总跳数与耗时。
 ///
-/// 上一条压测只有一个收件人，压的是它那把邮箱锁；这条把 64 个服务串成一个环、
-/// 同时放 64 个令牌进去转圈，每一跳都要把一个服务重新推进运行队列再取出来，
-/// 压的是调度器本身。
-///
-/// 默认跳过，跑法：`cargo test --release -- --ignored --nocapture`
-#[test]
-#[ignore = "压测，请用 cargo test --release -- --ignored 运行"]
-fn scheduling_throughput_across_many_services() {
-    const SERVICES: usize = 64;
-    const TOKENS: usize = 64;
-    const HOPS_PER_TOKEN: u64 = 10_000;
-    /// 固定线程数：令牌数远多于线程数，worker 一直有活干，读数才反映队列本身的
-    /// 开销而不是线程反复挂起唤醒的开销。
-    const THREADS: usize = 4;
-
+/// 每一跳都要把一个服务重新推进运行队列再取出来，压的是调度器本身。
+fn relay_ring(
+    threads: usize,
+    services: usize,
+    tokens: usize,
+    hops_per_token: u64,
+) -> (u64, std::time::Duration) {
     let shared = Arc::new(RelayShared::default());
     let relay_state = shared.clone();
     let scenario_state = shared.clone();
     let journal: Journal = Arc::new(Mutex::new(Vec::new()));
-    let scenario_journal = journal.clone();
 
     let registry = Registry::new()
         .with_builtins()
@@ -518,40 +538,32 @@ fn scheduling_throughput_across_many_services() {
             shared: relay_state.clone(),
         })
         .with("driver", move || Driver {
-            journal: scenario_journal.clone(),
+            journal: journal.clone(),
             scenario: {
                 let shared = scenario_state.clone();
-                Arc::new(move |ctx: Ctx, journal: Journal| {
+                Arc::new(move |ctx: Ctx, _journal: Journal| {
                     let shared = shared.clone();
                     Box::pin(async move {
-                        let mut ring = Vec::with_capacity(SERVICES);
-                        for _ in 0..SERVICES {
+                        let mut ring = Vec::with_capacity(services);
+                        for _ in 0..services {
                             ring.push(ctx.launch("relay", "").await.unwrap());
                         }
                         // 先把环接好。这些 SETUP 都排在令牌之前进各自的邮箱，
                         // 所以任何一个中转站收到令牌时一定已经知道下家是谁
                         for (index, handle) in ring.iter().enumerate() {
-                            let next = ring[(index + 1) % SERVICES];
+                            let next = ring[(index + 1) % services];
                             ctx.send(*handle, SETUP, Payload::of(next)).unwrap();
                         }
 
                         *shared.started.lock().unwrap() = Some(Instant::now());
-                        for token in 0..TOKENS {
-                            let entry = ring[token * SERVICES / TOKENS];
-                            ctx.send(entry, TOKEN, Payload::of(HOPS_PER_TOKEN)).unwrap();
+                        for token in 0..tokens {
+                            let entry = ring[token * services / tokens];
+                            ctx.send(entry, TOKEN, Payload::of(hops_per_token)).unwrap();
                         }
                         // 收尾时刻由最后一个令牌自己记下，所以这里的轮询精度不影响读数
-                        while shared.finished.load(SeqCst) < TOKENS as u64 {
+                        while shared.finished.load(SeqCst) < tokens as u64 {
                             ctx.sleep(1).await;
                         }
-
-                        let elapsed = shared.elapsed.lock().unwrap().unwrap();
-                        let hops = TOKENS as u64 * HOPS_PER_TOKEN;
-                        note(&journal, hops.to_string());
-                        println!(
-                            "{THREADS} 线程 / {SERVICES} 个服务 × {TOKENS} 个令牌共接力 {hops} 跳，耗时 {elapsed:?}，约 {:.2} 万次调度/秒",
-                            hops as f64 / elapsed.as_secs_f64() / 10_000.0
-                        );
                     })
                 })
             },
@@ -559,16 +571,59 @@ fn scheduling_throughput_across_many_services() {
 
     rskynet::start(
         Config::default()
-            .with_thread(THREADS)
+            .with_thread(threads)
             .with_bootstrap("bootstrap driver"),
         registry,
     )
     .unwrap();
 
-    assert_eq!(
-        shared.hops.load(SeqCst),
-        TOKENS as u64 * HOPS_PER_TOKEN,
-        "一跳都不能丢"
+    let hops = shared.hops.load(SeqCst);
+    assert_eq!(hops, tokens as u64 * hops_per_token, "一跳都不能丢");
+    (hops, shared.elapsed.lock().unwrap().unwrap())
+}
+
+/// 压测：一堆服务同时可运行时的调度吞吐。
+///
+/// 上一条压测只有一个收件人，压的是那一个邮箱；这条把 64 个服务串成一个环、
+/// 同时放 64 个令牌进去转圈，压的是调度器本身。
+///
+/// 线程数固定 4：令牌数远多于线程数，worker 一直有活干，读数才反映队列本身的
+/// 开销而不是线程反复挂起唤醒的开销。
+///
+/// 默认跳过，跑法：`cargo test --release -- --ignored --nocapture`
+#[test]
+#[ignore = "压测，请用 cargo test --release -- --ignored 运行"]
+fn scheduling_throughput_across_many_services() {
+    const THREADS: usize = 4;
+    const SERVICES: usize = 64;
+    const TOKENS: usize = 64;
+
+    let (hops, elapsed) = relay_ring(THREADS, SERVICES, TOKENS, 10_000);
+    println!(
+        "{THREADS} 线程 / {SERVICES} 个服务 × {TOKENS} 个令牌共接力 {hops} 跳，耗时 {elapsed:?}，约 {:.2} 万次调度/秒",
+        hops as f64 / elapsed.as_secs_f64() / 10_000.0
+    );
+}
+
+/// 压测：worker 数远多于可运行服务数时的调度吞吐。
+///
+/// 上一条让每个 worker 都有活干，量的是队列本身；这条反过来——16 个 worker 只有
+/// 4 个服务可跑，大部分线程一直在「睡下、被叫醒、发现没自己的份、再睡」之间打转，
+/// 量的正是唤醒与窃取这两条路径的开销。skynet 那种全局队列在这个场景下会被唤醒
+/// 风暴压垮，所以它值得单独一条读数。
+///
+/// 默认跳过，跑法：`cargo test --release -- --ignored --nocapture`
+#[test]
+#[ignore = "压测，请用 cargo test --release -- --ignored 运行"]
+fn scheduling_throughput_with_idle_workers() {
+    const THREADS: usize = 16;
+    const SERVICES: usize = 4;
+    const TOKENS: usize = 4;
+
+    let (hops, elapsed) = relay_ring(THREADS, SERVICES, TOKENS, 10_000);
+    println!(
+        "{THREADS} 线程 / {SERVICES} 个服务 × {TOKENS} 个令牌共接力 {hops} 跳，耗时 {elapsed:?}，约 {:.2} 万次调度/秒",
+        hops as f64 / elapsed.as_secs_f64() / 10_000.0
     );
 }
 

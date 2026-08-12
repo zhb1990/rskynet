@@ -11,6 +11,8 @@ repository = "https://github.com/zhuhb/rskynet"
 
 # 统一管理依赖版本，后续新增 rskynet-net / rskynet-cluster 等成员时直接复用
 [workspace.dependencies]
+arc-swap = "1"
+crossbeam-queue = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }

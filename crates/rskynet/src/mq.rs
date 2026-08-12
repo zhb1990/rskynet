@@ -1,16 +1,33 @@
 //! 两级消息队列，对照 `skynet-src/skynet_mq.c`。
 //!
 //! - [`Mailbox`]：每个服务一个，等价于 C 版的 `struct message_queue`。
-//!   C 版手写环形缓冲加倍扩容，这里用 `VecDeque`（本身就是按需扩容的环形缓冲），
-//!   语义一致；`in_global` 标志与过载检测原样保留。
+//!   C 版是「大锁 + 手写环形缓冲加倍扩容」，这里换成两条无锁的
+//!   [`SegQueue`] 加一个原子状态机，投递方与消费方全程不加锁。
 //! - [`Scheduler`]：存放「有活干的服务」，对应 `struct global_queue`——
 //!   但不再是一条被所有线程争抢的队列，见下。
 //!
 //! 相比 C 版本，邮箱里多了一条 `ready` 队列存放服务内部被唤醒的 Future 任务，
 //! 于是「服务可被调度」的条件从「邮箱非空」推广为「邮箱非空或有就绪任务」。
-//! `in_global` 依然是整套调度的核心不变量：
+//!
+//! # in_global 布尔量为什么升级成状态机
+//!
+//! C 版靠 `in_global` 一个布尔量维持整套调度的核心不变量：
 //! **它为 true 时表示该服务要么排在某条运行队列里，要么正被某个 worker 持有，
 //! 因此同一服务绝不会被两个 worker 同时执行。**
+//!
+//! 但这个布尔量必须与「队列已空」**原子地**绑定，否则会丢活：消费方看到两条
+//! 队列都空 → 投递方压入新消息、看到 `in_global` 仍为 true 于是不入队 →
+//! 消费方清掉标志放生服务。那条消息就此再也无人处理。C 版靠邮箱那把锁把两件事
+//! 圈在一起，无锁化之后改用四态状态机，把「持有期间来了新活」显式记下来：
+//!
+//! ```text
+//! Idle     ──投递──> Queued     投递方 CAS 成功，由它负责入运行队列
+//! Queued   ──取走──> Running    worker 从运行队列取到，开始独占执行
+//! Running  ──投递──> Notified   持有期间又来了新活，投递方无需入队
+//! Notified ──复位──> Running    消费方发现有人投过活，复位后重扫队列
+//! Running  ──取空──> Idle       CAS 成功才算放生，失败说明刚被 Notified
+//! Running  ──让渡──> Queued     交回运行队列，必须先改状态再入队
+//! ```
 //!
 //! # 为什么全局队列变成了每 worker 一条
 //!
@@ -19,15 +36,17 @@
 //! push/pop，闲下来才去别人队列头部窃取。
 //!
 //! 但 BWoS 的 owner 侧操作只允许绑定线程调用，而投递方是任意线程（定时器线程、
-//! 外部唤醒的 waker 都可能），所以还留了一条加锁的 injector 队列兜底：
+//! 外部唤醒的 waker 都可能），所以还留了一条 injector 队列兜底：
 //! 非 worker 线程的投递、本地队列写满的溢出，都落到 injector，谁都能从里面取。
 
 use std::cell::Cell;
-use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::thread::{self, Thread};
 
-use parking_lot::{Condvar, Mutex};
+use arc_swap::ArcSwapOption;
+use crossbeam_queue::SegQueue;
+use futures_util::future::BoxFuture;
 
 use crate::bwos::{self, CachePad, Owner, Stealer};
 use crate::message::Message;
@@ -36,112 +55,206 @@ use crate::server::ServiceContext;
 /// 过载报警的初始阈值，对照 C 版 `MQ_OVERLOAD`。
 pub(crate) const OVERLOAD_THRESHOLD: usize = 1024;
 
-/// 一次调度取到的活儿：要么是一条新消息，要么是一个被唤醒的服务内任务。
-pub(crate) enum Work {
-    Message(Message),
+/// 就绪队列里的一件活。
+pub(crate) enum Ready {
+    /// 服务内某个任务被唤醒了，去 poll 它。
     Task(usize),
+    /// 别的线程托我们插一个新任务，见 [`crate::server::ServiceContext::spawn`]。
+    Spawn(BoxFuture<'static, ()>),
 }
 
-struct MailboxInner {
-    queue: VecDeque<Message>,
-    /// 服务内被唤醒、等待 poll 的任务 id（相当于 skynet 里可以 resume 的协程）。
-    ready: VecDeque<usize>,
-    in_global: bool,
-    overload: usize,
-    overload_threshold: usize,
+/// 一次调度取到的活儿：要么是一条新消息，要么是就绪队列里的一件活。
+pub(crate) enum Work {
+    Message(Message),
+    Ready(Ready),
+}
+
+/// 邮箱状态，取代 C 版的 `in_global` 布尔量，取值含义见模块头。
+mod state {
+    pub(super) const IDLE: u8 = 0;
+    pub(super) const QUEUED: u8 = 1;
+    pub(super) const RUNNING: u8 = 2;
+    pub(super) const NOTIFIED: u8 = 3;
 }
 
 pub(crate) struct Mailbox {
-    inner: Mutex<MailboxInner>,
+    queue: SegQueue<Message>,
+    /// 服务内被唤醒、等待 poll 的任务（相当于 skynet 里可以 resume 的协程）。
+    ready: SegQueue<Ready>,
+    /// 积压的消息条数。批处理预算与 `mqlen` 统计都只需要近似值，Relaxed 足够。
+    len: AtomicUsize,
+    state: AtomicU8,
+    /// 下面两个只有「当前持有本服务的那个 worker」会碰，天然无竞争。
+    overload: AtomicUsize,
+    overload_threshold: AtomicUsize,
 }
 
 impl Mailbox {
     pub(crate) fn new() -> Self {
         Self {
-            inner: Mutex::new(MailboxInner {
-                queue: VecDeque::with_capacity(64),
-                ready: VecDeque::new(),
-                // 与 C 版一致：创建时就置位，保证服务初始化完成前不会被 worker 领走
-                in_global: true,
-                overload: 0,
-                overload_threshold: OVERLOAD_THRESHOLD,
-            }),
+            queue: SegQueue::new(),
+            ready: SegQueue::new(),
+            len: AtomicUsize::new(0),
+            // 与 C 版一致：创建时就置位，保证服务初始化完成前不会被 worker 领走
+            state: AtomicU8::new(state::QUEUED),
+            overload: AtomicUsize::new(0),
+            overload_threshold: AtomicUsize::new(OVERLOAD_THRESHOLD),
         }
     }
 
-    /// 投递消息。返回 true 表示调用方需要把该服务推入全局队列。
+    /// 投递消息。返回 true 表示调用方需要把该服务推入运行队列。
     pub(crate) fn push_message(&self, msg: Message) -> bool {
-        let mut inner = self.inner.lock();
-        inner.queue.push_back(msg);
-        !std::mem::replace(&mut inner.in_global, true)
+        self.len.fetch_add(1, Ordering::Relaxed);
+        self.queue.push(msg);
+        self.notify()
     }
 
-    /// 标记某个服务内任务就绪。返回 true 表示调用方需要把该服务推入全局队列。
-    pub(crate) fn push_ready(&self, task: usize) -> bool {
-        let mut inner = self.inner.lock();
-        inner.ready.push_back(task);
-        !std::mem::replace(&mut inner.in_global, true)
+    /// 往就绪队列里放一件活。返回 true 表示调用方需要把该服务推入运行队列。
+    pub(crate) fn push_ready(&self, ready: Ready) -> bool {
+        self.ready.push(ready);
+        self.notify()
     }
 
-    /// 取一件活干。返回 `None` 表示服务彻底空闲，此时会**原子地**清掉
-    /// `in_global`，让后续的投递方负责把服务重新推进全局队列。
+    /// 宣告「这个服务有活干了」，返回 true 表示调用方需要把它推入运行队列。
+    ///
+    /// 必须在活**已经**压进队列之后调用：消费方一旦看到 `NOTIFIED`，就必须能
+    /// 捞到东西，否则它复位重扫仍是空的，会白转一圈。
+    ///
+    /// 服务被 kill 时也用它，保证一定会被某个 worker 领走一次以完成销毁。
+    pub(crate) fn notify(&self) -> bool {
+        let mut current = self.state.load(Ordering::Relaxed);
+        loop {
+            let next = match current {
+                state::IDLE => state::QUEUED,
+                state::RUNNING => state::NOTIFIED,
+                // 已经排在运行队列里，或者持有者已经知道有新活，都无需再管
+                _ => return false,
+            };
+            match self.state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return next == state::QUEUED,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// 取一件活干。返回 `None` 表示服务彻底空闲，此时状态已经落回 `IDLE`，
+    /// 后续的投递方会负责把服务重新推进运行队列。
     ///
     /// 就绪任务优先于新消息：对应 skynet 里被 resume 的协程会一路跑到下一次
     /// yield，之后才轮到下一条消息。
     pub(crate) fn take_work(&self) -> Option<Work> {
-        let mut inner = self.inner.lock();
-        if let Some(task) = inner.ready.pop_front() {
-            return Some(Work::Task(task));
-        }
-        match inner.queue.pop_front() {
-            Some(msg) => {
-                let length = inner.queue.len();
-                while length > inner.overload_threshold {
-                    inner.overload = length;
-                    inner.overload_threshold *= 2;
+        loop {
+            if let Some(ready) = self.ready.pop() {
+                return Some(Work::Ready(ready));
+            }
+            if let Some(msg) = self.queue.pop() {
+                self.check_overload();
+                return Some(Work::Message(msg));
+            }
+            // 两条队列都看空了。只有 CAS 成功才算真的放生：失败说明就在刚才这段
+            // 空隙里有人投了新活，复位成 RUNNING 再扫一遍即可——投递方是「先压队列
+            // 再改状态」，所以这一遍必定有收获，循环不会没完没了。
+            match self.state.compare_exchange(
+                state::RUNNING,
+                state::IDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.overload_threshold
+                        .store(OVERLOAD_THRESHOLD, Ordering::Relaxed);
+                    return None;
                 }
-                Some(Work::Message(msg))
-            }
-            None => {
-                inner.in_global = false;
-                inner.overload_threshold = OVERLOAD_THRESHOLD;
-                None
+                Err(state::NOTIFIED) => self.state.store(state::RUNNING, Ordering::Release),
+                Err(other) => {
+                    // 走到这里说明有人在服务不属于自己的时候调了 take_work
+                    debug_assert!(false, "取活时的邮箱状态不该是 {other}");
+                    return None;
+                }
             }
         }
     }
 
-    /// 只取就绪任务，不碰 `in_global`。服务初始化阶段用它把 init 推进到第一次挂起。
-    pub(crate) fn take_ready(&self) -> Option<usize> {
-        self.inner.lock().ready.pop_front()
+    /// 积压超过阈值就记一笔，并把阈值翻倍，免得持续过载时把日志刷爆。
+    /// 只有持有本服务的 worker 会调用，因此这里的读改写不必是原子的。
+    fn check_overload(&self) {
+        let length = self.len.fetch_sub(1, Ordering::Relaxed) - 1;
+        let mut threshold = self.overload_threshold.load(Ordering::Relaxed);
+        if length <= threshold {
+            return;
+        }
+        while length > threshold {
+            threshold *= 2;
+        }
+        self.overload.store(length, Ordering::Relaxed);
+        self.overload_threshold.store(threshold, Ordering::Relaxed);
     }
 
-    /// 强行置位 `in_global`。返回 true 表示调用方需要入队。
-    /// 服务被 kill 时用它保证一定会被某个 worker 领走一次以完成销毁。
-    pub(crate) fn mark_in_global(&self) -> bool {
-        let mut inner = self.inner.lock();
-        !std::mem::replace(&mut inner.in_global, true)
+    /// 只取就绪队列，不碰状态。服务初始化阶段用它把 init 推进到第一次挂起。
+    pub(crate) fn take_ready(&self) -> Option<Ready> {
+        self.ready.pop()
     }
 
-    /// 清掉 `in_global`。服务清理完毕后调用，好让清理之后迟到的消息还能
-    /// 把这个服务重新推进全局队列、再被清一次。
-    pub(crate) fn reset_in_global(&self) {
-        self.inner.lock().in_global = false;
+    /// 状态置为「已排进运行队列」。**必须在真正入队之前调用**：反过来的话，
+    /// 别的 worker 可能已经把服务取走并置成 `RUNNING`，我们再一覆盖就变成了
+    /// 「标记为在队列里，实际谁也没拿着」，这个服务从此不会再被唤醒。
+    pub(crate) fn mark_queued(&self) {
+        self.state.store(state::QUEUED, Ordering::Release);
+    }
+
+    /// 状态置为「已被某个 worker 独占」，由运行队列的取出方调用。
+    pub(crate) fn mark_running(&self) {
+        self.state.store(state::RUNNING, Ordering::Release);
+    }
+
+    /// 销毁流程的收尾：把状态放回 `IDLE`，让清理之后迟到的消息还能把这个服务
+    /// 重新推进运行队列、再被清一次。
+    ///
+    /// 返回 false 表示清理期间又有活进来了，此时状态仍归调用方所有，
+    /// 它必须再清一遍再来放生。**这是「两个 worker 不会同时清理同一个服务」的
+    /// 依据**：只有这一次 CAS 成功之后，服务才可能被别人重新领走。
+    pub(crate) fn release(&self) -> bool {
+        match self.state.compare_exchange(
+            state::RUNNING,
+            state::IDLE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => true,
+            Err(state::NOTIFIED) => {
+                self.state.store(state::RUNNING, Ordering::Release);
+                false
+            }
+            Err(other) => {
+                debug_assert!(false, "放生时的邮箱状态不该是 {other}");
+                true
+            }
+        }
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.inner.lock().queue.len()
+        self.len.load(Ordering::Relaxed)
     }
 
     /// 取出并清零过载读数，对照 `skynet_mq_overload`。
     pub(crate) fn take_overload(&self) -> usize {
-        std::mem::take(&mut self.inner.lock().overload)
+        self.overload.swap(0, Ordering::Relaxed)
     }
 
     /// 服务销毁时清空邮箱，未处理的消息交回调用方以便给发起者回错误。
     pub(crate) fn drain(&self) -> Vec<Message> {
-        let mut inner = self.inner.lock();
-        inner.ready.clear();
-        inner.queue.drain(..).collect()
+        while self.ready.pop().is_some() {}
+        let mut left = Vec::new();
+        while let Some(msg) = self.queue.pop() {
+            self.len.fetch_sub(1, Ordering::Relaxed);
+            left.push(msg);
+        }
+        left
     }
 }
 
@@ -150,6 +263,22 @@ impl Mailbox {
 /// 本地队列取空之前不会主动去碰 injector，这个周期性回看是为了防止 injector 里的
 /// 活被本地队列饿死，对应 Go 调度器每 61 次查一遍全局队列的做法。
 const INJECT_INTERVAL: usize = 64;
+
+/// 找不到活时先空转几轮再挂起。
+///
+/// 活是一阵一阵来的，而 Windows 上一次「挂起 + 唤醒」往返要 1~10µs，白挨一次很
+/// 不划算。自旋一会儿就能接住那些只差一点点就赶上的投递，代价是几百纳秒的空转。
+///
+/// 256 是量出来的：「16 worker / 4 服务」那条压测在 3 / 64 / 256 / 1024 轮下分别是
+/// 70 / 131 / 206 / 194 万次每秒——再往上，空转的 worker 开始抢真正干活那几个的
+/// CPU，另外两条压测也跟着掉。
+const SPIN_ROUNDS: usize = 256;
+
+/// 一轮窃取最多试几个受害者。
+///
+/// BWoS 允许伪失败（对方正在写的那一块偷不动），所以「扫完一圈没偷到」并不说明
+/// 别人真闲着；与其把 N-1 条队列全读一遍，不如试两下就回去看 injector 再睡。
+const STEAL_ATTEMPTS: usize = 2;
 
 thread_local! {
     /// 当前线程绑定到了哪个调度器的哪号 worker。
@@ -166,6 +295,13 @@ struct WorkerSlot {
     tick: AtomicUsize,
     /// 挑窃取目标用的 xorshift 状态。
     rng: AtomicU64,
+    /// 绑定线程的句柄，[`Scheduler::register_worker`] 时填入，用于定向唤醒。
+    thread: ArcSwapOption<Thread>,
+    /// 定向递交的单槽，对照 ltask 的 `worker->service_ready`。
+    ///
+    /// 空指针表示没有；非空时它是一个「寄存」在这里的 `Arc` 强引用，
+    /// 取出方负责用 [`Arc::from_raw`] 收回，因此计数不会失衡。
+    handoff: AtomicPtr<ServiceContext>,
 }
 
 impl WorkerSlot {
@@ -185,6 +321,34 @@ impl WorkerSlot {
         self.rng.store(x, Ordering::Relaxed);
         x
     }
+
+    /// 把服务直接递到这个 worker 手上。槽已被占时原样交还调用方。
+    fn offer(&self, ctx: Arc<ServiceContext>) -> Result<(), Arc<ServiceContext>> {
+        let ptr = Arc::into_raw(ctx).cast_mut();
+        match self.handoff.compare_exchange(
+            std::ptr::null_mut(),
+            ptr,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => Ok(()),
+            // 安全性：CAS 失败说明这个 Arc 没交出去，所有权仍在我们手里
+            Err(_) => Err(unsafe { Arc::from_raw(ptr) }),
+        }
+    }
+
+    /// 取走别人递过来的服务。
+    fn take(&self) -> Option<Arc<ServiceContext>> {
+        let ptr = self.handoff.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        // 安全性：swap 保证同一个指针只会被一个线程取到，收回的正是 offer 寄存的那个引用
+        (!ptr.is_null()).then(|| unsafe { Arc::from_raw(ptr) })
+    }
+
+    fn wake(&self) {
+        if let Some(thread) = self.thread.load_full() {
+            thread.unpark();
+        }
+    }
 }
 
 /// 运行队列的集合：每 worker 一条 BWoS 本地队列，外加一条谁都能用的 injector。
@@ -194,7 +358,7 @@ pub(crate) struct Scheduler {
     stealers: Vec<Stealer<Arc<ServiceContext>>>,
     slots: Vec<CachePad<WorkerSlot>>,
     /// 非 worker 线程的投递、以及本地队列写满时的溢出，都落在这里。
-    injector: Mutex<VecDeque<Arc<ServiceContext>>>,
+    injector: SegQueue<Arc<ServiceContext>>,
     /// 所有队列加起来排着多少个服务。
     ///
     /// 它存在的理由是让「全都空着」这个最常见的情况便宜到只剩一次原子读：
@@ -202,15 +366,26 @@ pub(crate) struct Scheduler {
     /// 「还有别人在等吗」。没有它的话每次都要走一遍「遍历本地块 + 锁 injector +
     /// 扫一圈别人的队列」，空转成本比原来那把大锁还高。
     pending: CachePad<AtomicUsize>,
-    /// injector 里排着多少个，用来在它空着时省掉一次加锁。
-    injector_len: CachePad<AtomicUsize>,
-    /// 睡在条件变量上的 worker 数，对照 C 版 `struct monitor` 的 `sleep`。
-    sleepers: AtomicUsize,
-    /// 每次投递自增，睡前用它确认「我扫队列之后没人投过新活」。
-    notify_seq: AtomicU64,
-    /// 只用来跟 `idle` 配对，不保护任何数据。
-    gate: Mutex<()>,
-    idle: Condvar,
+    /// 空闲 worker 位图，每 64 个 worker 一个字：位 i 为 1 表示 i 号 worker 已经
+    /// 登记「我要睡了」。对照 C 版 `struct monitor` 的 `sleep` 计数，
+    /// 但记的是「谁」而不只是「几个」，这样才能定向唤醒。
+    idle: Box<[CachePad<AtomicU64>]>,
+    /// 醒着、手上没活、正在扫队列的 worker 数。
+    ///
+    /// 有人在找活时投递方就不必再叫人起来——反正那位马上会扫到这件活。
+    /// 少了这一条，一次扇出风暴会叫醒 O(消息数) 个线程，全都白起。
+    searching: CachePad<AtomicUsize>,
+    /// 同时找活的 worker 数上限，超了就直接去睡。
+    ///
+    /// 没有这道闸，N 个空闲 worker 会一起去扫全场，跨核缓存流量是 O(N²)，
+    /// 而它们本来就是因为没活干才在扫。
+    max_searchers: usize,
+    /// 「哪条本地队列有货可偷」的提示位图，每 64 个 worker 一个字。
+    ///
+    /// 有了它，挑受害者从「挨个去碰 N 条别人的队列」变成「读一个字、挑一位」。
+    /// 它只是提示，允许滞后：owner 跨块时置位（每 `BLOCK_SIZE` 个元素一次，
+    /// 摊薄到可忽略），窃贼白跑一趟就把它清掉，于是错报最多浪费一次尝试。
+    stealable: Box<[CachePad<AtomicU64>]>,
     quit: AtomicBool,
 }
 
@@ -230,21 +405,27 @@ impl Scheduler {
             locals,
             stealers,
             slots,
-            injector: Mutex::new(VecDeque::new()),
+            injector: SegQueue::new(),
             pending: CachePad(AtomicUsize::new(0)),
-            injector_len: CachePad(AtomicUsize::new(0)),
-            sleepers: AtomicUsize::new(0),
-            notify_seq: AtomicU64::new(0),
-            gate: Mutex::new(()),
-            idle: Condvar::new(),
+            idle: (0..workers.div_ceil(64))
+                .map(|_| CachePad(AtomicU64::new(0)))
+                .collect(),
+            searching: CachePad(AtomicUsize::new(0)),
+            max_searchers: (workers / 2).max(1),
+            stealable: (0..workers.div_ceil(64))
+                .map(|_| CachePad(AtomicU64::new(0)))
+                .collect(),
             quit: AtomicBool::new(false),
         }
     }
 
-    /// 把当前线程绑定成 `id` 号 worker，从此它的投递与取活优先走本地队列。
-    /// 返回的守卫析构时解绑。
+    /// 把当前线程绑定成 `id` 号 worker，从此它的投递与取活优先走本地队列，
+    /// 并且可以被定向唤醒。返回的守卫析构时解绑。
     pub(crate) fn register_worker(&self, id: usize) -> WorkerGuard {
         assert!(id < self.locals.len(), "worker 编号越界");
+        self.slots[id]
+            .thread
+            .store(Some(Arc::new(thread::current())));
         CURRENT_WORKER.with(|slot| slot.set(Some((self.identity(), id))));
         WorkerGuard
     }
@@ -266,32 +447,81 @@ impl Scheduler {
 
     /// 把一个有活干的服务放进运行队列。
     pub(crate) fn push(&self, ctx: Arc<ServiceContext>) {
-        // 有 worker 在睡就绕开本地队列：BWoS 里 owner 当前正在写的那一块对窃贼是
-        // 隐形的，活攒不满一块就塞本地，被唤醒的 worker 会空手而归。系统忙起来
-        // （无人睡）之后自然回到全速的本地路径。
-        let target = match self.worker_id() {
-            Some(id) if self.sleepers.load(Ordering::SeqCst) == 0 => Some(id),
-            _ => None,
-        };
-        let overflow = match target {
+        // 顺序要紧：先宣告「我在队列里」再真的入队。反过来的话，别的 worker 可能
+        // 已经把它取走并置成 RUNNING，我们这一记 store 就把它标成了「在队列里，
+        // 实际谁也没拿着」，这个服务从此不会再被唤醒。
+        ctx.mailbox.mark_queued();
+        self.pending.fetch_add(1, Ordering::Relaxed);
+
+        // 这道屏障与 worker 睡前的那道配对，见 [`Scheduler::find_work_or_park`]：
+        // 两侧各有一道 SeqCst 全序点，才能保证「投递方以为没人要睡、
+        // 待睡方以为没有新活」这种双向失明不会发生。
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if self.searching.load(Ordering::Relaxed) > 0 {
+            // 已经有人醒着在扫队列，就把活放进谁都够得着的 injector 让他顺手捞走，
+            // 省下一次挂起唤醒往返（Windows 上 1~10µs，乒乓型负载里全部开销都在这）。
+            // 这里**不能**图快放自己的本地队列：BWoS 里 owner 正在写的那一块对窃贼
+            // 是隐形的，那位扫一圈空手而归就去睡了，下一跳又得叫人。
+            self.injector.push(ctx);
+            return;
+        }
+        if let Some(id) = self.claim_idle() {
+            // 定向递交：既省掉一趟 injector，也同样绕开了「当前块隐形」的问题
+            let slot = &self.slots[id];
+            if let Err(ctx) = slot.offer(ctx) {
+                self.place(ctx);
+            }
+            // 位已经被我们摘掉了，不管递交成不成，这一下都必须叫：
+            // 否则没人再会来叫它，它就带着活睡过去了
+            slot.wake();
+            return;
+        }
+        // 大家都在忙，没人等着接活：进自己的本地队列，这条路最快
+        self.place(ctx);
+    }
+
+    /// 把服务安置进某条运行队列：worker 线程优先放自己的本地队列（无锁且缓存热），
+    /// 其余线程与本地队列写满的溢出都落到 injector。
+    fn place(&self, ctx: Arc<ServiceContext>) {
+        let overflow = match self.worker_id() {
             // 安全性：worker 编号来自线程局部变量，同一条本地队列只有绑定它的
             // 那个线程会走到这里，满足 BWoS 的 owner 独占契约。
-            Some(id) => unsafe { self.locals[id].push_back(ctx) }.err(),
+            Some(id) => match unsafe { self.locals[id].push_back(ctx) } {
+                // 让出了一整块，告诉窃贼这里有货
+                Ok(bwos::Pushed::Granted) => {
+                    self.mark_stealable(id);
+                    None
+                }
+                Ok(bwos::Pushed::Local) => None,
+                Err(ctx) => Some(ctx),
+            },
             None => Some(ctx),
         };
         if let Some(ctx) = overflow {
-            self.push_injector(ctx);
+            self.injector.push(ctx);
         }
-        self.pending.fetch_add(1, Ordering::Relaxed);
-        self.notify();
     }
 
     /// 取一个有活干的服务。worker 线程走「本地 -> injector -> 窃取」，
     /// 其它线程只能取 injector。
+    ///
+    /// 取到的服务状态一律置成 `RUNNING`，也就是「已被本线程独占」——
+    /// 这是「同一服务绝不会被两个 worker 同时执行」这条不变量的落点。
     pub(crate) fn pop(&self) -> Option<Arc<ServiceContext>> {
+        let ctx = self.pop_runnable()?;
+        ctx.mailbox.mark_running();
+        Some(ctx)
+    }
+
+    fn pop_runnable(&self) -> Option<Arc<ServiceContext>> {
         let Some(id) = self.worker_id() else {
             return self.pop_injector();
         };
+        // 别人指名递到手上的活最优先，而且这一步不能被下面的 pending 快速判空绕过
+        if let Some(ctx) = self.slots[id].take() {
+            self.pending.fetch_sub(1, Ordering::Relaxed);
+            return Some(ctx);
+        }
         if self.pending.load(Ordering::Relaxed) == 0 {
             // 全都空着，这是让渡路径上最常走的一条，到此为止
             return None;
@@ -310,46 +540,61 @@ impl Scheduler {
         self.pop_injector().or_else(|| self.steal(id))
     }
 
-    fn push_injector(&self, ctx: Arc<ServiceContext>) {
-        let mut injector = self.injector.lock();
-        injector.push_back(ctx);
-        self.injector_len.store(injector.len(), Ordering::Release);
-    }
-
     fn pop_injector(&self) -> Option<Arc<ServiceContext>> {
-        if self.injector_len.load(Ordering::Acquire) == 0 {
-            return None;
-        }
-        let mut injector = self.injector.lock();
         // 可能被别的线程抢先取空了，这时什么都不该记账
-        let ctx = injector.pop_front()?;
-        self.injector_len.store(injector.len(), Ordering::Release);
+        let ctx = self.injector.pop()?;
         self.pending.fetch_sub(1, Ordering::Relaxed);
         Some(ctx)
     }
 
-    /// 从随机一个起点扫一圈别人的队列。偷不到不代表别人真闲着——
-    /// 对方正在写的那一块本来就偷不动。
+    /// 按 `stealable` 位图挑受害者下手，最多试 [`STEAL_ATTEMPTS`] 个。
+    ///
+    /// 位图之外的队列一概不碰：读一个字就能筛掉全场，省下的正是「一个空闲 worker
+    /// 挨个去读 N-1 条别人的队列头」那份跨核缓存流量。起点仍然随机，免得所有窃贼
+    /// 一起盯着编号最小的那个受害者。
+    ///
+    /// 偷不到不代表对方真闲着——对方正在写的那一块本来就偷不动，所以这里失败即
+    /// 收手，回去看 injector、自旋、然后睡，比固执地扫满一圈划算。
     fn steal(&self, id: usize) -> Option<Arc<ServiceContext>> {
         let count = self.stealers.len();
         if count < 2 {
             return None;
         }
         let start = (self.slots[id].next_random() % count as u64) as usize;
+        let mut attempts = 0;
         for offset in 0..count {
             let victim = (start + offset) % count;
-            if victim == id {
+            if victim == id || !self.is_stealable(victim) {
                 continue;
             }
             if let Some(ctx) = self.stealers[victim].steal_front() {
                 self.pending.fetch_sub(1, Ordering::Relaxed);
                 return Some(ctx);
             }
+            // 白跑一趟：把提示位清掉，别的窃贼就不必再来一遍。
+            // owner 下次跨块会重新置位，所以清早了也不会漏活
+            self.clear_stealable(victim);
+            attempts += 1;
+            if attempts >= STEAL_ATTEMPTS {
+                break;
+            }
         }
         None
     }
 
-    /// worker 收工前把本地队列倒进 injector。
+    fn is_stealable(&self, id: usize) -> bool {
+        self.stealable[id / 64].load(Ordering::Relaxed) & (1 << (id % 64)) != 0
+    }
+
+    fn mark_stealable(&self, id: usize) {
+        self.stealable[id / 64].fetch_or(1 << (id % 64), Ordering::Release);
+    }
+
+    fn clear_stealable(&self, id: usize) {
+        self.stealable[id / 64].fetch_and(!(1 << (id % 64)), Ordering::Relaxed);
+    }
+
+    /// worker 收工前把手上的队列倒进 injector。
     ///
     /// 收尾阶段主线程还要把剩下的活干完，而它取不到别人的本地队列——窃取允许伪
     /// 失败，靠不住。只有 owner 自己的 `pop_back` 能确定性地排空。
@@ -357,76 +602,138 @@ impl Scheduler {
         let Some(id) = self.worker_id() else {
             return;
         };
-        let mut injector = self.injector.lock();
+        if let Some(ctx) = self.slots[id].take() {
+            self.injector.push(ctx);
+        }
         // 安全性：同上，owner 侧操作只由绑定线程发起。
         while let Some(ctx) = unsafe { self.locals[id].pop_back() } {
-            injector.push_back(ctx);
+            self.injector.push(ctx);
         }
-        self.injector_len.store(injector.len(), Ordering::Release);
+        self.clear_stealable(id);
     }
 
-    /// 取一次投递序列号快照。worker 要在**扫队列之前**取，才能识别出
-    /// 「扫完到睡下这段时间里有人投了新活」。
-    pub(crate) fn notify_seq(&self) -> u64 {
-        self.notify_seq.load(Ordering::SeqCst)
-    }
-
-    /// 投递之后叫醒一个睡着的 worker。
+    /// 找活：先连扫几轮，扫不到就登记空闲并挂起。返回自旋期间捞到的活。
     ///
-    /// C 版的 `skynet_globalmq_push` 并不唤醒 worker，靠定时器线程每 2.5ms 顺手
-    /// 唤醒，代价是消息在所有 worker 都睡着时最坏要等一个 tick。这里改成有人睡就
-    /// 直接唤一个，延迟更低；没人睡时只花两个原子操作，连锁都不用碰。
-    fn notify(&self) {
-        self.notify_seq.fetch_add(1, Ordering::SeqCst);
-        if self.sleepers.load(Ordering::SeqCst) > 0 {
-            // 借 gate 排一次队：确保对方要么已经睡稳（收得到通知），
-            // 要么还没进入 wait（会自己复查序列号后放弃睡觉）
-            drop(self.gate.lock());
-            self.idle.notify_one();
+    /// # 为什么不会丢唤醒
+    ///
+    /// 投递方是「压队列 → 屏障 → 看有没有人在找活 / 有没有人睡着」，
+    /// 待睡方是「登记空闲位 → 屏障 → 再扫一遍队列」。两边各有一道 SeqCst 全序点，
+    /// 于是至少有一方能看见对方：要么投递方看到空闲位并把我们叫起来，
+    /// 要么我们那最后一遍扫描能看到它投的活。这就是原来那套「投递序列号 + 条件
+    /// 变量」的无锁版本，代价从「共享行上的 SeqCst 读改写」降到「本地屏障 +
+    /// 读多写少的普通读」，而且唤醒从「随便叫一个」变成了定向叫。
+    ///
+    /// `thread::park` 自带唤醒令牌，早到的 `unpark` 不会丢，所以这里不需要
+    /// 「睡前复查」之外的任何配合。
+    pub(crate) fn find_work_or_park(&self) -> Option<Arc<ServiceContext>> {
+        let id = self.worker_id().expect("只有 worker 线程会来找活");
+        // 找活的人已经够多了就别再添乱，直接去睡：真有活时投递方会点名叫我们
+        let rounds = if self.searching.fetch_add(1, Ordering::SeqCst) < self.max_searchers {
+            SPIN_ROUNDS
+        } else {
+            0
+        };
+        for _ in 0..rounds {
+            if let Some(ctx) = self.pop() {
+                self.searching.fetch_sub(1, Ordering::Relaxed);
+                return Some(ctx);
+            }
+            if self.is_quit() {
+                self.searching.fetch_sub(1, Ordering::Relaxed);
+                return None;
+            }
+            std::hint::spin_loop();
         }
+
+        // 登记空闲位必须排在 searching 减回去之前：中间那一瞬要是「既没人在找活、
+        // 也没人登记空闲」，投递方就谁都不叫了，而我们正准备睡下
+        self.mark_idle(id);
+        self.searching.fetch_sub(1, Ordering::SeqCst);
+        std::sync::atomic::fence(Ordering::SeqCst);
+
+        if let Some(ctx) = self.pop() {
+            self.clear_idle(id);
+            return Some(ctx);
+        }
+        if !self.is_quit() {
+            thread::park();
+        }
+        self.clear_idle(id);
+        None
     }
 
-    /// worker 空闲时睡在这里。`seq` 必须是**开始找活之前**取的快照。
-    pub(crate) fn wait_for_work(&self, seq: u64) {
-        // 先声明「我要睡了」，再复查序列号。这两步与 notify 里「先自增序列号、
-        // 再看有没有人睡」构成 Dekker 模式：SeqCst 全序保证两边至少一方看到对方，
-        // 因此不会出现「投递方以为没人睡、睡眠方以为没新活」的丢唤醒。
-        self.sleepers.fetch_add(1, Ordering::SeqCst);
-        let mut gate = self.gate.lock();
-        if self.notify_seq.load(Ordering::SeqCst) == seq && !self.is_quit() {
-            self.idle.wait(&mut gate);
+    /// 摘一个已登记空闲的 worker 出来，摘到就意味着「叫它起来是我的责任」。
+    fn claim_idle(&self) -> Option<usize> {
+        for (index, word) in self.idle.iter().enumerate() {
+            let mut bits = word.load(Ordering::Relaxed);
+            while bits != 0 {
+                let bit = bits.trailing_zeros();
+                match word.compare_exchange_weak(
+                    bits,
+                    bits & !(1 << bit),
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return Some(index * 64 + bit as usize),
+                    // 被别的投递方抢先摘走了，看看这个字里还有没有别人
+                    Err(actual) => bits = actual,
+                }
+            }
         }
-        drop(gate);
-        self.sleepers.fetch_sub(1, Ordering::SeqCst);
+        None
+    }
+
+    fn mark_idle(&self, id: usize) {
+        self.idle[id / 64].fetch_or(1 << (id % 64), Ordering::SeqCst);
+    }
+
+    fn clear_idle(&self, id: usize) {
+        self.idle[id / 64].fetch_and(!(1 << (id % 64)), Ordering::Relaxed);
     }
 
     /// 定时器线程的兜底唤醒，对照 C 版 `wakeup(m, m->count - 1)`。
     pub(crate) fn poke(&self) {
-        if self.len() > 0 && self.sleepers.load(Ordering::SeqCst) > 0 {
-            self.notify();
+        if self.len() > 0 {
+            if let Some(id) = self.claim_idle() {
+                self.slots[id].wake();
+            }
         }
     }
 
     pub(crate) fn set_quit(&self) {
         self.quit.store(true, Ordering::Release);
-        self.notify_seq.fetch_add(1, Ordering::SeqCst);
-        drop(self.gate.lock());
-        self.idle.notify_all();
+        // 收工信号要让所有睡着的 worker 都醒过来，一个都不能落下
+        for slot in &self.slots {
+            slot.wake();
+        }
     }
 
     pub(crate) fn is_quit(&self) -> bool {
         self.quit.load(Ordering::Acquire)
     }
 
-    /// 正在睡觉的 worker 数，仅供测试等待「对方确实睡下了」。
+    /// 已登记空闲的 worker 数，仅供测试等待「对方确实睡下了」。
     #[cfg(test)]
     pub(crate) fn sleeping(&self) -> usize {
-        self.sleepers.load(Ordering::SeqCst)
+        self.idle
+            .iter()
+            .map(|word| word.load(Ordering::SeqCst).count_ones() as usize)
+            .sum()
     }
 
     /// 排队中的服务总数，观测用，允许短暂不精确。
     pub(crate) fn len(&self) -> usize {
         self.pending.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for Scheduler {
+    fn drop(&mut self) {
+        // handoff 槽里寄存着 Arc 强引用，正常收尾时 flush_local 会取空，
+        // 这里兜住异常路径（比如 worker 线程 panic）以免泄漏
+        for slot in &self.slots {
+            drop(slot.take());
+        }
     }
 }
 
@@ -452,28 +759,66 @@ mod tests {
         Message::new(1, session, MsgType::USER, Payload::None)
     }
 
-    /// in_global 标志只有在邮箱确实空了之后才清掉
-    #[test]
-    fn in_global_cleared_only_when_empty() {
+    /// 造一个「已被 worker 领走」的邮箱，即 take_work 的正常前提
+    fn running_mailbox() -> Mailbox {
         let mailbox = Mailbox::new();
-        // 新建时 in_global 已置位，第一次投递不需要入队
+        mailbox.mark_running();
+        mailbox
+    }
+
+    /// 状态只有在邮箱确实空了之后才落回 IDLE
+    #[test]
+    fn state_falls_back_to_idle_only_when_empty() {
+        let mailbox = Mailbox::new();
+        // 新建时状态已是 QUEUED，第一次投递不需要入队
         assert!(!mailbox.push_message(message(1)));
+        mailbox.mark_running();
         assert!(matches!(mailbox.take_work(), Some(Work::Message(_))));
-        // 队列空 -> 清标志
+        // 队列空 -> 落回 IDLE
         assert!(mailbox.take_work().is_none());
-        // 清掉之后再投递就需要调用方入队了
+        // 落回之后再投递就需要调用方入队了
         assert!(mailbox.push_message(message(2)));
         assert!(!mailbox.push_message(message(3)));
+    }
+
+    /// 持有期间来的活不会丢：消费方判空之后才被通知，也必须重扫一遍
+    #[test]
+    fn work_arriving_during_the_empty_check_is_not_lost() {
+        let mailbox = running_mailbox();
+        // 投递方压进一条活，并把状态从 RUNNING 推到 NOTIFIED
+        assert!(!mailbox.push_message(message(1)), "持有者还在，投递方不该自己入队");
+        assert!(matches!(mailbox.take_work(), Some(Work::Message(_))));
+
+        // 再模拟最刁的那一刻：消费方已经看完两条空队列、正要落回 IDLE 时被通知。
+        // 此时状态是 NOTIFIED 而队列是空的，消费方必须复位重扫一遍才能放生
+        assert!(!mailbox.notify());
+        assert!(mailbox.take_work().is_none(), "重扫确实没活，才允许落回 IDLE");
+        // 落回之后的投递方就该自己负责入队了
+        assert!(mailbox.push_message(message(2)));
+    }
+
+    /// 清理期间又来了活就不许放生：否则服务会被别的 worker 领走，两个人同时清一个
+    #[test]
+    fn release_refuses_while_new_work_arrives() {
+        let mailbox = running_mailbox();
+        assert!(mailbox.release(), "队列空着，放生");
+
+        mailbox.mark_running();
+        assert!(!mailbox.push_message(message(1)), "持有者还在，不必入队");
+        assert!(!mailbox.release(), "清理期间来了新活，不许放生");
+        // 状态仍归调用方所有，再清一遍才放得掉
+        mailbox.drain();
+        assert!(mailbox.release());
     }
 
     /// 就绪任务要排在新消息前面，对应协程被 resume 后跑到下次 yield 才轮到下条消息
     #[test]
     fn ready_tasks_come_before_messages() {
-        let mailbox = Mailbox::new();
+        let mailbox = running_mailbox();
         mailbox.push_message(message(1));
-        mailbox.push_ready(7);
+        mailbox.push_ready(Ready::Task(7));
         match mailbox.take_work() {
-            Some(Work::Task(id)) => assert_eq!(id, 7),
+            Some(Work::Ready(Ready::Task(id))) => assert_eq!(id, 7),
             other => panic!("应先取到就绪任务，实际是 {:?}", other.is_some()),
         }
         assert!(matches!(mailbox.take_work(), Some(Work::Message(_))));
@@ -482,7 +827,7 @@ mod tests {
     /// 报警一次之后阈值翻倍，免得持续过载时把日志刷爆
     #[test]
     fn overload_threshold_doubles() {
-        let mailbox = Mailbox::new();
+        let mailbox = running_mailbox();
         for i in 0..(OVERLOAD_THRESHOLD * 2 + 2) {
             mailbox.push_message(message(i as i32));
         }
@@ -496,6 +841,7 @@ mod tests {
 
         // 队列排空后阈值复位
         while mailbox.take_work().is_some() {}
+        mailbox.mark_running();
         for i in 0..(OVERLOAD_THRESHOLD + 2) {
             mailbox.push_message(message(i as i32));
         }
@@ -506,13 +852,54 @@ mod tests {
     /// 销毁时要能把未处理的消息全部取出来，好给发送方回错误
     #[test]
     fn drain_returns_all_pending_messages() {
-        let mailbox = Mailbox::new();
+        let mailbox = running_mailbox();
         mailbox.push_message(message(1));
         mailbox.push_message(message(2));
-        mailbox.push_ready(3);
+        mailbox.push_ready(Ready::Task(3));
         let left = mailbox.drain();
         assert_eq!(left.len(), 2);
+        assert_eq!(mailbox.len(), 0, "长度计数要跟着清干净");
         assert!(mailbox.take_ready().is_none());
+    }
+
+    /// 多个投递方与一个消费方并发时，一件活都不能丢、也不能被处理两次
+    #[test]
+    fn concurrent_push_and_take_lose_nothing() {
+        const SENDERS: usize = 4;
+        const PER_SENDER: i32 = 5_000;
+
+        let mailbox = Mailbox::new();
+        // 用一个布尔量冒充运行队列：true 表示这个服务正排在里面等人来取
+        let queued = AtomicBool::new(true);
+        let mut taken = 0usize;
+
+        thread::scope(|scope| {
+            for _ in 0..SENDERS {
+                scope.spawn(|| {
+                    for i in 0..PER_SENDER {
+                        if mailbox.push_message(message(i)) {
+                            queued.store(true, Ordering::Release);
+                        }
+                    }
+                });
+            }
+
+            let total = SENDERS * PER_SENDER as usize;
+            while taken < total {
+                // 取走服务这一步与真实的 Scheduler::pop 一致：先出队，再置 RUNNING
+                if !queued.swap(false, Ordering::AcqRel) {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                mailbox.mark_running();
+                while mailbox.take_work().is_some() {
+                    taken += 1;
+                }
+            }
+        });
+
+        assert_eq!(taken, SENDERS * PER_SENDER as usize, "一条都不该丢");
+        assert_eq!(mailbox.len(), 0);
     }
 
     /// 没绑定 worker 的线程（主线程、定时器线程）只走 injector，收发都得通
@@ -552,6 +939,41 @@ mod tests {
         });
     }
 
+    /// 可偷位图允许滞后，但不能长期错位：攒满一块就置位，窃贼白跑一趟就清位
+    #[test]
+    fn the_stealable_hint_follows_the_queues() {
+        let node = test_node_with(Config::default().with_thread(2));
+        let sched = &node.sched;
+
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let _worker = sched.register_worker(0);
+                // 不满一块时对窃贼是隐形的，位图也不该置位
+                for handle in 0..(bwos::BLOCK_SIZE as u32) {
+                    sched.push(dummy_context_on(node.clone(), handle));
+                }
+                assert!(!sched.is_stealable(0), "还在当前块里，没什么可偷");
+                // 再压一个就跨块了，前一块整块交出去
+                sched.push(dummy_context_on(node.clone(), 999));
+                assert!(sched.is_stealable(0));
+            });
+        });
+
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let _worker = sched.register_worker(1);
+                // 位图指到哪偷到哪，把交出来的那一块掏空
+                for _ in 0..bwos::BLOCK_SIZE {
+                    assert!(sched.pop().is_some());
+                }
+                assert!(sched.is_stealable(0), "位图滞后是允许的");
+                // 白跑这一趟之后位就该清掉，别的窃贼不必再来一遍
+                assert!(sched.pop().is_none());
+                assert!(!sched.is_stealable(0));
+            });
+        });
+    }
+
     /// 本地队列写满之后要溢出到 injector，一件活都不能丢
     #[test]
     fn local_overflow_falls_back_to_the_injector() {
@@ -586,9 +1008,9 @@ mod tests {
         thread::scope(|scope| {
             scope.spawn(|| {
                 let _worker = sched.register_worker(0);
-                let seq = sched.notify_seq();
                 assert!(sched.pop().is_none());
-                sched.wait_for_work(seq);
+                // 自旋几轮后登记空闲位并挂起，被叫醒后从 handoff 槽里取到那件活
+                sched.find_work_or_park();
                 found.store(sched.pop().is_some(), Ordering::SeqCst);
             });
 
@@ -596,11 +1018,69 @@ mod tests {
             while sched.sleeping() == 0 {
                 std::hint::spin_loop();
             }
-            // 明知有人在睡，1 号就该把活放进谁都够得着的 injector 而不是自己的本地队列
+            // 明知有人在睡，1 号就该把活直接递到它手上而不是塞自己的本地队列
             let _worker = sched.register_worker(1);
             sched.push(dummy_context_on(node.clone(), 1));
         });
 
         assert!(found.load(Ordering::SeqCst), "被唤醒的 worker 应当能取到那件活");
+    }
+
+    /// 递到手上的活优先于本地队列里的：定向唤醒的语义就是「这件活归你」
+    #[test]
+    fn a_handed_off_service_comes_first() {
+        let node = test_node_with(Config::default().with_thread(2));
+        let sched = &node.sched;
+
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let _worker = sched.register_worker(0);
+                // 先往自己的本地队列里塞一个，此时无人空闲，走的是本地路径
+                sched.push(dummy_context_on(node.clone(), 7));
+                // 再登记成空闲，于是下一次投递会走「摘一个空闲 worker 定向递交」
+                sched.mark_idle(0);
+                sched.push(dummy_context_on(node.clone(), 9));
+                assert_eq!(sched.sleeping(), 0, "空闲位应当被投递方摘走");
+                assert_eq!(sched.pop().map(|ctx| ctx.handle), Some(9), "递到手上的优先");
+                assert_eq!(sched.pop().map(|ctx| ctx.handle), Some(7));
+            });
+        });
+    }
+
+    /// handoff 槽被占着时投递要退回队列，不能把活丢了
+    #[test]
+    fn a_taken_handoff_slot_falls_back_to_the_queue() {
+        let node = test_node_with(Config::default().with_thread(2));
+        let sched = &node.sched;
+
+        // 第一件活递进 0 号的槽里
+        sched.mark_idle(0);
+        sched.push(dummy_context_on(node.clone(), 1));
+        // 第二件活来的时候槽已经占着了，只能退回队列
+        sched.mark_idle(0);
+        sched.push(dummy_context_on(node.clone(), 2));
+
+        assert_eq!(sched.len(), 2, "两件活都得在账上");
+        // 递到 0 号手上那件只有它自己拿得到，非 worker 线程只够得着 injector
+        assert_eq!(sched.pop().map(|ctx| ctx.handle), Some(2));
+        assert!(sched.pop().is_none());
+    }
+
+    /// 已经有 worker 醒着在找活时，投递方不该再叫醒别人
+    #[test]
+    fn a_searching_worker_absorbs_the_wakeup() {
+        let node = test_node_with(Config::default().with_thread(2));
+        let sched = &node.sched;
+
+        // 0 号登记为空闲，同时假装有人正在找活
+        sched.mark_idle(0);
+        sched.searching.fetch_add(1, Ordering::SeqCst);
+        sched.push(dummy_context_on(node.clone(), 1));
+        assert_eq!(sched.sleeping(), 1, "有人在找活，空闲位不该被摘掉");
+
+        // 找活的那位走了，下一次投递才轮到叫人
+        sched.searching.fetch_sub(1, Ordering::SeqCst);
+        sched.push(dummy_context_on(node.clone(), 2));
+        assert_eq!(sched.sleeping(), 0, "这次该把睡着的 0 号摘出来叫醒了");
     }
 }

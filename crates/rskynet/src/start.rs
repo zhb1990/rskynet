@@ -16,6 +16,7 @@ use serde::Deserialize;
 use crate::error::{Error, Result};
 use crate::module::Registry;
 use crate::server::Node;
+use crate::timer::Wheel;
 
 /// 各 worker 线程的消息批处理权重，直接照搬 C 版 `skynet_start.c` 里的常量表。
 const WORKER_WEIGHTS: [i32; 32] = [
@@ -167,11 +168,10 @@ fn worker_loop(node: &Node, id: usize, weight: i32) {
     let _worker = node.sched.register_worker(id);
     let mut hold = None;
     while !node.sched.is_quit() {
-        // 序列号要在**开始找活之前**取，否则「扫完队列」到「睡下」之间的投递会被漏掉
-        let seq = node.sched.notify_seq();
         hold = node.dispatch(hold.take(), weight);
         if hold.is_none() {
-            node.sched.wait_for_work(seq);
+            // 找活：先自旋几轮，还是空手就登记空闲位并挂起，等人定向叫醒
+            hold = node.sched.find_work_or_park();
         }
     }
     // 收工时手里可能还捏着一个服务：它的 in_global 仍是置位的，却已经不在运行
@@ -186,9 +186,12 @@ fn worker_loop(node: &Node, id: usize, weight: i32) {
 }
 
 /// 定时器主循环，对照 C 版 `thread_timer`。
+///
+/// 时间轮就建在这个栈帧上，全节点只有本线程碰得到它，因此不必加锁。
 fn timer_loop(node: &Node) {
+    let mut wheel = Wheel::new();
     while !node.sched.is_quit() {
-        node.fire_timers();
+        node.fire_timers(&mut wheel);
         if node.total() == 0 {
             break;
         }

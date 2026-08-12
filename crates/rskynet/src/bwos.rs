@@ -70,6 +70,19 @@ impl<T> DerefMut for CachePad<T> {
     }
 }
 
+/// 一次压入的结果：调用方靠它知道「有没有新的整块可以被偷了」。
+///
+/// 调度器用这个信号维护一张「哪条本地队列有货可偷」的位图，于是窃贼挑受害者时
+/// 只需读一个字，不必挨个去碰别人的队列（那可是 N 条跨核缓存行）。
+/// 因为跨块每 `block_size` 个元素才发生一次，这个信号本身几乎不要钱。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Pushed {
+    /// 值落在 owner 正在写的那一块里，对窃贼还是隐形的。
+    Local,
+    /// 跨块了：前一块已整块交给窃贼，现在偷得动。
+    Granted,
+}
+
 /// 一次窃取的结果。
 enum Steal<T> {
     Taken(T),
@@ -303,18 +316,23 @@ impl<T> LifoQueue<T> {
     /// # Safety
     ///
     /// 只能由 owner 线程调用。
-    unsafe fn push_back(&self, value: T) -> Result<(), T> {
+    unsafe fn push_back(&self, value: T) -> Result<Pushed, T> {
         let mut owner = self.last_block.load(Ordering::Relaxed);
         let mut value = value;
+        let mut granted = false;
         loop {
             let owner_index = (owner & self.mask) as usize;
             match unsafe { self.blocks[owner_index].put(value) } {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    return Ok(if granted { Pushed::Granted } else { Pushed::Local });
+                }
                 Err(back) => value = back,
             }
             if !self.advance_put_index(&mut owner) {
                 return Err(value);
             }
+            // 迈进下一块的同时把前一块交给了窃贼，见 advance_put_index 里的 grant
+            granted = true;
         }
     }
 
@@ -430,12 +448,13 @@ pub(crate) fn queue<T>(num_blocks: usize, block_size: usize) -> (Owner<T>, Steal
 }
 
 impl<T> Owner<T> {
-    /// 压入一个元素。返回 `Err` 表示队列满了，值原样交还，调用方自行找地方安置。
+    /// 压入一个元素。返回 `Err` 表示队列满了，值原样交还，调用方自行找地方安置；
+    /// 返回 [`Pushed::Granted`] 表示这一下让出了一整块，窃贼从此偷得动。
     ///
     /// # Safety
     ///
     /// 同一时刻只能有一个线程调用本队列的 owner 侧方法。
-    pub(crate) unsafe fn push_back(&self, value: T) -> Result<(), T> {
+    pub(crate) unsafe fn push_back(&self, value: T) -> Result<Pushed, T> {
         unsafe { self.queue.push_back(value) }
     }
 
@@ -496,7 +515,7 @@ mod tests {
         let mut pushed = 0u32;
         let rejected = loop {
             match unsafe { owner.push_back(pushed) } {
-                Ok(()) => pushed += 1,
+                Ok(_) => pushed += 1,
                 Err(value) => break value,
             }
             assert!(pushed < 64, "容量应当有限");
@@ -504,6 +523,19 @@ mod tests {
         assert_eq!(rejected, pushed, "被拒的值必须原样交还");
         // 弹掉一个之后仍然进不去：owner 还在原地那一块，得等它退回去腾出空间
         assert!(unsafe { owner.pop_back() }.is_some());
+    }
+
+    /// 跨块时要报出「有整块可偷了」，调度器靠这个信号维护可偷位图
+    #[test]
+    fn crossing_a_block_reports_the_grant() {
+        let (owner, _stealer) = queue::<u32>(4, 4);
+        for i in 0..4 {
+            let pushed = unsafe { owner.push_back(i) }.expect("不该满");
+            assert_eq!(pushed, Pushed::Local, "同一块里的压入对窃贼还是隐形的");
+        }
+        // 第 5 个装不进当前块，owner 迈进下一块，前一块就交出去了
+        let pushed = unsafe { owner.push_back(4) }.expect("不该满");
+        assert_eq!(pushed, Pushed::Granted);
     }
 
     /// 窃贼从最早的元素开始拿，而且只能拿 owner 已经走过的块

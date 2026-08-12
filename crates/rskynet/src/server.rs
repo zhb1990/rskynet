@@ -12,7 +12,7 @@
 //! [`Node::destroy`] 会清空任务集，循环随之断开，`Arc` 计数归零。
 //! 这与 skynet 里 `delete_context` 释放 Lua 虚拟机、连带干掉所有协程是一个道理。
 
-use std::collections::HashMap;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -24,11 +24,11 @@ use crate::error::{Error, Result};
 use crate::handle::HandleStorage;
 use crate::message::{Addr, Message, MsgType, Payload};
 use crate::module::Registry;
-use crate::mq::{Mailbox, Scheduler, Work};
+use crate::mq::{Mailbox, Ready, Scheduler, Work};
 use crate::session::SessionTable;
 use crate::start::Config;
 use crate::task::TaskSet;
-use crate::timer::Timer;
+use crate::timer::{Timer, Wheel};
 
 /// 一个服务的运行时上下文。
 pub(crate) struct ServiceContext {
@@ -40,10 +40,6 @@ pub(crate) struct ServiceContext {
     pub(crate) sessions: SessionTable,
     service: Arc<dyn Service>,
     tasks: TaskSet,
-    /// 正在处理中的请求：任务 id -> (请求方, session)。
-    /// 服务半途退出时要给这些请求方回一个错误，否则对方的 `call` 永远挂着。
-    /// 对照 `lualib/skynet.lua` 里 `skynet.exit` 遍历 `session_coroutine_id` 的那段。
-    inflight: Mutex<HashMap<usize, (u32, i32)>>,
     /// 已被摘出 handle 表，等待某个 worker 领走做销毁。
     dead: AtomicBool,
     /// 保留服务：不计入退出条件，且要留到最后才释放。
@@ -55,13 +51,42 @@ pub(crate) struct ServiceContext {
     message_count: AtomicU64,
     /// 累计占用 worker 的时间，单位微秒；仅在 `profile` 打开时统计。
     cpu_cost: AtomicU64,
-    /// 指向自己，用于把自己推进全局队列、以及给任务 waker 用。
+    /// 指向自己，给任务 waker 用：waker 可能被外部长期扣着，不该吊住整个服务。
     me: Weak<ServiceContext>,
 }
 
+thread_local! {
+    /// 当前线程正在执行哪个服务，存的是 `ServiceContext` 的地址，0 表示不在服务里。
+    ///
+    /// 服务内部那些不加锁的容器（任务集、用户自己的 [`crate::SvcCell`]）都以
+    /// 「只有正在执行本服务的线程会碰」为前提，这个量就是用来当场判定这一点的。
+    static CURRENT_SERVICE: Cell<usize> = const { Cell::new(0) };
+}
+
+/// 标记「本线程正在执行某个服务」，析构时还原成先前那个。
+///
+/// 需要还原而不是清零，是因为会嵌套：服务 A 的任务里调 `launch` 起服务 B 时，
+/// B 的 init 会就地在 A 的线程上跑到第一次挂起。
+struct Running(usize);
+
+impl Running {
+    fn enter(ctx: &ServiceContext) -> Self {
+        let me = ctx as *const ServiceContext as usize;
+        Running(CURRENT_SERVICE.with(|cell| cell.replace(me)))
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        CURRENT_SERVICE.with(|cell| cell.set(self.0));
+    }
+}
+
 impl ServiceContext {
-    fn arc(&self) -> Arc<ServiceContext> {
-        self.me.upgrade().expect("服务上下文正在被释放")
+    /// 本线程此刻是否正在执行本服务，也就是能不能直接动服务内部那些不加锁的容器。
+    fn owns_current_thread(&self) -> bool {
+        let me = self as *const ServiceContext as usize;
+        CURRENT_SERVICE.with(|cell| cell.get()) == me
     }
 
     pub(crate) fn is_dead(&self) -> bool {
@@ -77,22 +102,42 @@ impl ServiceContext {
     }
 
     /// 投递一条消息。这是所有消息进入服务的唯一入口。
-    pub(crate) fn push(&self, msg: Message) {
+    ///
+    /// 收 `&Arc<Self>` 而不是 `&self`：投递方手上本来就有 `Arc`，这样入队时只需
+    /// 一次普通 `Arc::clone`，省掉每条消息一次 `Weak::upgrade`（那是个 CAS 循环）。
+    pub(crate) fn push(self: &Arc<Self>, msg: Message) {
         if self.mailbox.push_message(msg) {
-            self.node.sched.push(self.arc());
+            self.node.sched.push(self.clone());
         }
     }
 
     /// 唤醒服务内的某个任务，与消息投递走同一条「进入运行队列」的路径。
-    pub(crate) fn wake_task(&self, task: usize) {
-        if self.mailbox.push_ready(task) {
-            self.node.sched.push(self.arc());
+    pub(crate) fn wake_task(self: &Arc<Self>, task: usize) {
+        if self.mailbox.push_ready(Ready::Task(task)) {
+            self.node.sched.push(self.clone());
         }
     }
 
     /// 起一个服务内任务，等价于 skynet 的 `skynet.fork`。
-    pub(crate) fn spawn(&self, future: BoxFuture<'static, ()>) -> usize {
-        let task = self.tasks.insert(&self.me, future);
+    ///
+    /// `Ctx` 是 `Send` 的，用户完全可以从自己起的 OS 线程调它，而那个线程碰不得
+    /// 服务的任务集（见 [`crate::task`] 的安全契约）。所以这里分两条路：本线程
+    /// 正执行本服务就直接插入，否则把 future 当成一件活塞进邮箱，由持有者插入。
+    pub(crate) fn spawn(self: &Arc<Self>, future: BoxFuture<'static, ()>) {
+        if self.owns_current_thread() {
+            self.install_task(future, None);
+        } else if self.mailbox.push_ready(Ready::Spawn(future)) {
+            self.node.sched.push(self.clone());
+        }
+    }
+
+    /// 把一个 future 放进任务集并排进就绪队列。只有持有本服务的线程能调用。
+    fn install_task(
+        self: &Arc<Self>,
+        future: BoxFuture<'static, ()>,
+        request: Option<(u32, i32)>,
+    ) -> usize {
+        let task = self.tasks.insert(&self.me, future, request);
         self.wake_task(task);
         task
     }
@@ -112,7 +157,7 @@ impl ServiceContext {
 
     /// 处理一条消息，对照 C 版 `dispatch_message` 与 skynet.lua 的
     /// `raw_dispatch_message`：应答消息唤醒挂起的 session，其余消息开一个新任务。
-    fn handle_message(&self, mut msg: Message) {
+    fn handle_message(self: &Arc<Self>, mut msg: Message) {
         self.message_count.fetch_add(1, Ordering::Relaxed);
         if msg.mtype.is_reply() && msg.session != 0 {
             let result = if msg.mtype == MsgType::ERROR {
@@ -124,13 +169,9 @@ impl ServiceContext {
             return;
         }
         let (source, session) = (msg.source, msg.session);
-        let ctx = Ctx::new(self.arc());
-        // 这里只是把任务排进就绪队列，真正的 poll 在本函数返回之后，
-        // 所以登记 inflight 不会漏掉已经完成的任务
-        let task = self.spawn(self.service.clone().dispatch(ctx, msg));
-        if session != 0 && source != 0 {
-            self.inflight.lock().insert(task, (source, session));
-        }
+        let request = (session != 0 && source != 0).then_some((source, session));
+        let ctx = Ctx::new(self.clone());
+        self.install_task(self.service.clone().dispatch(ctx, msg), request);
     }
 
     /// poll 一个就绪任务。
@@ -142,6 +183,9 @@ impl ServiceContext {
             // 任务已完成，唤醒迟到了；Future 契约允许这种无害的多余唤醒
             return;
         };
+        // 用户代码就在下面这次 poll 里跑，`Ctx::spawn`、`Ctx::exit` 都靠这个标记
+        // 认出「调用者正是本服务的持有者」，从而敢直接动服务内部那些不加锁的容器
+        let _running = Running::enter(self);
         let mut cx = std::task::Context::from_waker(&waker);
         let started = self.node.profile().then(std::time::Instant::now);
         let result = future.as_mut().poll(&mut cx);
@@ -150,38 +194,46 @@ impl ServiceContext {
                 .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         match result {
-            std::task::Poll::Ready(()) => {
-                self.inflight.lock().remove(&task);
-                self.tasks.remove(task);
-            }
+            // 任务正常跑完，它手上那个请求也就算办完了，不必再回错误
+            std::task::Poll::Ready(()) => self.tasks.remove(task),
             std::task::Poll::Pending => self.tasks.restore(task, future),
         }
     }
 
-    /// 只把就绪任务推进到全部挂起，不碰邮箱。服务初始化阶段用它。
-    fn drain_ready(&self) {
-        while let Some(task) = self.mailbox.take_ready() {
-            self.poll_task(task);
+    /// 只把就绪队列推进到全部挂起，不碰邮箱。服务初始化阶段用它。
+    fn drain_ready(self: &Arc<Self>) {
+        while let Some(ready) = self.mailbox.take_ready() {
+            self.run_ready(ready);
+        }
+    }
+
+    /// 处理就绪队列里的一件活。
+    fn run_ready(self: &Arc<Self>, ready: Ready) {
+        match ready {
+            Ready::Task(task) => self.poll_task(task),
+            // 别的线程托我们插的任务：插进去就会排到就绪队列尾部，随后被 poll
+            Ready::Spawn(future) => {
+                self.install_task(future, None);
+            }
         }
     }
 
     /// 给所有「正在处理中」的请求回错误，对照 `skynet.exit` 里遍历
     /// `session_coroutine_id` 逐个 `PTYPE_ERROR` 的那段。
     ///
-    /// 必须在退出的**那一刻**就发，不能拖到销毁时：服务往往是在自己的 dispatch
-    /// 任务里调 `exit` 的，那个任务随后会正常返回，inflight 记录也就跟着被当成
-    /// 「已办完」清掉了，届时再想通知请求方已经晚了。
+    /// 服务自己调 `exit` 时必须在**那一刻**就发，不能拖到销毁时：那个任务随后会
+    /// 正常返回，记录也就跟着被当成「已办完」清掉了，届时再想通知请求方已经晚了。
     ///
     /// 即使该请求其实已经应答过也无妨：请求方的 session 早已销毁，迟到的错误包
     /// 会被直接丢弃。
+    ///
+    /// 非持有线程（跨线程 `kill`）直接跳过：那种情况下请求与任务完成本来就在竞态，
+    /// 交给销毁它的那个 worker 在 [`ServiceContext::cleanup`] 里补上更清楚。
     pub(crate) fn fail_inflight(&self) {
-        let inflight: Vec<(u32, i32)> = self
-            .inflight
-            .lock()
-            .drain()
-            .map(|(_, request)| request)
-            .collect();
-        for (source, session) in inflight {
+        if !self.owns_current_thread() {
+            return;
+        }
+        for (source, session) in self.tasks.take_requests() {
             let _ = self
                 .node
                 .send_raw(self.handle, source, MsgType::ERROR, session, Payload::None);
@@ -189,26 +241,35 @@ impl ServiceContext {
     }
 
     /// 销毁前的清理，幂等。
+    ///
+    /// 「放生邮箱」放在最后一步，而且只有确认清理期间没有新活进来才算成功——
+    /// 因为服务一旦放生就可能被别的 worker 重新领走、再清一次，而清理动的都是
+    /// 服务内部那些「只有持有者会碰」的结构，两个 worker 同时清同一个服务是不行的。
     fn cleanup(&self) {
-        self.fail_inflight();
-        // 邮箱里没来得及处理的请求同样要回个错误
-        for msg in self.mailbox.drain() {
-            if msg.needs_reply() && msg.source != 0 && !msg.mtype.is_reply() {
-                let _ = self.node.send_raw(
-                    self.handle,
-                    msg.source,
-                    MsgType::ERROR,
-                    msg.session,
-                    Payload::None,
-                );
+        // 清理动的全是「只有持有者会碰」的东西，而调用方正是持有者
+        let _running = Running::enter(self);
+        loop {
+            self.fail_inflight();
+            // 先丢任务再清 session 表：任务里的 `Call` 析构时还会来注销 session
+            let tasks = self.tasks.drain();
+            drop(tasks);
+            self.sessions.clear();
+            // 邮箱里没来得及处理的请求同样要回个错误
+            for msg in self.mailbox.drain() {
+                if msg.needs_reply() && msg.source != 0 && !msg.mtype.is_reply() {
+                    let _ = self.node.send_raw(
+                        self.handle,
+                        msg.source,
+                        MsgType::ERROR,
+                        msg.session,
+                        Payload::None,
+                    );
+                }
+            }
+            if self.mailbox.release() {
+                return;
             }
         }
-        // 先丢任务再清 session 表：任务里的 `Call` 析构时还会来注销 session
-        let tasks = self.tasks.drain();
-        drop(tasks);
-        self.sessions.clear();
-        // 让清理之后迟到的消息还能把自己重新推进运行队列，从而被再清一次
-        self.mailbox.reset_in_global();
     }
 }
 
@@ -311,7 +372,6 @@ impl Node {
                 sessions: SessionTable::new(),
                 service: instance,
                 tasks: TaskSet::new(),
-                inflight: Mutex::new(HashMap::new()),
                 dead: AtomicBool::new(false),
                 reserved: AtomicBool::new(false),
                 destroyed: AtomicBool::new(false),
@@ -329,15 +389,19 @@ impl Node {
             let slot = failure.clone();
             let cx = Ctx::new(ctx.clone());
             let args = args.to_string();
-            ctx.spawn(Box::pin(async move {
-                if let Err(err) = service.init(cx.clone(), args).await {
-                    cx.log(format!("error: 初始化失败：{err}"));
-                    *slot.lock() = Some(err);
-                    // 初始化失败的服务不该留在世上；同步阶段失败时
-                    // new_service 会看到 dead 标志并接手善后
-                    cx.exit();
-                }
-            }));
+            // 这个服务还没进过运行队列，本线程独占它，可以直接插任务
+            ctx.install_task(
+                Box::pin(async move {
+                    if let Err(err) = service.init(cx.clone(), args).await {
+                        cx.log(format!("error: 初始化失败：{err}"));
+                        *slot.lock() = Some(err);
+                        // 初始化失败的服务不该留在世上；同步阶段失败时
+                        // new_service 会看到 dead 标志并接手善后
+                        cx.exit();
+                    }
+                }),
+                None,
+            );
         }
         ctx.drain_ready();
 
@@ -346,6 +410,9 @@ impl Node {
         if let Some(err) = failure.lock().take() {
             self.handles.retire(handle);
             ctx.mark_dead();
+            // 这个服务从创建起就没进过运行队列，一直被本线程独占；把状态挪到
+            // RUNNING 是为了让销毁流程的「放生」一步与正常路径走同一套 CAS
+            ctx.mailbox.mark_running();
             self.destroy(&ctx);
             return Err(Error::Init {
                 kind: kind.to_string(),
@@ -369,9 +436,10 @@ impl Node {
             None => false,
             Some(ctx) => {
                 ctx.mark_dead();
-                // 趁请求还记在账上，立刻通知所有等着本服务回话的人
+                // 服务自己调 exit 时，趁请求还记在账上立刻通知所有等着回话的人；
+                // 跨线程 kill 则什么都不做，由销毁它的那个 worker 在 cleanup 里补
                 ctx.fail_inflight();
-                if ctx.mailbox.mark_in_global() {
+                if ctx.mailbox.notify() {
                     self.sched.push(ctx);
                 }
                 true
@@ -446,9 +514,17 @@ impl Node {
         let mut handled = 0usize;
         loop {
             match ctx.mailbox.take_work() {
-                // 邮箱和就绪队列都空了，in_global 已被清掉，把这个服务放生
-                None => return self.sched.pop(),
-                Some(Work::Task(task)) => ctx.poll_task(task),
+                // 邮箱和就绪队列都空了，状态已落回 IDLE，把这个服务放生
+                None => {
+                    // 放生的那一瞬间可能正好有人在 kill 它：对方的 notify 撞上我们
+                    // 的「落回 IDLE」，于是谁都不会再把它推进运行队列，销毁也就没人
+                    // 做了。这里补一次入队，让它一定被某个 worker 领走并销毁。
+                    if ctx.is_dead() && ctx.mailbox.notify() {
+                        self.sched.push(ctx);
+                    }
+                    return self.sched.pop();
+                }
+                Some(Work::Ready(ready)) => ctx.run_ready(ready),
                 Some(Work::Message(msg)) => {
                     if handled == 0 && weight >= 0 {
                         budget = (ctx.mailbox.len() >> weight).max(1);
@@ -492,9 +568,9 @@ impl Node {
         }
     }
 
-    /// 派发到期的定时器，由定时器线程调用。
-    pub(crate) fn fire_timers(&self) {
-        for event in self.timer.update() {
+    /// 派发到期的定时器，由定时器线程调用，`wheel` 是它独占持有的时间轮。
+    pub(crate) fn fire_timers(&self, wheel: &mut Wheel) {
+        for event in self.timer.update(wheel) {
             let _ = self.send_raw(
                 0,
                 event.handle,
@@ -563,7 +639,6 @@ pub(crate) mod tests {
             sessions: SessionTable::new(),
             service: Arc::new(NullService),
             tasks: TaskSet::new(),
-            inflight: Mutex::new(HashMap::new()),
             dead: AtomicBool::new(false),
             reserved: AtomicBool::new(false),
             destroyed: AtomicBool::new(false),
@@ -605,6 +680,26 @@ pub(crate) mod tests {
         assert!(node.dispatch(None, 0).is_none());
         assert_eq!(node.total(), 0);
         assert!(node.sched.is_quit(), "服务数归零应通知 worker 收工");
+    }
+
+    /// 服务被 worker 领走之后才被 kill，也必须被销毁
+    ///
+    /// 这时 `retire` 的 notify 只会把邮箱状态推到 `NOTIFIED`，谁都不会把这个服务
+    /// 重新推进运行队列——销毁只能由持有它的那个 worker 自己负责。
+    #[test]
+    fn a_service_killed_while_held_is_still_destroyed() {
+        let node = test_node();
+        let handle = node.new_service("null", "").unwrap();
+        // 扮成 worker 把它领走，此刻它的状态是 RUNNING
+        let ctx = node.sched.pop().expect("新服务应当排在运行队列里");
+        assert_eq!(ctx.handle, handle);
+
+        assert!(node.retire(handle));
+        assert_eq!(node.sched.len(), 0, "没有人会把它重新入队");
+
+        // 持有者接着跑一轮就该发现 dead 标志并善后
+        assert!(node.dispatch(Some(ctx), 0).is_none());
+        assert_eq!(node.total(), 0, "服务必须被销毁，否则节点永远等不到退出");
     }
 
     /// 发给不存在的地址应当报错而不是悄悄丢弃

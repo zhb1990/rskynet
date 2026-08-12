@@ -3,11 +3,25 @@
 //! handle 的低 24 位是节点内序号，高 8 位是 harbor（节点）编号，
 //! 这样跨节点通信时看一眼地址就知道该不该转发。槽位数组按 2 的幂倍增，
 //! 用 `handle & (slot_size - 1)` 直接定位，与 C 版一致。
+//!
+//! # 读路径为什么不加锁
+//!
+//! 每发一条消息都要按 handle 查一次表（按名字发还要多查一次名字表），C 版为此
+//! 上了一把读写锁，于是这把锁成了整条投递路径上最先撞上的争抢点。这里改用
+//! [`ArcSwap`] 的快照语义：
+//!
+//! - 槽位数组本身很少变（只有扩容才换），所以整数组一个 `ArcSwap`；
+//! - 每个槽单独一个 `ArcSwapOption`，注册与摘除只动一个槽，不必换整个数组；
+//! - 名字表整表 COW，注册名字时克隆一份改完再换上去。
+//!
+//! 读者拿到的是某一瞬的快照，写者永不阻塞读者。写者之间仍然互斥（`alloc` 那把锁），
+//! 但注册、摘除、改名都是冷路径。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use parking_lot::RwLock;
+use arc_swap::{ArcSwap, ArcSwapOption};
+use parking_lot::Mutex;
 
 use crate::server::ServiceContext;
 
@@ -18,29 +32,29 @@ pub(crate) const HANDLE_REMOTE_SHIFT: u32 = 24;
 
 const DEFAULT_SLOT_SIZE: usize = 4;
 
-struct Inner {
-    /// 下一个尝试分配的序号，0 号保留给内核。
-    handle_index: u32,
-    slot: Vec<Option<Arc<ServiceContext>>>,
-    /// 本地名字表。C 版用有序数组加二分查找，这里用 `BTreeMap`，语义相同。
-    names: BTreeMap<String, u32>,
-}
+/// 槽位数组。扩容时整条换掉，平时只动其中某个槽。
+type Slots = Box<[ArcSwapOption<ServiceContext>]>;
 
 pub(crate) struct HandleStorage {
     /// 已经左移到高 8 位的 harbor 编号。
     harbor: u32,
-    inner: RwLock<Inner>,
+    slots: ArcSwap<Slots>,
+    /// 本地名字表。C 版用有序数组加二分查找，这里用 `BTreeMap`，语义相同。
+    names: ArcSwap<BTreeMap<String, u32>>,
+    /// 下一个尝试分配的序号（0 号保留给内核），同时充当写者之间的互斥锁。
+    ///
+    /// 摘除与改名也要拿它：否则「扩容时整数组搬家」与「摘掉某个槽」并发时，
+    /// 被摘掉的那个会随着搬家又回到新数组里。
+    alloc: Mutex<u32>,
 }
 
 impl HandleStorage {
     pub(crate) fn new(harbor: u32) -> Self {
         Self {
             harbor: (harbor & 0xff) << HANDLE_REMOTE_SHIFT,
-            inner: RwLock::new(Inner {
-                handle_index: 1,
-                slot: vec![None; DEFAULT_SLOT_SIZE],
-                names: BTreeMap::new(),
-            }),
+            slots: ArcSwap::from_pointee(empty_slots(DEFAULT_SLOT_SIZE)),
+            names: ArcSwap::from_pointee(BTreeMap::new()),
+            alloc: Mutex::new(1),
         }
     }
 
@@ -56,82 +70,99 @@ impl HandleStorage {
     where
         F: FnOnce(u32) -> Arc<ServiceContext>,
     {
-        let mut inner = self.inner.write();
+        let mut next = self.alloc.lock();
+        let mut make = Some(make);
         loop {
-            let mut handle = inner.handle_index;
-            for _ in 0..inner.slot.len() {
+            let slots = self.slots.load();
+            let mut handle = *next;
+            for _ in 0..slots.len() {
                 if handle > HANDLE_MASK {
                     // 0 号保留
                     handle = 1;
                 }
-                let hash = (handle as usize) & (inner.slot.len() - 1);
-                if inner.slot[hash].is_none() {
-                    let ctx = make(handle | self.harbor);
-                    inner.slot[hash] = Some(ctx.clone());
-                    inner.handle_index = handle + 1;
+                let hash = (handle as usize) & (slots.len() - 1);
+                if slots[hash].load().is_none() {
+                    let ctx = make.take().expect("闭包只会被调用一次")(handle | self.harbor);
+                    slots[hash].store(Some(ctx.clone()));
+                    *next = handle + 1;
                     return ctx;
                 }
                 handle += 1;
             }
-            self.grow(&mut inner);
+            drop(slots);
+            self.grow();
         }
     }
 
-    /// 槽位翻倍并重新散列。
-    fn grow(&self, inner: &mut Inner) {
-        let new_size = inner.slot.len() * 2;
+    /// 槽位翻倍并重新散列。调用方必须持有 `alloc`。
+    fn grow(&self) {
+        let old = self.slots.load();
+        let new_size = old.len() * 2;
         assert!(new_size <= HANDLE_MASK as usize + 1, "服务数量超出 handle 空间");
-        let mut new_slot = vec![None; new_size];
-        for ctx in inner.slot.drain(..).flatten() {
+        let new_slots = empty_slots(new_size);
+        for ctx in old.iter().filter_map(|slot| slot.load_full()) {
             let hash = (ctx.handle as usize) & (new_size - 1);
-            debug_assert!(new_slot[hash].is_none());
-            new_slot[hash] = Some(ctx);
+            debug_assert!(new_slots[hash].load().is_none());
+            new_slots[hash].store(Some(ctx));
         }
-        inner.slot = new_slot;
+        // 换数组的这一瞬，还捏着旧数组快照的读者看到的仍是搬家前的样子；
+        // 里面的 Arc 与新数组指向同一批服务，读到旧的也没错
+        self.slots.store(Arc::new(new_slots));
     }
 
     /// 把服务从表里摘除，同时清掉它注册过的名字。返回被摘除的上下文。
     pub(crate) fn retire(&self, handle: u32) -> Option<Arc<ServiceContext>> {
-        let mut inner = self.inner.write();
-        let hash = (handle as usize) & (inner.slot.len() - 1);
-        let hit = matches!(&inner.slot[hash], Some(ctx) if ctx.handle == handle);
-        if !hit {
-            return None;
+        let _writer = self.alloc.lock();
+        let slots = self.slots.load();
+        let hash = (handle as usize) & (slots.len() - 1);
+        let ctx = slots[hash].load_full().filter(|ctx| ctx.handle == handle)?;
+        slots[hash].store(None);
+
+        let names = self.names.load();
+        if names.values().any(|owner| *owner == handle) {
+            let mut next = BTreeMap::clone(&names);
+            next.retain(|_, owner| *owner != handle);
+            self.names.store(Arc::new(next));
         }
-        let ctx = inner.slot[hash].take();
-        inner.names.retain(|_, owner| *owner != handle);
-        ctx
+        Some(ctx)
     }
 
     pub(crate) fn grab(&self, handle: u32) -> Option<Arc<ServiceContext>> {
-        let inner = self.inner.read();
-        let hash = (handle as usize) & (inner.slot.len() - 1);
-        match &inner.slot[hash] {
-            Some(ctx) if ctx.handle == handle => Some(ctx.clone()),
-            _ => None,
-        }
+        let slots = self.slots.load();
+        let hash = (handle as usize) & (slots.len() - 1);
+        slots[hash].load_full().filter(|ctx| ctx.handle == handle)
     }
 
     /// 当前所有活着的 handle，退出流程逐个 kill 时用。
     pub(crate) fn handles(&self) -> Vec<u32> {
-        let inner = self.inner.read();
-        inner.slot.iter().flatten().map(|ctx| ctx.handle).collect()
+        self.slots
+            .load()
+            .iter()
+            .filter_map(|slot| slot.load_full())
+            .map(|ctx| ctx.handle)
+            .collect()
     }
 
     pub(crate) fn find_name(&self, name: &str) -> Option<u32> {
-        self.inner.read().names.get(name).copied()
+        self.names.load().get(name).copied()
     }
 
     /// 注册本地名字。与 C 版一致，名字已被占用时返回 false（不覆盖）。
     pub(crate) fn register_name(&self, handle: u32, name: &str) -> bool {
-        let mut inner = self.inner.write();
-        if inner.names.contains_key(name) {
+        let _writer = self.alloc.lock();
+        let names = self.names.load();
+        if names.contains_key(name) {
             return false;
         }
-        inner.names.insert(name.to_string(), handle);
+        let mut next = BTreeMap::clone(&names);
+        next.insert(name.to_string(), handle);
+        self.names.store(Arc::new(next));
         true
     }
+}
 
+fn empty_slots(size: usize) -> Slots {
+    (0..size).map(|_| ArcSwapOption::empty()).collect()
 }
 
 #[cfg(test)]
