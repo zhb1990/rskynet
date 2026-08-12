@@ -35,6 +35,18 @@ use crate::session::SessionTable;
 use crate::start::Config;
 use crate::task::TaskSet;
 
+/// 一次访问最多干多少件活，就回头看一眼运行队列里有没有别人在等。
+///
+/// **消息与就绪任务各算一件。** 只按消息计数的话，一个在 poll 中自唤醒的任务
+/// （`yield_now` 那类 future 就是这么实现的）会让 [`Node::run_service`] 永不返回：
+/// 就绪队列始终非空，邮箱永远等不到空，那个 worker 也就再看不到收工信号。
+///
+/// 取 64 是在「让渡开销」与「换服务之后重新热起工作集」之间折中：开销占比大致是
+/// `切换成本 / (64 × 单件活成本)`，同时也把 `pending` 那条被所有 worker 反复写的
+/// 热缓存行的读取频率压到每 64 件一次。一条消息通常对应两件活——消息本身，
+/// 以及它开出来的那个任务随后那次 poll。
+const YIELD_INTERVAL: usize = 64;
+
 /// 一个服务的运行时上下文。
 pub(crate) struct ServiceContext {
     pub(crate) handle: u32,
@@ -343,7 +355,7 @@ impl ServiceContext {
 pub(crate) enum Ran {
     /// 邮箱与就绪队列都空了，服务已经放生（状态落回 `IDLE`），调用方不再持有它。
     Idle,
-    /// 本轮预算用完，服务仍归调用方持有。
+    /// 该让渡了——运行队列里有别人在等，或者节点要收工。服务仍归调用方持有。
     Yielded,
     /// 服务已被摘除，仍归调用方持有，等着被销毁。
     Dead,
@@ -697,13 +709,12 @@ impl Node {
     pub(crate) fn dispatch(
         &self,
         hold: Option<Arc<ServiceContext>>,
-        weight: i32,
     ) -> Option<Arc<ServiceContext>> {
         let ctx = match hold {
             Some(ctx) => ctx,
             None => self.sched.pop()?,
         };
-        match self.run_service(&ctx, Some(weight)) {
+        match self.run_service(&ctx, true) {
             Ran::Dead => {
                 self.destroy(&ctx);
                 self.sched.pop()
@@ -728,31 +739,26 @@ impl Node {
         }
     }
 
-    /// 在当前线程上执行一个自己持有的服务，直到没活干、预算用完或者服务已死。
+    /// 在当前线程上执行一个自己持有的服务，直到没活干、该让渡了或者服务已死。
     ///
-    /// worker 与独占线程共用这一段：区别只在预算与「干完之后怎么处置」，
+    /// worker 与独占线程共用这一段：区别只在让不让渡与「干完之后怎么处置」，
     /// 都由调用方决定。
     ///
-    /// `weight` 是批处理预算，对照 C 版那张权重表：负数表示一次只处理一条消息
-    /// （响应快），非负表示一次处理 `队列长度 >> weight` 条（吞吐高）。传 `None`
-    /// 则一次把活干完——独占线程只有这一个服务，让渡给谁都没有意义。
-    pub(crate) fn run_service(&self, ctx: &Arc<ServiceContext>, weight: Option<i32>) -> Ran {
+    /// `preemptible` 为真（worker）时每干满 [`YIELD_INTERVAL`] 件活就问一次
+    /// [`Scheduler::should_yield`]：确实有人在等才交回运行队列，没人等就重新
+    /// 计数接着跑，于是空闲时的行为与「一口气干到邮箱空」完全一致。为假
+    /// （独占线程）时一次把活干完——那条线程只有这一个服务，让渡给谁都没有意义。
+    pub(crate) fn run_service(&self, ctx: &Arc<ServiceContext>, preemptible: bool) -> Ran {
         if ctx.is_dead() {
             return Ran::Dead;
         }
-        let mut budget = if weight.is_some() { 1 } else { usize::MAX };
-        let mut handled = 0usize;
+        let mut done = 0usize;
         loop {
             match ctx.mailbox.take_work() {
                 // 邮箱和就绪队列都空了，状态已落回 IDLE，服务就此放生
                 None => return Ran::Idle,
                 Some(Work::Ready(ready)) => ctx.run_ready(ready),
                 Some(Work::Message(msg)) => {
-                    if handled == 0 {
-                        if let Some(weight) = weight.filter(|weight| *weight >= 0) {
-                            budget = (ctx.mailbox.len() >> weight).max(1);
-                        }
-                    }
                     let overload = ctx.mailbox.take_overload();
                     if overload > 0 {
                         self.log(
@@ -761,14 +767,18 @@ impl Node {
                         );
                     }
                     ctx.handle_message(msg);
-                    handled += 1;
                 }
             }
             if ctx.is_dead() {
                 return Ran::Dead;
             }
-            if handled >= budget {
-                return Ran::Yielded;
+            done += 1;
+            if preemptible && done >= YIELD_INTERVAL {
+                if self.sched.should_yield() {
+                    return Ran::Yielded;
+                }
+                // 没人在等，那就没有让渡的理由：重新计数，接着把这个服务跑下去
+                done = 0;
             }
         }
     }
@@ -940,7 +950,7 @@ pub(crate) mod tests {
         assert!(node.handles.grab(handle).is_none());
 
         // 销毁由 worker 完成：跑一轮调度即可
-        assert!(node.dispatch(None, 0).is_none());
+        assert!(node.dispatch(None).is_none());
         assert_eq!(node.total(), 0);
         assert!(node.sched.is_quit(), "服务数归零应通知 worker 收工");
     }
@@ -961,8 +971,82 @@ pub(crate) mod tests {
         assert_eq!(node.sched.len(), 0, "没有人会把它重新入队");
 
         // 持有者接着跑一轮就该发现 dead 标志并善后
-        assert!(node.dispatch(Some(ctx), 0).is_none());
+        assert!(node.dispatch(Some(ctx)).is_none());
         assert_eq!(node.total(), 0, "服务必须被销毁，否则节点永远等不到退出");
+    }
+
+    /// 一条测试用消息：不带 source 也不带 session，于是不会牵扯回包那套记账
+    fn work_message() -> Message {
+        Message::new(0, 0, MsgType::USER, Payload::None)
+    }
+
+    /// 没人在等就不让渡：一口气把邮箱干空，`YIELD_INTERVAL` 只是个检查点
+    #[test]
+    fn a_lone_service_runs_to_empty() {
+        let node = test_node();
+        let ctx = dummy_context_on(node.clone(), 1);
+        // 邮箱新建时就是 QUEUED，所以这些投递都不会真的去动运行队列
+        let total = YIELD_INTERVAL * 4;
+        for _ in 0..total {
+            ctx.push(work_message());
+        }
+        ctx.mailbox.mark_running();
+
+        assert_eq!(node.sched.len(), 0, "运行队列空着，没人可让");
+        assert!(matches!(node.run_service(&ctx, true), Ran::Idle));
+        assert_eq!(ctx.message_count(), total as u64, "该一条不剩地干完");
+    }
+
+    /// 有别人在等，干满一批就得把自己交回运行队列
+    #[test]
+    fn a_busy_service_yields_when_others_are_waiting() {
+        let node = test_node();
+        // 运行队列里排一个别人，`pending` 于是不为 0
+        node.sched.push(dummy_context_on(node.clone(), 2));
+
+        let ctx = dummy_context_on(node.clone(), 1);
+        for _ in 0..YIELD_INTERVAL {
+            ctx.push(work_message());
+        }
+        ctx.mailbox.mark_running();
+
+        assert!(matches!(node.run_service(&ctx, true), Ran::Yielded));
+        // 一条消息是两件活：消息本身，加上它开出来那个任务的第一次 poll
+        assert_eq!(ctx.message_count(), (YIELD_INTERVAL / 2) as u64);
+    }
+
+    /// 在 poll 里自唤醒的任务不能把 worker 永久扣住
+    ///
+    /// 这种任务的就绪队列永远不空，邮箱也就永远等不到空，`run_service` 走不到
+    /// `Ran::Idle`。只按消息计数的话它连一次让渡检查都触发不了，worker 从此
+    /// 看不到收工信号，节点关不掉——这条用例守的就是那个出口。
+    #[test]
+    fn a_self_waking_task_cannot_pin_the_worker() {
+        #[derive(Default)]
+        struct SelfWaker;
+
+        impl Service for SelfWaker {
+            fn dispatch(self: Arc<Self>, _ctx: Ctx, _msg: Message) -> BoxFuture<'static, ()> {
+                Box::pin(std::future::poll_fn(|cx| {
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }))
+            }
+        }
+
+        let registry = Registry::new().with("self-waker", SelfWaker::default);
+        let node = Node::new(&Config::default(), registry, Arc::new(StubTimer));
+        node.new_service("self-waker", "").expect("应创建成功");
+        // 自己把它领走，运行队列于是空了：能救场的只剩收工信号
+        let ctx = node.sched.pop().expect("新服务应当排在运行队列里");
+        ctx.push(work_message());
+        assert_eq!(node.sched.len(), 0);
+
+        node.sched.set_quit();
+        assert!(
+            matches!(node.run_service(&ctx, true), Ran::Yielded),
+            "收工信号该把它换下来，而不是在里面转到天荒地老"
+        );
     }
 
     /// 独占服务不进运行队列，它自带一条线程；摘除之后那条线程要自己收工
