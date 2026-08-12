@@ -186,7 +186,7 @@ impl Service for Driver {
 // ------------------------------------------------------------ 测试脚手架
 
 /// 起一个节点跑完用例，返回用例记录下来的内容。
-fn run_node<F>(bootstrap: &str, scenario: F) -> Vec<String>
+fn run_node<F>(services: &[&str], scenario: F) -> Vec<String>
 where
     F: Fn(Ctx, Journal) -> BoxFuture<'static, ()> + Send + Sync + 'static,
 {
@@ -206,7 +206,9 @@ where
             journal: shared.clone(),
         });
 
-    let config = Config::default().with_thread(2).with_bootstrap(bootstrap);
+    let config = Config::default()
+        .with_thread(2)
+        .with_bootstrap(services.iter().copied());
     rskynet::start(config, registry).expect("节点应当正常启动并退出");
 
     let entries = journal.lock().unwrap();
@@ -222,7 +224,7 @@ fn note(journal: &Journal, entry: impl Into<String>) {
 /// call 的基本功：发出去的请求能拿回对端的应答
 #[test]
 fn call_returns_the_reply() {
-    let seen = run_node("bootstrap echo; driver", |ctx, journal| {
+    let seen = run_node(&["echo", "driver"], |ctx, journal| {
         Box::pin(async move {
             let reply = ctx.request(".echo", Payload::text("你好")).await.unwrap();
             note(&journal, reply.as_str().unwrap());
@@ -234,7 +236,7 @@ fn call_returns_the_reply() {
 /// 按名字寻址和按 handle 寻址应当等价，名字不存在时立刻失败而不是挂住
 #[test]
 fn name_and_handle_addressing_are_equivalent() {
-    let seen = run_node("bootstrap echo; driver", |ctx, journal| {
+    let seen = run_node(&["echo", "driver"], |ctx, journal| {
         Box::pin(async move {
             let handle = ctx.query_name("echo").expect("echo 应已注册名字");
             note(&journal, format!("查到 {}", handle != 0));
@@ -258,7 +260,7 @@ fn name_and_handle_addressing_are_equivalent() {
 /// sleep 由定时器服务唤醒，既不能早退也不能睡过头
 #[test]
 fn sleep_is_woken_by_the_timer() {
-    let seen = run_node("bootstrap driver", |ctx, journal| {
+    let seen = run_node(&["driver"], |ctx, journal| {
         Box::pin(async move {
             let started = Instant::now();
             ctx.sleep(15).await;
@@ -276,7 +278,7 @@ fn sleep_is_woken_by_the_timer() {
 fn a_pending_call_does_not_block_the_service() {
     // 主任务去 call 一个睡 20 厘秒才回话的服务，同时 fork 一个任务去 call 快服务。
     // 若服务是被整个卡住的，快的那个不可能先回来。
-    let seen = run_node("bootstrap echo; slow; driver", |ctx, journal| {
+    let seen = run_node(&["echo", "slow", "driver"], |ctx, journal| {
         Box::pin(async move {
             let fast_ctx = ctx.clone();
             let fast_journal = journal.clone();
@@ -300,7 +302,7 @@ fn a_pending_call_does_not_block_the_service() {
 fn requests_are_served_concurrently() {
     // 三个请求分别要睡 20、10、15 厘秒。若对端是串行处理的，总耗时会是 45 厘秒；
     // 并发处理则接近最慢的 20 厘秒。
-    let seen = run_node("bootstrap slow; driver", |ctx, journal| {
+    let seen = run_node(&["slow", "driver"], |ctx, journal| {
         Box::pin(async move {
             let done: Arc<SvcCell<Vec<String>>> = Arc::new(SvcCell::default());
             let started = Instant::now();
@@ -336,7 +338,7 @@ fn requests_are_served_concurrently() {
 /// 对端处理到一半退出时，请求方要收到错误而不是永久挂死
 #[test]
 fn caller_gets_an_error_when_callee_exits_midway() {
-    let seen = run_node("bootstrap quitter; driver", |ctx, journal| {
+    let seen = run_node(&["quitter", "driver"], |ctx, journal| {
         Box::pin(async move {
             let err = ctx.request(".quitter", Payload::None).await.unwrap_err();
             note(&journal, format!("{}", matches!(err, Error::CallFailed(_))));
@@ -348,7 +350,7 @@ fn caller_gets_an_error_when_callee_exits_midway() {
 /// kill 之后地址与名字同时失效，再发过去立刻失败
 #[test]
 fn requests_to_a_dead_service_fail_immediately() {
-    let seen = run_node("bootstrap echo; driver", |ctx, journal| {
+    let seen = run_node(&["echo", "driver"], |ctx, journal| {
         Box::pin(async move {
             let handle = ctx.query_name("echo").unwrap();
             assert!(ctx.kill(handle));
@@ -363,7 +365,7 @@ fn requests_to_a_dead_service_fail_immediately() {
 /// send 不等应答，且同一对收发方之间的消息严格保序
 #[test]
 fn send_is_fire_and_forget_but_ordered() {
-    let seen = run_node("bootstrap counter; driver", |ctx, journal| {
+    let seen = run_node(&["counter", "driver"], |ctx, journal| {
         Box::pin(async move {
             for i in 0..100u32 {
                 ctx.post(".counter", Payload::text(i.to_string())).unwrap();
@@ -379,7 +381,7 @@ fn send_is_fire_and_forget_but_ordered() {
 /// 运行期能动态拉起服务，类型不存在或 init 失败时给出对应的错误
 #[test]
 fn services_can_be_launched_at_runtime() {
-    let seen = run_node("bootstrap driver", |ctx, journal| {
+    let seen = run_node(&["driver"], |ctx, journal| {
         Box::pin(async move {
             let handle = ctx.launch("echo", "").await.unwrap();
             note(&journal, format!("{}", handle != 0));
@@ -403,7 +405,7 @@ fn services_can_be_launched_at_runtime() {
 /// init 失败的服务不能留在节点里占着服务计数
 #[test]
 fn failed_init_leaves_no_trace() {
-    let seen = run_node("bootstrap driver", |ctx, journal| {
+    let seen = run_node(&["driver"], |ctx, journal| {
         Box::pin(async move {
             // 先等引导服务退场，服务计数稳定下来再取基准
             ctx.sleep(3).await;
@@ -423,7 +425,7 @@ fn failed_init_leaves_no_trace() {
 /// 名字是先到先得的，注册过就不能再被顶掉
 #[test]
 fn names_cannot_be_registered_twice() {
-    let seen = run_node("bootstrap echo; driver", |ctx, journal| {
+    let seen = run_node(&["echo", "driver"], |ctx, journal| {
         Box::pin(async move {
             note(&journal, format!("{}", ctx.register_name("独一份")));
             note(&journal, format!("{}", ctx.register_name("独一份")));
@@ -436,7 +438,7 @@ fn names_cannot_be_registered_twice() {
 /// 服务内起大量并发任务时，每一个都要被调度到，一个都不能饿死
 #[test]
 fn many_local_tasks_all_get_scheduled() {
-    let seen = run_node("bootstrap echo; driver", |ctx, journal| {
+    let seen = run_node(&["echo", "driver"], |ctx, journal| {
         Box::pin(async move {
             let done = Arc::new(SvcCell::new(0u32));
             for i in 0..200u32 {
@@ -465,7 +467,7 @@ fn many_local_tasks_all_get_scheduled() {
 /// 这条慢路径。
 #[test]
 fn spawn_from_a_foreign_thread_still_runs() {
-    let seen = run_node("bootstrap driver", |ctx, journal| {
+    let seen = run_node(&["driver"], |ctx, journal| {
         Box::pin(async move {
             let done = Arc::new(AtomicU64::new(0));
             let outside = ctx.clone();
@@ -490,7 +492,7 @@ fn spawn_from_a_foreign_thread_still_runs() {
 /// 对照 skynet.stat 的那几个统计口径都要有值
 #[test]
 fn runtime_stats_are_available() {
-    let seen = run_node("bootstrap echo; driver", |ctx, journal| {
+    let seen = run_node(&["echo", "driver"], |ctx, journal| {
         Box::pin(async move {
             for _ in 0..10 {
                 ctx.request(".echo", Payload::text("x")).await.unwrap();
@@ -513,7 +515,7 @@ fn runtime_stats_are_available() {
 fn throughput_one_million_messages() {
     const TOTAL: u64 = 1_000_000;
 
-    let seen = run_node("bootstrap counter; driver", |ctx, journal| {
+    let seen = run_node(&["counter", "driver"], |ctx, journal| {
         Box::pin(async move {
             let started = Instant::now();
             for _ in 0..TOTAL {
@@ -591,7 +593,7 @@ fn relay_ring(
     rskynet::start(
         Config::default()
             .with_thread(threads)
-            .with_bootstrap("bootstrap driver"),
+            .with_bootstrap(["driver"]),
         registry,
     )
     .unwrap();
@@ -649,7 +651,7 @@ fn scheduling_throughput_with_idle_workers() {
 /// 引导服务不存在时，启动阶段就要报错
 #[test]
 fn missing_bootstrap_service_fails_startup() {
-    let config = Config::default().with_bootstrap("根本没这个服务");
+    let config = Config::default().with_bootstrap_service("根本没这个服务");
     let err = rskynet::start(config, Registry::new().with_builtins()).unwrap_err();
     assert!(matches!(err, Error::UnknownService(_)));
 }
@@ -707,7 +709,7 @@ fn custom_message_types_work() {
         });
 
     rskynet::start(
-        Config::default().with_bootstrap("bootstrap picky; driver"),
+        Config::default().with_bootstrap(["picky", "driver"]),
         registry,
     )
     .unwrap();

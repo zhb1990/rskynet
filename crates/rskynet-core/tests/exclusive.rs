@@ -238,10 +238,12 @@ fn an_exclusive_service_owns_its_thread() {
     let config = Config::from_toml_str(
         r#"
         thread = 2
-        bootstrap = "bootstrap poller; probe"
 
         [poller]
         greeting = "你好"
+
+        [bootstrap]
+        services = [{ name = "poller" }, { name = "probe" }]
         "#,
     )
     .expect("配置应解析成功");
@@ -343,7 +345,7 @@ fn a_backlog_survives_the_shutdown() {
         })
         .with("flooder", || Flooder { total: TOTAL });
 
-    let config = Config::default().with_bootstrap("bootstrap sink; flooder");
+    let config = Config::default().with_bootstrap(["sink", "flooder"]);
     Builder::new(config)
         .registry(registry)
         .run()

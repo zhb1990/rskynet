@@ -47,6 +47,10 @@ pub enum Error {
     #[error("解析配置失败：{0}")]
     ConfigParse(#[from] toml::de::Error),
 
+    /// 服务参数用 JSON 承载时的编解码失败，见 [`crate::service::Bootstrap`]。
+    #[error("服务参数不是合法的 JSON：{0}")]
+    Json(#[from] serde_json::Error),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

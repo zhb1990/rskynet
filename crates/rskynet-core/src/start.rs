@@ -13,8 +13,8 @@ use std::any::Any;
 use std::sync::Arc;
 use std::thread;
 
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::module::Registry;
@@ -26,6 +26,80 @@ const WORKER_WEIGHTS: [i32; 32] = [
     3, 3,
 ];
 
+/// 一条服务启动项：类型名加参数。
+///
+/// C 版把这两截挤在一个字符串里，靠 `sscanf` 按首个空格拆；这里各占一个字段，
+/// 于是参数里带空格、带分号都不再是问题。
+///
+/// 可以序列化，是因为服务的 `init` 只收得到一个字符串：整张清单编成 JSON 递过去，
+/// 由引导服务解回来，见 [`crate::service::Bootstrap`]。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ServiceSpec {
+    /// 服务类型名，也就是注册表里的那个键。
+    pub name: String,
+    /// 传给服务 `init` 的参数，不需要就留空。
+    pub args: String,
+}
+
+impl ServiceSpec {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            args: String::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_args(mut self, args: impl Into<String>) -> Self {
+        self.args = args.into();
+        self
+    }
+}
+
+impl From<&str> for ServiceSpec {
+    fn from(name: &str) -> Self {
+        Self::new(name)
+    }
+}
+
+impl From<String> for ServiceSpec {
+    fn from(name: String) -> Self {
+        Self::new(name)
+    }
+}
+
+impl<N: Into<String>, A: Into<String>> From<(N, A)> for ServiceSpec {
+    fn from((name, args): (N, A)) -> Self {
+        Self::new(name).with_args(args)
+    }
+}
+
+/// 引导配置，对照 skynet config 里 `bootstrap` 那一行：
+///
+/// ```toml
+/// [bootstrap]
+/// name = "bootstrap"
+/// services = [{ name = "pong" }, { name = "ping", args = "100" }]
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct BootstrapConfig {
+    /// 引导服务的类型名，默认是内置的 `bootstrap`。
+    pub name: String,
+    /// 引导服务按顺序拉起的服务，写在前面的先起。
+    pub services: Vec<ServiceSpec>,
+}
+
+impl Default for BootstrapConfig {
+    fn default() -> Self {
+        Self {
+            name: crate::service::BOOTSTRAP.to_string(),
+            services: Vec::new(),
+        }
+    }
+}
+
 /// 节点配置，对照 skynet 的 `config` 文件。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -34,8 +108,9 @@ pub struct Config {
     pub thread: usize,
     /// 本节点编号，会占据 handle 的高 8 位。
     pub harbor: u32,
-    /// 引导服务，格式是「类型名 参数」，例如 `"bootstrap pong; ping 100"`。
-    pub bootstrap: String,
+    /// 引导服务及它要拉起的服务清单，用 [`Config::with_bootstrap`] 与
+    /// [`Config::with_bootstrap_service`] 改写。
+    pub(crate) bootstrap: BootstrapConfig,
     /// 日志服务的类型名。
     pub logservice: String,
     /// 传给日志服务的参数：日志文件路径，留空表示只写标准输出。
@@ -55,7 +130,7 @@ impl Default for Config {
                 .map(|n| n.get())
                 .unwrap_or(4),
             harbor: 0,
-            bootstrap: format!("{} ", crate::service::BOOTSTRAP),
+            bootstrap: BootstrapConfig::default(),
             logservice: crate::service::LOGGER.to_string(),
             logger: String::new(),
             profile: true,
@@ -80,10 +155,27 @@ impl Config {
         Self::from_toml_str(&text)
     }
 
-    /// 覆盖引导服务，链式配置用。
+    /// 覆盖引导清单，链式配置用。只有类型名的写字符串，要带参数的写成一对：
+    ///
+    /// ```
+    /// # use rskynet_core::Config;
+    /// Config::default().with_bootstrap(["pong", "ping"]);
+    /// Config::default().with_bootstrap([("pong", ""), ("ping", "100")]);
+    /// ```
     #[must_use]
-    pub fn with_bootstrap(mut self, bootstrap: impl Into<String>) -> Self {
-        self.bootstrap = bootstrap.into();
+    pub fn with_bootstrap<I>(mut self, services: I) -> Self
+    where
+        I: IntoIterator,
+        I::Item: Into<ServiceSpec>,
+    {
+        self.bootstrap.services = services.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// 换掉引导服务本身的类型名，默认是内置的 `bootstrap`。
+    #[must_use]
+    pub fn with_bootstrap_service(mut self, name: impl Into<String>) -> Self {
+        self.bootstrap.name = name.into();
         self
     }
 
@@ -117,8 +209,16 @@ impl Config {
         if self.harbor > 0xff {
             return Err(Error::Config("harbor 编号必须在 0..=255 之间".into()));
         }
-        if self.bootstrap.trim().is_empty() {
+        if self.bootstrap.name.trim().is_empty() {
             return Err(Error::Config("必须指定引导服务".into()));
+        }
+        if let Some(pos) = self
+            .bootstrap
+            .services
+            .iter()
+            .position(|spec| spec.name.trim().is_empty())
+        {
+            return Err(Error::Config(format!("引导清单第 {} 项没写 name", pos + 1)));
         }
         // `flatten` 把不认识的键统统收进 extra，于是「拼错内核字段就报错」这条防线
         // 得自己补上：扩展的配置一律写成表，落在顶层的散键只可能是拼错
@@ -165,15 +265,6 @@ impl Builder {
     /// 启动节点并阻塞到所有服务退出。
     pub fn run(self) -> Result<()> {
         run(self.config, self.registry)
-    }
-}
-
-/// 把「类型名 参数」拆成两截，对照 C 版 `bootstrap()` 里的 `sscanf`。
-pub(crate) fn split_cmdline(cmdline: &str) -> (&str, &str) {
-    let cmdline = cmdline.trim();
-    match cmdline.split_once(char::is_whitespace) {
-        Some((kind, args)) => (kind, args.trim_start()),
-        None => (cmdline, ""),
     }
 }
 
@@ -239,8 +330,10 @@ fn boot(node: &Arc<Node>, config: &Config) -> Result<()> {
     // 这样关停过程中产生的日志仍然写得出来
     node.reserve(logger);
 
-    let (kind, args) = split_cmdline(&config.bootstrap);
-    node.new_service(kind, args)?;
+    // `init` 只递得动一个字符串，而清单是一张表，于是编成 JSON 交过去，
+    // 由引导服务自己解回来
+    let services = serde_json::to_string(&config.bootstrap.services)?;
+    node.new_service(&config.bootstrap.name, &services)?;
 
     // 定时器必须排在引导服务之后：它一看到「活着的服务数归零」就宣布节点收工，
     // 而引导服务出场之前那个数字本来就是 0
@@ -316,17 +409,6 @@ fn drain(node: &Node) {
 mod tests {
     use super::*;
 
-    /// 引导命令按首个空白拆成服务名与参数
-    #[test]
-    fn cmdline_splits_at_first_space() {
-        assert_eq!(
-            split_cmdline("bootstrap pong; ping 100"),
-            ("bootstrap", "pong; ping 100")
-        );
-        assert_eq!(split_cmdline("  logger  "), ("logger", ""));
-        assert_eq!(split_cmdline("logger\tfile.log"), ("logger", "file.log"));
-    }
-
     /// 配置能从 TOML 解析，未写的字段走默认值
     #[test]
     fn config_parses_from_toml() {
@@ -334,19 +416,45 @@ mod tests {
             r#"
             thread = 4
             harbor = 1
-            bootstrap = "bootstrap ping"
             logger = "run/rskynet.log"
             profile = false
+
+            [bootstrap]
+            services = [{ name = "pong" }, { name = "ping", args = "100" }]
             "#,
         )
         .expect("配置应解析成功");
         assert_eq!(config.thread, 4);
         assert_eq!(config.harbor, 1);
-        assert_eq!(config.bootstrap, "bootstrap ping");
         assert_eq!(config.logger, "run/rskynet.log");
         assert!(!config.profile);
-        // 没写的字段走默认值
+        // 没写的字段走默认值，包括引导服务的类型名
         assert_eq!(config.logservice, crate::service::LOGGER);
+        assert_eq!(config.bootstrap.name, crate::service::BOOTSTRAP);
+
+        let services = &config.bootstrap.services;
+        assert_eq!(services.len(), 2);
+        assert_eq!(services[0].name, "pong");
+        // 没写 args 的那项拿到空串，而不是把名字连着参数一块吞进去
+        assert_eq!(services[0].args, "");
+        assert_eq!(services[1].name, "ping");
+        assert_eq!(services[1].args, "100");
+    }
+
+    /// 参数里的空格与分号原样留给服务，不再像 sscanf 那样被拆开
+    #[test]
+    fn spec_args_are_not_split() {
+        let config = Config::from_toml_str(
+            r#"
+            [bootstrap]
+            services = [{ name = "gate", args = "0.0.0.0:8888; backlog 128" }]
+            "#,
+        )
+        .expect("配置应解析成功");
+        assert_eq!(
+            config.bootstrap.services[0].args,
+            "0.0.0.0:8888; backlog 128"
+        );
     }
 
     /// 非法取值和拼错的键都要在启动前拦下
@@ -354,7 +462,20 @@ mod tests {
     fn invalid_config_is_rejected() {
         assert!(Config::from_toml_str("thread = 0").is_err());
         assert!(Config::from_toml_str("harbor = 256").is_err());
-        assert!(Config::from_toml_str(r#"bootstrap = "  ""#).is_err());
+        assert!(
+            Config::from_toml_str(
+                r#"[bootstrap]
+            name = "  ""#
+            )
+            .is_err()
+        );
+        assert!(
+            Config::from_toml_str(
+                r#"[bootstrap]
+            services = [{ args = "100" }]"#
+            )
+            .is_err()
+        );
         assert!(Config::from_toml_str("不认识的键 = 1").is_err());
     }
 

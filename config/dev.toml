@@ -7,10 +7,6 @@ thread = 4
 # 本节点编号，占据 handle 的高 8 位，跨节点通信时用来判断是否需要转发。
 harbor = 0
 
-# 引导服务，格式是「类型名 参数」。
-# 内置的 bootstrap 会把参数按 `;` 拆开，逐个拉起。
-bootstrap = "bootstrap pong; ping 100"
-
 # 日志服务的类型名。它独占一条线程，写文件不占用 worker。
 logservice = "logger"
 
@@ -26,4 +22,17 @@ profile = true
 # [net]
 # listen = "0.0.0.0:8888"
 #
-# 顶层的散键一律按「拼错了内核字段」处理，启动时就会报错。
+# 顶层的散键一律按「拼错了内核字段」处理，启动时就会报错。TOML 的规矩是段一开
+# 就管到下一个段为止，所以散键都得写在上面，段（含下面的 [bootstrap]）写在后面。
+
+# 引导配置。
+[bootstrap]
+# 引导服务的类型名。换成自己的实现就改这里。
+name = "bootstrap"
+
+# 引导清单，写在前面的先起：pong 在 init 里注册好 .pong，ping 才查得到它。
+# args 是原样交给服务 init 的那个字符串参数，不需要就不写。
+services = [
+    { name = "pong" },
+    { name = "ping", args = "100" },
+]

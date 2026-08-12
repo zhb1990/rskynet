@@ -170,7 +170,7 @@ impl Service for Echo {
 
 fn main() -> Result<()> {
     let registry = Registry::new().with_builtins().with("echo", || Echo);
-    let config = Config::default().with_bootstrap("bootstrap echo");
+    let config = Config::default().with_bootstrap(["echo"]);
     rskynet::start(config, registry)
 }
 ```

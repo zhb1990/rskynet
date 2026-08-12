@@ -181,7 +181,7 @@ fn main() -> Result<()> {
     // 也可以用 Config::from_toml_file("config/dev.toml")
     let config = Config::default()
         .with_thread(4)
-        .with_bootstrap("bootstrap pong; ping 1000");
+        .with_bootstrap([("pong", ""), ("ping", "1000")]);
 
     println!(
         "=== rskynet ping-pong 示例，MsgType::USER = {:?} ===",
