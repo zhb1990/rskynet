@@ -81,7 +81,7 @@ pub(crate) struct Mailbox {
     queue: SegQueue<Message>,
     /// 服务内被唤醒、等待 poll 的任务（相当于 skynet 里可以 resume 的协程）。
     ready: SegQueue<Ready>,
-    /// 积压的消息条数。批处理预算与 `mqlen` 统计都只需要近似值，Relaxed 足够。
+    /// 积压的消息条数。过载检测与 `mqlen` 统计都只需要近似值，Relaxed 足够。
     len: AtomicUsize,
     state: AtomicU8,
     /// 下面两个只有「当前持有本服务的那个 worker」会碰，天然无竞争。
@@ -370,9 +370,13 @@ pub(crate) struct Scheduler {
     /// 所有队列加起来排着多少个服务。
     ///
     /// 它存在的理由是让「全都空着」这个最常见的情况便宜到只剩一次原子读：
-    /// 权重为负的 worker 每处理一条消息就要让渡一次，也就是每条消息都要问一遍
-    /// 「还有别人在等吗」。没有它的话每次都要走一遍「遍历本地块 + 锁 injector +
-    /// 扫一圈别人的队列」，空转成本比原来那把大锁还高。
+    /// worker 每干满一批活就要问一遍「还有别人在等吗」（见
+    /// [`Scheduler::should_yield`]），取活时也要先判一次空。没有它的话每次都要
+    /// 走一遍「遍历本地块 + 锁 injector + 扫一圈别人的队列」，空转成本比原来那把
+    /// 大锁还高。
+    ///
+    /// 反过来，它是被每次 push/pop 反复写的热缓存行，所以问的一方要按批问，
+    /// 别按件问。
     pending: CachePad<AtomicUsize>,
     /// 空闲 worker 位图，每 64 个 worker 一个字：位 i 为 1 表示 i 号 worker 已经
     /// 登记「我要睡了」。对照 C 版 `struct monitor` 的 `sleep` 计数，
@@ -709,6 +713,19 @@ impl Scheduler {
                 self.slots[id].wake();
             }
         }
+    }
+
+    /// 手上这个服务该交回运行队列了吗：有别人在等，或者节点要收工。
+    ///
+    /// 收工信号折进来是因为它是自唤醒任务唯一的出口：那种服务的就绪队列永远
+    /// 非空，`run_service` 走不到 `Ran::Idle`，而 worker 的退出条件在它外面。
+    /// 少了这一句，一个 poll 里自唤醒的任务就能把 worker 永久扣住——主线程正
+    /// 卡在 join 上，`retire_all` 排在 join 之后，于是没人会去把那个服务标成
+    /// 死的，节点再也关不掉。
+    ///
+    /// `pending` 是热的写行，所以调用方必须按批问而不是按件问。
+    pub(crate) fn should_yield(&self) -> bool {
+        self.pending.load(Ordering::Relaxed) > 0 || self.is_quit()
     }
 
     /// 只管 worker。要宣布整个节点收工请走 `Node::quit`，独占线程还得单独敲。

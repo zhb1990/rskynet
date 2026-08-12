@@ -126,7 +126,7 @@ pub(crate) fn exclusive_loop(ctx: Arc<ServiceContext>, service: Arc<dyn Exclusiv
         // 要么已经把状态推成 QUEUED（那也是给本线程看的），要么随后压进来的活
         // 会把状态推成 NOTIFIED，被 take_work 的重扫接住
         ctx.mailbox.mark_running();
-        if node.run_service(&ctx, None).is_dead() || ctx.is_dead() {
+        if node.run_service(&ctx, false).is_dead() || ctx.is_dead() {
             break;
         }
         ctx.with_ownership(|| service.idle(&cx, &idler));

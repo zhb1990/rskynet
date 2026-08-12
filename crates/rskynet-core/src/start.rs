@@ -6,8 +6,8 @@
 //! - 每个独占服务一条线程：定时器与日志各一条，网络层也是一条。
 //!   C 版那是内核里的专用线程，这里它们是普通服务，见 [`crate::Exclusive`]
 //!
-//! worker 的 `weight` 沿用 C 版那张表：前 4 个线程一次只处理一条消息（响应快），
-//! 后面的线程一次处理 `队列长度 >> weight` 条（吞吐高）。
+//! worker 之间没有分工：C 版那张按线程编号分档的权重表这里没有照搬，让渡改成
+//! 由争用情况决定，见 [`crate::server::Node::run_service`] 与 README。
 //!
 //! # 系统服务
 //!
@@ -28,12 +28,6 @@ use crate::error::{Error, Result};
 use crate::module::Registry;
 use crate::server::Node;
 use crate::service;
-
-/// 各 worker 线程的消息批处理权重，直接照搬 C 版 `skynet_start.c` 里的常量表。
-const WORKER_WEIGHTS: [i32; 32] = [
-    -1, -1, -1, -1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3,
-    3, 3,
-];
 
 /// 系统服务在配置里的样子。内核只认一个 `name`（服务类型名），段里其余的键
 /// 一概不看——那是认领这一段的服务自己的事，它在 `init` 里用
@@ -272,11 +266,10 @@ fn run(config: Config, registry: Registry, timer: Arc<dyn Timer>) -> Result<()> 
     let panic = thread::scope(|scope| {
         let mut workers = Vec::with_capacity(config.thread);
         for id in 0..config.thread {
-            let weight = WORKER_WEIGHTS.get(id).copied().unwrap_or(0);
             workers.push(
                 thread::Builder::new()
                     .name(format!("rskynet-worker-{id}"))
-                    .spawn_scoped(scope, move || worker_loop(shared, id, weight))
+                    .spawn_scoped(scope, move || worker_loop(shared, id))
                     .expect("worker 线程创建失败"),
             );
         }
@@ -355,12 +348,12 @@ fn shutdown(node: &Arc<Node>) -> Option<Box<dyn Any + Send + 'static>> {
 }
 
 /// worker 主循环，对照 C 版 `thread_worker`。
-fn worker_loop(node: &Node, id: usize, weight: i32) {
+fn worker_loop(node: &Node, id: usize) {
     // 绑定本线程的运行队列：从此本线程的投递与取活优先走它，取空了才去偷别人的
     let _worker = node.sched.register_worker(id);
     let mut hold = None;
     while !node.sched.is_quit() {
-        hold = node.dispatch(hold.take(), weight);
+        hold = node.dispatch(hold.take());
         if hold.is_none() {
             // 找活：先自旋几轮，还是空手就登记空闲位并挂起，等人定向叫醒
             hold = node.sched.find_work_or_park();
@@ -385,7 +378,7 @@ fn worker_loop(node: &Node, id: usize, weight: i32) {
 fn drain(node: &Node) {
     let mut hold = None;
     loop {
-        hold = node.dispatch(hold, -1);
+        hold = node.dispatch(hold);
         if hold.is_none() {
             return;
         }
