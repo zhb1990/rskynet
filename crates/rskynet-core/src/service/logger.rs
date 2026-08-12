@@ -2,6 +2,9 @@
 //!
 //! 内核的 `Ctx::log` 并不直接写文件，而是把日志当成一条 `TEXT` 消息发给本服务
 //! ——这样写日志就是一次投递，不会在业务线程上做 IO。
+//!
+//! 它是个[独占线程服务][crate::Exclusive]：写文件是阻塞 IO，让它占着共享 worker
+//! 不合适。两个钩子都走默认实现，也就是「没日志可写就阻塞在 park 上」。
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -12,6 +15,7 @@ use futures_util::future::BoxFuture;
 
 use crate::context::{Ctx, Service};
 use crate::error::Result;
+use crate::exclusive::Exclusive;
 use crate::message::{Message, MsgType};
 use crate::task::SvcCell;
 
@@ -67,7 +71,11 @@ impl Service for Logger {
         Box::pin(async move {
             match msg.mtype {
                 MsgType::TEXT => {
-                    self.write(&ctx, msg.source, msg.payload.as_str().unwrap_or("<非法日志>"));
+                    self.write(
+                        &ctx,
+                        msg.source,
+                        msg.payload.as_str().unwrap_or("<非法日志>"),
+                    );
                 }
                 // 对照 C 版收到 SIGHUP 后重开日志文件的做法
                 MsgType::SYSTEM => {
@@ -84,3 +92,5 @@ impl Service for Logger {
         })
     }
 }
+
+impl Exclusive for Logger {}

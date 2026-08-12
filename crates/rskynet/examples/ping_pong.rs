@@ -9,7 +9,9 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use rskynet::{BoxFuture, Config, Ctx, Message, MsgType, Payload, Registry, Result, Service, SvcCell};
+use rskynet::{
+    BoxFuture, Config, Ctx, Message, MsgType, Payload, Registry, Result, Service, SvcCell,
+};
 
 /// ping 与 pong 之间的请求。同进程传递，直接塞对象，不需要序列化。
 enum Ask {
@@ -181,6 +183,9 @@ fn main() -> Result<()> {
         .with_thread(4)
         .with_bootstrap("bootstrap pong; ping 1000");
 
-    println!("=== rskynet ping-pong 示例，MsgType::USER = {:?} ===", MsgType::USER);
+    println!(
+        "=== rskynet ping-pong 示例，MsgType::USER = {:?} ===",
+        MsgType::USER
+    );
     rskynet::start(config, registry)
 }

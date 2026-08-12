@@ -50,12 +50,13 @@
 //! | --- | --- | --- |
 //! | [`rskynet_core`] | Actor 内核：邮箱、调度、session、定时器 | 总是启用 |
 //! | `rskynet-macros` | 消去 `Service` 实现样板的过程宏 | `macros`（默认开） |
-//! | `rskynet-net` | socket 层，以插件形式接入内核 | `net` |
+//! | `rskynet-net` | socket 层，一个[独占线程的服务][Exclusive] | `net` |
 //!
 //! 网络层做成独立 crate 而不是内核的一个模块，是为了让内核不碰 epoll/kqueue
-//! ——它因此是纯跨平台的，也不必为了跑单元测试就拉起一套 IO。两者的接缝是
-//! [`rskynet_core::ext`] 那三件扩展点：[`NodeRef`] 往邮箱投消息、[`Plugin`]
-//! 提供跟着节点起落的线程、[`ReplyToken`] 让外部线程能给一次 `call` 回话。
+//! ——它因此是纯跨平台的，也不必为了跑单元测试就拉起一套 IO。它进内核的路子
+//! 与别的服务没两样，只是用 [`Registry::with_exclusive`] 注册，于是那条阻塞在
+//! epoll 上的线程就是它自己的。真要再起子线程，[`rskynet_core::ext`] 里的
+//! [`NodeRef`] 与 [`ReplyToken`] 负责把消息与回话带回内核。
 
 pub use rskynet_core::*;
 

@@ -35,8 +35,8 @@
 //! 每个 worker 一条 [`crate::bwos`] 的 BWoS 队列：owner 在自己的队列上无锁
 //! push/pop，闲下来才去别人队列头部窃取。
 //!
-//! 但 BWoS 的 owner 侧操作只允许绑定线程调用，而投递方是任意线程（定时器线程、
-//! 外部唤醒的 waker 都可能），所以还留了一条 injector 队列兜底：
+//! 但 BWoS 的 owner 侧操作只允许绑定线程调用，而投递方是任意线程（独占服务那些
+//! 线程、外部唤醒的 waker 都可能），所以还留了一条 injector 队列兜底：
 //! 非 worker 线程的投递、本地队列写满的溢出，都落到 injector，谁都能从里面取。
 
 use std::cell::Cell;
@@ -241,6 +241,14 @@ impl Mailbox {
         self.len.load(Ordering::Relaxed)
     }
 
+    /// 服务此刻是否「没人管」：既不在运行队列里，也没被谁持有。
+    ///
+    /// 只是一瞬间的观测，仅供测试等待「对方确实空转下来了」。
+    #[cfg(test)]
+    pub(crate) fn is_idle(&self) -> bool {
+        self.state.load(Ordering::Acquire) == state::IDLE
+    }
+
     /// 取出并清零过载读数，对照 `skynet_mq_overload`。
     pub(crate) fn take_overload(&self) -> usize {
         self.overload.swap(0, Ordering::Relaxed)
@@ -284,7 +292,7 @@ thread_local! {
     /// 当前线程绑定到了哪个调度器的哪号 worker。
     ///
     /// 存调度器地址是因为同进程可以跑多个节点，得认准自己那一个；非 worker 线程
-    /// （主线程、定时器线程、外部唤醒线程）这里始终是 `None`。
+    /// （主线程、独占服务的线程、外部唤醒线程）这里始终是 `None`。
     static CURRENT_WORKER: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
 }
 
@@ -447,6 +455,9 @@ impl Scheduler {
 
     /// 把一个有活干的服务放进运行队列。
     pub(crate) fn push(&self, ctx: Arc<ServiceContext>) {
+        // 独占服务的执行者是它自己那条线程，进了运行队列就等于允许两条线程同时
+        // 执行同一个服务——那条不变量是 SvcCell 的立身之本，这里守一道
+        debug_assert!(!ctx.is_exclusive(), "独占服务不该进运行队列");
         // 顺序要紧：先宣告「我在队列里」再真的入队。反过来的话，别的 worker 可能
         // 已经把它取走并置成 RUNNING，我们这一记 store 就把它标成了「在队列里，
         // 实际谁也没拿着」，这个服务从此不会再被唤醒。
@@ -691,7 +702,7 @@ impl Scheduler {
         self.idle[id / 64].fetch_and(!(1 << (id % 64)), Ordering::Relaxed);
     }
 
-    /// 定时器线程的兜底唤醒，对照 C 版 `wakeup(m, m->count - 1)`。
+    /// 定时器服务的兜底唤醒，对照 C 版 `wakeup(m, m->count - 1)`。
     pub(crate) fn poke(&self) {
         if self.len() > 0 {
             if let Some(id) = self.claim_idle() {
@@ -700,6 +711,7 @@ impl Scheduler {
         }
     }
 
+    /// 只管 worker。要宣布整个节点收工请走 `Node::quit`，独占线程还得单独敲。
     pub(crate) fn set_quit(&self) {
         self.quit.store(true, Ordering::Release);
         // 收工信号要让所有睡着的 worker 都醒过来，一个都不能落下
@@ -786,13 +798,19 @@ mod tests {
     fn work_arriving_during_the_empty_check_is_not_lost() {
         let mailbox = running_mailbox();
         // 投递方压进一条活，并把状态从 RUNNING 推到 NOTIFIED
-        assert!(!mailbox.push_message(message(1)), "持有者还在，投递方不该自己入队");
+        assert!(
+            !mailbox.push_message(message(1)),
+            "持有者还在，投递方不该自己入队"
+        );
         assert!(matches!(mailbox.take_work(), Some(Work::Message(_))));
 
         // 再模拟最刁的那一刻：消费方已经看完两条空队列、正要落回 IDLE 时被通知。
         // 此时状态是 NOTIFIED 而队列是空的，消费方必须复位重扫一遍才能放生
         assert!(!mailbox.notify());
-        assert!(mailbox.take_work().is_none(), "重扫确实没活，才允许落回 IDLE");
+        assert!(
+            mailbox.take_work().is_none(),
+            "重扫确实没活，才允许落回 IDLE"
+        );
         // 落回之后的投递方就该自己负责入队了
         assert!(mailbox.push_message(message(2)));
     }
@@ -902,7 +920,7 @@ mod tests {
         assert_eq!(mailbox.len(), 0);
     }
 
-    /// 没绑定 worker 的线程（主线程、定时器线程）只走 injector，收发都得通
+    /// 没绑定 worker 的线程（主线程、独占服务的线程）只走 injector，收发都得通
     #[test]
     fn non_worker_threads_use_the_injector() {
         let node = test_node_with(Config::default().with_thread(2));
@@ -1023,7 +1041,10 @@ mod tests {
             sched.push(dummy_context_on(node.clone(), 1));
         });
 
-        assert!(found.load(Ordering::SeqCst), "被唤醒的 worker 应当能取到那件活");
+        assert!(
+            found.load(Ordering::SeqCst),
+            "被唤醒的 worker 应当能取到那件活"
+        );
     }
 
     /// 递到手上的活优先于本地队列里的：定向唤醒的语义就是「这件活归你」

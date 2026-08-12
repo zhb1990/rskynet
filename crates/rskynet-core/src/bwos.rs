@@ -324,7 +324,11 @@ impl<T> LifoQueue<T> {
             let owner_index = (owner & self.mask) as usize;
             match unsafe { self.blocks[owner_index].put(value) } {
                 Ok(()) => {
-                    return Ok(if granted { Pushed::Granted } else { Pushed::Local });
+                    return Ok(if granted {
+                        Pushed::Granted
+                    } else {
+                        Pushed::Local
+                    });
                 }
                 Err(back) => value = back,
             }

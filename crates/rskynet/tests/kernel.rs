@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use rskynet::{BoxFuture, Config, Ctx, Error, Message, MsgType, Payload, Registry, Service, SvcCell};
+use rskynet::{
+    BoxFuture, Config, Ctx, Error, Message, MsgType, Payload, Registry, Service, SvcCell,
+};
 
 /// 用例观察到的现象，跨线程收集，节点退出后统一断言。
 type Journal = Arc<Mutex<Vec<String>>>;
@@ -244,13 +246,16 @@ fn name_and_handle_addressing_are_equivalent() {
             note(&journal, reply.as_str().unwrap());
 
             let err = ctx.request(".查无此人", Payload::None).await.unwrap_err();
-            note(&journal, format!("{}", matches!(err, Error::NameNotFound(_))));
+            note(
+                &journal,
+                format!("{}", matches!(err, Error::NameNotFound(_))),
+            );
         })
     });
     assert_eq!(seen, vec!["查到 true", "按句柄!", "按名字!", "true"]);
 }
 
-/// sleep 由定时器线程唤醒，既不能早退也不能睡过头
+/// sleep 由定时器服务唤醒，既不能早退也不能睡过头
 #[test]
 fn sleep_is_woken_by_the_timer() {
     let seen = run_node("bootstrap driver", |ctx, journal| {
@@ -276,7 +281,10 @@ fn a_pending_call_does_not_block_the_service() {
             let fast_ctx = ctx.clone();
             let fast_journal = journal.clone();
             ctx.spawn(async move {
-                let reply = fast_ctx.request(".echo", Payload::text("快")).await.unwrap();
+                let reply = fast_ctx
+                    .request(".echo", Payload::text("快"))
+                    .await
+                    .unwrap();
                 note(&fast_journal, format!("先到：{}", reply.as_str().unwrap()));
             });
 
@@ -301,7 +309,10 @@ fn requests_are_served_concurrently() {
                 let task_ctx = ctx.clone();
                 let done = done.clone();
                 ctx.spawn(async move {
-                    let reply = task_ctx.request(".slow", Payload::text(centis)).await.unwrap();
+                    let reply = task_ctx
+                        .request(".slow", Payload::text(centis))
+                        .await
+                        .unwrap();
                     done.borrow_mut().push(reply.as_str().unwrap().to_string());
                 });
             }
@@ -377,7 +388,10 @@ fn services_can_be_launched_at_runtime() {
             note(&journal, reply.as_str().unwrap());
 
             let err = ctx.launch("查无此类", "").await.unwrap_err();
-            note(&journal, format!("{}", matches!(err, Error::UnknownService(_))));
+            note(
+                &journal,
+                format!("{}", matches!(err, Error::UnknownService(_))),
+            );
 
             let err = ctx.launch("stillborn", "").await.unwrap_err();
             note(&journal, format!("{}", matches!(err, Error::Init { .. })));
@@ -395,7 +409,10 @@ fn failed_init_leaves_no_trace() {
             ctx.sleep(3).await;
             let before = ctx.service_count();
 
-            note(&journal, format!("{}", ctx.launch("stillborn", "").await.is_err()));
+            note(
+                &journal,
+                format!("{}", ctx.launch("stillborn", "").await.is_err()),
+            );
             ctx.sleep(3).await;
             note(&journal, format!("{}", ctx.service_count() == before));
         })
@@ -426,7 +443,9 @@ fn many_local_tasks_all_get_scheduled() {
                 let task_ctx = ctx.clone();
                 let done = done.clone();
                 ctx.spawn(async move {
-                    let _ = task_ctx.request(".echo", Payload::text(i.to_string())).await;
+                    let _ = task_ctx
+                        .request(".echo", Payload::text(i.to_string()))
+                        .await;
                     *done.borrow_mut() += 1;
                 });
             }
@@ -645,7 +664,11 @@ fn custom_message_types_work() {
     struct Picky;
 
     impl Service for Picky {
-        fn init(self: Arc<Self>, ctx: Ctx, _args: String) -> BoxFuture<'static, rskynet::Result<()>> {
+        fn init(
+            self: Arc<Self>,
+            ctx: Ctx,
+            _args: String,
+        ) -> BoxFuture<'static, rskynet::Result<()>> {
             Box::pin(async move {
                 ctx.register_name("picky");
                 Ok(())
@@ -675,7 +698,10 @@ fn custom_message_types_work() {
                     let good = ctx.call(".picky", MY_PROTO, Payload::None).await;
                     note(&journal, format!("{}", good.is_ok()));
                     let bad = ctx.call(".picky", MsgType::USER, Payload::None).await;
-                    note(&journal, format!("{}", matches!(bad, Err(Error::CallFailed(_)))));
+                    note(
+                        &journal,
+                        format!("{}", matches!(bad, Err(Error::CallFailed(_)))),
+                    );
                 })
             }),
         });

@@ -7,7 +7,7 @@
 //!
 //! 与 C 版的实现差异有两处：一是 C 版用侵入式链表串联同一格里的定时器，这里用
 //! `Vec`（事件是定长的小结构，Vec 更省事也更快），逐级迁移的算法完全照搬；二是
-//! C 版给时间轮配了一把自旋锁，这里改成时间轮由定时器线程独占持有（[`Wheel`]），
+//! C 版给时间轮配了一把自旋锁，这里改成时间轮由定时器服务独占持有（[`Wheel`]），
 //! 别的线程挂表一律走无锁队列（[`Timer::incoming`]），于是一把锁都不需要。
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,8 +32,9 @@ pub(crate) struct TimerEvent {
 
 /// 分层时间轮本体。
 ///
-/// 由定时器线程独占持有（建在它自己的栈上，见 `start::timer_loop`），所以这里
-/// 全是普通的 `&mut` 方法，不需要锁：别的线程想挂表只能走 [`Timer::incoming`]。
+/// 由定时器服务独占持有（长在 [`crate::service::Timer`] 身上，而那个服务独占
+/// 一条线程），所以这里全是普通的 `&mut` 方法，不需要锁：别的线程想挂表只能走
+/// [`Timer::incoming`]。
 pub(crate) struct Wheel {
     /// 当前刻度，单位厘秒。
     time: u32,
@@ -75,8 +76,8 @@ impl Wheel {
             mask <<= TIME_LEVEL_SHIFT;
             level += 1;
         }
-        let idx = ((time >> (TIME_NEAR_SHIFT + level as u32 * TIME_LEVEL_SHIFT))
-            & TIME_LEVEL_MASK) as usize;
+        let idx = ((time >> (TIME_NEAR_SHIFT + level as u32 * TIME_LEVEL_SHIFT)) & TIME_LEVEL_MASK)
+            as usize;
         self.levels[level][idx].push(event);
     }
 
@@ -121,14 +122,14 @@ impl Wheel {
 
 /// 节点级定时器里跨线程共享的那部分。
 ///
-/// 时间轮不在这儿——它归定时器线程独占（见 [`Wheel`]）。这里只剩真正需要共享的
-/// 东西：谁都可以把事件压进 [`Timer::incoming`]，由定时器线程每 tick 排空后插进
+/// 时间轮不在这儿——它归定时器服务独占（见 [`Wheel`]）。这里只剩真正需要共享的
+/// 东西：谁都可以把事件压进 [`Timer::incoming`]，由定时器服务每 tick 排空后插进
 /// 轮子；`elapsed` 则是所有人都要读的时钟。
 pub(crate) struct Timer {
     /// 等着被插进时间轮的事件。
     ///
     /// `sleep` 与 `call` 超时都要挂表，而挂表的是任意 worker 线程；它们够不着
-    /// 时间轮，只能排队等定时器线程代插——精度本来就是 10ms，晚一个 tick 没区别。
+    /// 时间轮，只能排队等定时器服务代插——精度本来就是 10ms，晚一个 tick 没区别。
     incoming: SegQueue<TimerEvent>,
     /// 进程启动时刻，用来把单调时钟换算成 unix 时间。
     started: Instant,
@@ -138,7 +139,7 @@ pub(crate) struct Timer {
     start_centis: u64,
     /// 已经推进过的刻度数（厘秒），对照 C 版 `TI->current`。
     ///
-    /// 只有定时器线程会写；`ctx.now()` / `ctx.time()` 每次调用都要读它，所以是原子量。
+    /// 只有定时器服务会写；`ctx.now()` / `ctx.time()` 每次调用都要读它，所以是原子量。
     elapsed: AtomicU64,
 }
 
@@ -158,7 +159,7 @@ impl Timer {
 
     /// 挂一个 `ticks` 厘秒后到期的定时器。`ticks` 为 0 时调用方应当立即投递应答。
     ///
-    /// 只是排进队列，真正插轮子由定时器线程在下一个 tick 做。到期时刻按当前刻度
+    /// 只是排进队列，真正插轮子由定时器服务在下一个 tick 做。到期时刻按当前刻度
     /// 算好带上，所以延后插入不会让定时器变长。
     pub(crate) fn add(&self, handle: u32, session: i32, ticks: u32) {
         let expire = (self.now() as u32).wrapping_add(ticks);
@@ -169,9 +170,9 @@ impl Timer {
         });
     }
 
-    /// 推进到真实时间，返回这期间到期的全部事件。定时器线程每 2.5ms 调一次。
+    /// 推进到真实时间，返回这期间到期的全部事件。定时器服务每 2.5ms 调一次。
     ///
-    /// `wheel` 由调用方（定时器线程）持有，这里只负责收集事件，派发由调用方做。
+    /// `wheel` 由调用方（定时器服务）持有，这里只负责收集事件，派发由调用方做。
     pub(crate) fn update(&self, wheel: &mut Wheel) -> Vec<TimerEvent> {
         let now = self.started.elapsed().as_millis() as u64 / 10;
         let elapsed = self.elapsed.load(Ordering::Relaxed);
@@ -269,7 +270,10 @@ mod tests {
         arm(&mut wheel, 7, 300);
         assert!(wheel.levels[0].iter().any(|slot| !slot.is_empty()));
 
-        assert!(advance(&mut wheel, 299).is_empty(), "提前到期就说明迁移算错了");
+        assert!(
+            advance(&mut wheel, 299).is_empty(),
+            "提前到期就说明迁移算错了"
+        );
         let fired = advance(&mut wheel, 1);
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].session, 7);
@@ -308,6 +312,9 @@ mod tests {
         let before = timer.now();
         timer.update(&mut wheel);
         assert!(timer.now() >= before);
-        assert!(timer.start_seconds() > 1_600_000_000, "unix 时间应当是合理值");
+        assert!(
+            timer.start_seconds() > 1_600_000_000,
+            "unix 时间应当是合理值"
+        );
     }
 }

@@ -153,7 +153,10 @@ mod tests {
         let session = table.alloc();
         table.abandon(session);
 
-        assert!(!table.complete(session, Ok(Payload::None)), "无人等待应返回 false");
+        assert!(
+            !table.complete(session, Ok(Payload::None)),
+            "无人等待应返回 false"
+        );
         assert_eq!(table.pending(), 0, "墓碑应随迟到回包一起清掉");
     }
 

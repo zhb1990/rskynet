@@ -30,7 +30,7 @@ flowchart LR
         SS["Session 表 session 到 Waker"]
     end
     Sender[其他服务 send/call] -->|投递消息| MB
-    TimerThread[定时器线程 时间轮] -->|RESPONSE 消息| MB
+    TimerSvc[定时器服务 时间轮] -->|RESPONSE 消息| MB
     Waker[Future 被唤醒] -->|任务 id| RQ
     MB -->|状态从 Idle 变 Queued 时入队| GQ[运行队列]
     RQ -->|状态从 Idle 变 Queued 时入队| GQ
@@ -49,6 +49,28 @@ worker 的一轮调度（对照 C 版 `skynet_context_message_dispatch`）：
 4. 邮箱和就绪队列都空了 → 状态落回 `Idle`，脱离运行队列，等下一次投递
 
 「就绪任务优先于新消息」不是随便定的：它对应 skynet 里被 resume 的协程会一路跑到下一次 yield，之后才轮到下一条消息。
+
+### 独占一条线程的服务
+
+服务默认跑在共享的 worker 池上，也可以让它**独占一条线程**——这样的服务每 `launch` 一次就新起一条线程，那条线程只跑这一个服务，空闲时由服务自己决定怎么睡。日志、定时器、将来的网络层都是这一类。
+
+C 版 skynet 为定时器与 socket 各写了一条专用线程：它们不是服务，没有邮箱也没有地址，内核得为它们单开一套代码。这里换个思路，把「独占一条线程」做成**服务的一种运行方式**（形态接近 ltask 的 exclusive service），于是那些活都由普通服务承担：
+
+| | 共享服务 | 独占服务 |
+| --- | --- | --- |
+| 谁来执行 | 运行队列上的某个 worker，可能被窃取 | 自己那条线程，从不进运行队列 |
+| 没活干时 | 去找别的服务干，找不到才挂起 | 调服务自己的 `idle` 钩子 |
+| 有活投进来 | 邮箱入运行队列，按空闲位图点名叫一个 worker | `unpark` 那条线程，再调一次 `interrupt` |
+| 适合什么 | 业务服务：`launch` 一万个只是一万个邮箱 | 要阻塞在自己事件源上（epoll）、或要按节拍醒来（时间轮）的活 |
+
+两者共用同一个邮箱状态机与同一段取活逻辑（`Node::run_service`），`init` / `dispatch` 的写法一字不差。「同一服务任意时刻只在一条线程上执行」这条不变量在独占模式下只会更强，所以 `SvcCell` 照旧可用。
+
+`Exclusive` 只有两个钩子：
+
+- `idle(&self, ctx, idler)`：邮箱与就绪队列都空了时调用，跑在自己那条线程上，可以放心阻塞。默认实现是 `idler.park()`；定时器在这里推一格时间轮再 `park_timeout(2.5ms)`；网络层将来在这里 `poll.poll(events, None)`，顺手把 IO 事件转成消息投出去。
+- `interrupt(&self)`：从任意线程把上面那个阻塞叫醒。默认空实现——内核每次唤醒都会**先 `unpark` 再调 `interrupt`**，所以纯消息驱动的服务（日志）什么都不用写；阻塞在别处的服务在这里敲自己那个唤醒手段（mio 的 `Waker`）。这里有一条硬要求：`interrupt` 必须接得住**早到的唤醒**——它可能发生在线程真正睡下去之前，那一下不能丢，否则「取活取空」与「睡下去」之间的那次投递就没人管了。`std` 的 park 令牌与 mio 的 `Waker` 都满足，`Condvar` 不满足。
+
+退出时序上，独占线程的退出条件是**自己被摘除**而不是节点收工，这样日志服务「留到最后收尾」的语义原样保住：`start()` 收尾时先 `retire_all()` 送走普通服务、join 掉它们的线程，最后才摘除保留服务（日志与定时器）。而发现自己已死之后，那条线程会先把邮箱里积压的消息处理完再销毁——不然关停前最后几行日志就跟着清理一起丢了。
 
 ### 邮箱：无锁队列 + 四态状态机
 
@@ -87,14 +109,14 @@ flowchart LR
     L1 -->|尾部取 后进先出| W1
     L1 -->|头部偷 先进先出| W0
     L0 -->|头部偷 先进先出| W1
-    Timer[定时器线程] --> INJ[injector 队列]
+    Timer[独占线程 定时器等] --> INJ[injector 队列]
     Ext[外部线程唤醒 waker] --> INJ
     L0 -.->|写满溢出| INJ
     INJ --> W0
     INJ --> W1
 ```
 
-BWoS 的 owner 侧操作只允许绑定线程调用，可投递方却是任意线程——定时器线程、被外部 channel 唤醒的 waker 都算。所以还留了一条 injector 队列兜底（同样是 `SegQueue`，无锁）：非 worker 线程的投递、本地队列写满的溢出都落在这里，谁都能取。worker 每取 64 次活会回头看一眼 injector，免得里面的服务被本地队列饿死。
+BWoS 的 owner 侧操作只允许绑定线程调用，可投递方却是任意线程——独占服务那几条线程、被外部 channel 唤醒的 waker 都算。所以还留了一条 injector 队列兜底（同样是 `SegQueue`，无锁）：非 worker 线程的投递、本地队列写满的溢出都落在这里，谁都能取。worker 每取 64 次活会回头看一眼 injector，免得里面的服务被本地队列饿死。
 
 **本地队列是后进先出的**，这是 BWoS lifo 变体的定义，图的是刚投递的服务多半还热在缓存里。代价是让渡回去的服务下一轮很可能又被同一个 worker 取到，不再是 skynet 那种严格 FIFO 轮转；跨 worker 的公平由窃取（从队列头部取最老的）和 injector 兜底。
 
@@ -205,13 +227,15 @@ cargo run --example ping_pong
 | `context.rs` | `lualib/skynet.lua` | 用户侧 API：`call` / `send` / `fork` / `sleep` |
 | `session.rs` | `lualib/skynet.lua` | `session_id_coroutine` 的对应物 |
 | `task.rs` | Lua 协程池 | 服务内 executor、`SvcCell` |
-| `service/logger.rs` | `service_logger.c` | 日志服务 |
+| `exclusive.rs` | 无对应 | 独占线程的服务：`Exclusive` 的 `idle` / `interrupt` 两个钩子与那条线程的主循环，见上文 |
+| `service/logger.rs` | `service_logger.c` | 日志服务（独占一条线程） |
+| `service/timer.rs` | `skynet_start.c` 的 `thread_timer` | 定时器服务（独占一条线程），C 版那是内核里的专用线程 |
 | `service/bootstrap.rs` | `bootstrap.lua` | 引导服务 |
-| `ext.rs` | 无对应 | 内核对外的扩展接口：`NodeRef` / `Plugin` / `ReplyToken`，见下文 |
+| `ext.rs` | 无对应 | 内核对外的扩展接口：`NodeRef` / `ReplyToken`，见下文 |
 
 ## 为什么服务状态可以不加锁
 
-调度器保证**同一个服务在任意时刻只会被一个 worker 线程执行**（由邮箱那个四态状态机维持：只有 `Queued → Running` 这一次取出的人才有执行权），所以服务内部天生是单线程访问的，只是「哪个线程」会随调度变化。换成工作窃取之后这条不变量照旧：一个服务同一时刻只躺在一条队列的一个槽位里，而 BWoS 保证每个槽位只会被取走一次，被偷走也只是换了个 worker 执行。`SvcCell<T>` 就建立在这条不变量上：它本质是 `RefCell`，只额外声明了 `Sync`，好让 `Arc<MyService>` 满足 `Send`。
+调度器保证**同一个服务在任意时刻只会被一条线程执行**（由邮箱那个四态状态机维持：只有 `Queued → Running` 这一次取出的人才有执行权），所以服务内部天生是单线程访问的，只是「哪条线程」会随调度变化。换成工作窃取之后这条不变量照旧：一个服务同一时刻只躺在一条队列的一个槽位里，而 BWoS 保证每个槽位只会被取走一次，被偷走也只是换了个 worker 执行。独占线程的服务更是从头到尾只有那一条线程。`SvcCell<T>` 就建立在这条不变量上：它本质是 `RefCell`，只额外声明了 `Sync`，好让 `Arc<MyService>` 满足 `Send`。
 
 用它而不用 `Mutex` 是有意的：跨 `await` 持有 `Mutex` 会真的死锁，而 `SvcCell` 只会在借用冲突时 panic，能第一时间把 bug 暴露出来。
 
@@ -228,15 +252,16 @@ struct Counter { hits: SvcCell<u64> }
 ## 相对 C 版的几处有意改动
 
 - **全局队列换成每 worker 一条的窃取队列**：见上文「运行队列」。
-- **投递即唤醒**：C 版 `skynet_globalmq_push` 不唤醒 worker，靠定时器线程每 2.5ms 顺手唤醒，代价是所有 worker 都睡着时消息最坏要等一个 tick。这里改成投递方按空闲位图点名叫一个具体的 worker，延迟更低；定时器线程的兜底唤醒保留。
-- **消息路径上没有锁**：邮箱、injector、唤醒、handle 表原先各有一把锁，一条消息从发出到被处理要抢四把。现在邮箱与 injector 是无锁队列，唤醒是位图加 `park`/`unpark`，handle 表与名字表用 `arc-swap` 做快照读（`grab()` 常态下连 RMW 都没有，`ctx.request(".pong", …)` 这种每次按名字寻址的写法也不再抢锁）。挂定时器同样不再抢时间轮的锁：投递方把事件压进一条无锁队列，定时器线程每 tick 排空后插进轮子——精度本来就是 10ms，晚一个 tick 插入无影响。`parking_lot` 只留给写者互斥这类冷路径（handle 分配、槽位扩容）。
+- **专用线程改成独占线程的服务**：C 版的定时器线程与 socket 线程是内核里两块独立代码，这里它们是普通服务，只是各占一条线程，见上文「独占一条线程的服务」。内核因此不必再为「跟着节点起落的线程」单开扩展点。
+- **投递即唤醒**：C 版 `skynet_globalmq_push` 不唤醒 worker，靠定时器线程每 2.5ms 顺手唤醒，代价是所有 worker 都睡着时消息最坏要等一个 tick。这里改成投递方按空闲位图点名叫一个具体的 worker，延迟更低；定时器那记兜底唤醒保留。
+- **消息路径上没有锁**：邮箱、injector、唤醒、handle 表原先各有一把锁，一条消息从发出到被处理要抢四把。现在邮箱与 injector 是无锁队列，唤醒是位图加 `park`/`unpark`，handle 表与名字表用 `arc-swap` 做快照读（`grab()` 常态下连 RMW 都没有，`ctx.request(".pong", …)` 这种每次按名字寻址的写法也不再抢锁）。挂定时器同样不再抢时间轮的锁：投递方把事件压进一条无锁队列，定时器服务每 tick 排空后插进轮子——精度本来就是 10ms，晚一个 tick 插入无影响。`parking_lot` 只留给写者互斥这类冷路径（handle 分配、槽位扩容）。
 - **节点不再是全局单例**：C 版用文件级静态变量，这里收进 `Arc<Node>`，同进程可以跑多个互不干扰的节点，单元测试因此能并行。
 - **字符串命令表换成类型化方法**：`skynet_command("LAUNCH", ...)` 这类字符串接口改成 `Ctx` 上的方法，编译期就能查错。
 - **消息负载可以是任意 Rust 对象**：同进程传递走 `Payload::Boxed`，零拷贝、不需要序列化；`Payload::Bytes` 留给日志和将来的网络层。
 
 ## 现状与边界
 
-已实现：服务生命周期（launch / exit / kill / abort）、消息与自定义协议号、session RPC、服务内并发、本地名字表、分层时间轮、日志服务、引导服务、TOML 配置、worker 权重调度与工作窃取、过载检测、退出时给在途请求回错误。
+已实现：服务生命周期（launch / exit / kill / abort）、消息与自定义协议号、session RPC、服务内并发、本地名字表、分层时间轮、独占线程的服务（日志与定时器都是）、引导服务、TOML 配置、worker 权重调度与工作窃取、过载检测、退出时给在途请求回错误。
 
 尚未实现（下一版）：socket / gate / agent 网络层、消去 `Service` 样板的过程宏、harbor / cluster 跨节点、monitor 死循环检测、debug_console、消息序列化协议。
 
@@ -273,13 +298,13 @@ cargo test --release -- --ignored --nocapture
 Cargo.toml                 workspace 根
 config/dev.toml            节点配置示例
 crates/rskynet-core/       内核
-  src/                     按 skynet-src 的文件名组织（bwos.rs 与 ext.rs 例外，C 版没有对应物）
-  tests/plugin.rs          扩展点的端到端验证
+  src/                     按 skynet-src 的文件名组织（bwos.rs / exclusive.rs / ext.rs 例外，C 版没有对应物）
+  tests/exclusive.rs       独占线程服务的端到端验证
 crates/rskynet/            门面：按 feature 把下面几个拼在一处，使用方只依赖它
   examples/ping_pong.rs    示例
   tests/kernel.rs          端到端测试
 crates/rskynet-macros/     过程宏，消去 Service 实现的样板（骨架，未实现）
-crates/rskynet-net/        网络层，以插件形式接入内核（骨架，未实现）
+crates/rskynet-net/        网络层，一个独占线程的服务（骨架，未实现）
 ```
 
 使用方只写一行依赖，要什么按 feature 开：
@@ -294,17 +319,16 @@ rskynet = { version = "0.1", features = ["net"] }   # macros 默认已开
 
 C 版的 socket 线程与内核同住一个编译单元，`skynet_socket_*` 直接碰内部结构。这里把它拆出去，图的是**内核不碰 epoll/kqueue**：内核因此是纯跨平台的，单元测试也不必为了跑一条消息就拉起一套 IO。
 
-代价是得有一套公开的接缝，`ext.rs` 就是那道缝，三件东西：
+拆出去之后，socket 层进内核的路只有「注册一个独占线程的服务」这一条——它需要的线程就是那条独占线程，需要的配置从 `ctx.node().section("net")` 读，需要投的消息走邮箱，都是服务本来就有的东西。`ext.rs` 只剩两件专供内核之外的线程用的东西：
 
 | 扩展点 | 作用 | 对应 skynet |
 | --- | --- | --- |
-| `NodeRef` | 从任意线程往服务邮箱投消息 | `skynet_context_push` |
-| `Plugin` | 跟着节点一起起落的自有线程，三个钩子：`init` 建资源并把对象放进扩展槽、`run` 独占一条线程、`shutdown` 把它从阻塞里叫醒 | `thread_socket` |
-| `ReplyToken` | 一张可以跨线程搬的回执单，外部线程办完活调 `reply`，服务侧那句 `ctx.call_external(…).await` 就醒过来 | socket 线程回一条带 session 的 `PTYPE_RESPONSE` |
+| `NodeRef` | 从内核之外的线程往服务邮箱投消息 | `skynet_context_push` |
+| `ReplyToken` | 一张可以跨线程搬的回执单，别的线程办完活调 `reply`，服务侧那句 `ctx.call_external(…).await` 就醒过来 | socket 线程回一条带 session 的 `PTYPE_RESPONSE` |
 
-于是网络层写起来是这样的：`SocketServer`（命令队列 + mio `Waker`）在 `init` 里进扩展槽，服务侧的扩展 trait 靠 `ctx.node().extension::<SocketServer>()` 取回它，`listen` / `connect` / `send` 都是「把命令连同一张回执单丢给 socket 线程，然后 `await`」；socket 事件则走 `NodeRef::send` 以 `MsgType::SOCKET` 投给连接的属主服务，与定时器回包同一条路径。配置各占一段（网络层读 `[net]`），内核只负责原样传过去。
+于是网络层写起来是这样的：socket 服务用 `with_exclusive` 注册，它的 `idle` 就是 `poll.poll(events, None)`，`interrupt` 敲 mio 的 `Waker`；业务服务的 `listen` / `connect` / `send` / `close` 是发给它的消息，办完由它 `reply`，调用方写成一句 `await`；socket 事件以 `MsgType::SOCKET` 投给连接的属主服务，与定时器回包同一条路径。真要再起子线程（比如把阻塞的域名解析挪出去），那条线程靠 `NodeRef` 与 `ReplyToken` 回话。
 
-`Plugin` 的 `shutdown` 有一处时序是硬要求：它必须**在 worker 与定时器线程都 join 完之后**才调用，而 `run` 那条线程要等它返回后才被 join。顺序一颠倒，挂在 epoll 里的 socket 线程就永远醒不过来，`start()` 随之卡死。`crates/rskynet-core/tests/plugin.rs` 拿一个最小插件把这条时序连同扩展槽、外部回包一起钉住了。
+`crates/rskynet-core/tests/exclusive.rs` 拿一个最小的「轮询器」把这套路整个走了一遍：自定义阻塞、被 `interrupt` 叫醒、外部事件转成消息、被 kill 时线程自己退掉、关停时积压的消息一条不丢。
 
 ## 测试
 

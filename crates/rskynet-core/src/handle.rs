@@ -82,7 +82,8 @@ impl HandleStorage {
                 }
                 let hash = (handle as usize) & (slots.len() - 1);
                 if slots[hash].load().is_none() {
-                    let ctx = make.take().expect("闭包只会被调用一次")(handle | self.harbor);
+                    let ctx =
+                        make.take().expect("闭包只会被调用一次")(handle | self.harbor);
                     slots[hash].store(Some(ctx.clone()));
                     *next = handle + 1;
                     return ctx;
@@ -98,7 +99,10 @@ impl HandleStorage {
     fn grow(&self) {
         let old = self.slots.load();
         let new_size = old.len() * 2;
-        assert!(new_size <= HANDLE_MASK as usize + 1, "服务数量超出 handle 空间");
+        assert!(
+            new_size <= HANDLE_MASK as usize + 1,
+            "服务数量超出 handle 空间"
+        );
         let new_slots = empty_slots(new_size);
         for ctx in old.iter().filter_map(|slot| slot.load_full()) {
             let hash = (ctx.handle as usize) & (new_size - 1);
@@ -135,11 +139,15 @@ impl HandleStorage {
 
     /// 当前所有活着的 handle，退出流程逐个 kill 时用。
     pub(crate) fn handles(&self) -> Vec<u32> {
+        self.contexts().iter().map(|ctx| ctx.handle).collect()
+    }
+
+    /// 当前所有活着的服务上下文，节点收工时逐个敲一遍用。
+    pub(crate) fn contexts(&self) -> Vec<Arc<ServiceContext>> {
         self.slots
             .load()
             .iter()
             .filter_map(|slot| slot.load_full())
-            .map(|ctx| ctx.handle)
             .collect()
     }
 

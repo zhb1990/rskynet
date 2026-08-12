@@ -1,6 +1,7 @@
 # rskynet 节点配置，对照 skynet 的 config 文件。
 
-# worker 线程数。不写则取 CPU 核数。
+# 共享 worker 线程数。不写则取 CPU 核数。
+# 日志与定时器各自独占一条线程，不算在这里面。
 thread = 4
 
 # 本节点编号，占据 handle 的高 8 位，跨节点通信时用来判断是否需要转发。
@@ -10,7 +11,7 @@ harbor = 0
 # 内置的 bootstrap 会把参数按 `;` 拆开，逐个拉起。
 bootstrap = "bootstrap pong; ping 100"
 
-# 日志服务的类型名。
+# 日志服务的类型名。它独占一条线程，写文件不占用 worker。
 logservice = "logger"
 
 # 传给日志服务的参数：日志文件路径。留空则只写标准输出。
@@ -19,8 +20,8 @@ logger = ""
 # 是否统计各服务的消息处理情况。
 profile = true
 
-# 插件的配置各占一段，内核只负责原样传过去，由插件自己解析。
-# 网络层（rskynet-net）读的就是 [net] 这一段：
+# 扩展的配置各占一段，内核只负责原样传过去，由认领它的服务在自己的 init 里
+# 用 ctx.node().section("段名") 解析。网络层（rskynet-net）读的就是 [net] 这一段：
 #
 # [net]
 # listen = "0.0.0.0:8888"

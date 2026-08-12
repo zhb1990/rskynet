@@ -2,24 +2,21 @@
 //! 一个编译单元，`skynet_socket_*` 直接碰内部结构；这里网络层住在独立 crate
 //! （`rskynet-net`）里，就必须有一套公开接口才进得来。
 //!
-//! 三件事凑成一套完整的扩展能力：
+//! 剩下的只有两件事，因为「跟着节点起落的线程」这件事已经由
+//! [独占线程服务][crate::Exclusive] 承担了——它就是个服务，不需要另开扩展点：
 //!
-//! - [`NodeRef`]：从外部线程往服务邮箱投消息，也就是 `skynet_context_push` 那条路。
-//! - [`Plugin`]：跟着节点一起起落的自有线程，对照 C 版的 `thread_socket`。
-//! - [`ReplyToken`]：让外部线程能给一次 `call` 回包，于是服务侧能把「向 socket
-//!   线程下个命令并等结果」写成一句 `await`。
+//! - [`NodeRef`]：从内核之外的线程往服务邮箱投消息，也就是 `skynet_context_push`
+//!   那条路。独占服务自己起的子线程（连接线程、阻塞线程池）靠它回话。
+//! - [`ReplyToken`]：让内核之外的线程能给一次 `call` 回包，于是服务侧能把
+//!   「把活交给别的线程并等结果」写成一句 `await`。
 
-use std::any::{Any, TypeId};
-use std::collections::HashMap;
 use std::sync::Arc;
+
+use serde::de::DeserializeOwned;
 
 use crate::error::Result;
 use crate::message::{Addr, MsgType, Payload};
 use crate::server::Node;
-use crate::start::Config;
-
-/// 扩展槽的内容：插件在 [`Plugin::init`] 里交出来，之后全节点只读。
-pub(crate) type Extensions = HashMap<TypeId, Arc<dyn Any + Send + Sync>>;
 
 /// 节点的对外把手，扩展代码访问内核的唯一入口。
 ///
@@ -59,7 +56,7 @@ impl NodeRef {
         self.node.resolve(addr)
     }
 
-    /// 节点是否已经收工。插件线程的主循环应当盯着它。
+    /// 节点是否已经收工。自己起的线程该盯着它决定何时退出。
     pub fn is_quit(&self) -> bool {
         self.node.sched.is_quit()
     }
@@ -74,57 +71,18 @@ impl NodeRef {
         self.node.log(source, text.into());
     }
 
-    /// 取某个插件在 [`Plugin::init`] 里登记的那个对象。
+    /// 取属于自己的那一段配置，例如 `ctx.node().section::<NetConfig>("net")`。
     ///
-    /// 这是扩展 trait 拿自己那份状态的标准姿势：网络层的
-    /// `SocketExt for Ctx` 就靠它从 `Ctx` 摸到 socket 线程的句柄。
-    pub fn extension<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
-        self.node
-            .extensions()?
-            .get(&TypeId::of::<T>())?
-            .clone()
-            .downcast::<T>()
-            .ok()
+    /// 段不存在时返回 `Ok(None)`，由服务自己决定是走默认值还是报错。服务的 `init`
+    /// 只收得到一个字符串参数，成段的配置从这里来。
+    pub fn section<T: DeserializeOwned>(&self, name: &str) -> Result<Option<T>> {
+        self.node.config().section(name)
     }
 }
 
 impl std::fmt::Debug for NodeRef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NodeRef").finish_non_exhaustive()
-    }
-}
-
-/// 一条跟着节点起落的自有线程，对照 C 版 `skynet_start.c` 里的 `thread_socket`。
-///
-/// 三个钩子的时序：
-///
-/// 1. [`Plugin::init`]：worker 与任何服务都还没起来，用来建资源。返回值进扩展槽，
-///    随后服务就能在自己的 `init` 里通过 [`NodeRef::extension`] 取到它。
-/// 2. [`Plugin::run`]：在 [`crate::start`] 的线程作用域里独占一条线程。
-/// 3. [`Plugin::shutdown`]：worker 与定时器线程都已收工，用来把 `run` 那条线程
-///    从阻塞里叫醒（网络层就是敲 mio 的 `Waker`）。**只有它返回后 `run` 那条
-///    线程才会被 join**，所以这里必须真的把线程叫醒，否则 `start` 永远不返回。
-///
-/// `init` 返回 `Err` 会让 `start` 当场带着这个错误返回，`run` 与 `shutdown` 都不
-/// 会再被调用——那时插件线程还没起来，没有需要收的尾。
-pub trait Plugin: Send + Sync + 'static {
-    /// 插件名，用于线程名与日志。
-    fn name(&self) -> &str;
-
-    /// 建资源。返回 `Some(x)` 就把 `x` 放进扩展槽，键是它的具体类型。
-    fn init(&self, node: &NodeRef, config: &Config) -> Result<Option<Arc<dyn Any + Send + Sync>>> {
-        let _ = (node, config);
-        Ok(None)
-    }
-
-    /// 插件自己的主循环，跑在独占线程上。应当以 [`NodeRef::is_quit`] 为退出条件。
-    fn run(&self, node: NodeRef) {
-        let _ = node;
-    }
-
-    /// 叫醒 [`Plugin::run`] 那条线程，让它看到 `is_quit` 并返回。
-    fn shutdown(&self, node: &NodeRef) {
-        let _ = node;
     }
 }
 

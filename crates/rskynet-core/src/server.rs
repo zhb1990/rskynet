@@ -12,16 +12,20 @@
 //! [`Node::destroy`] 会清空任务集，循环随之断开，`Arc` 计数归零。
 //! 这与 skynet 里 `delete_context` 释放 Lua 虚拟机、连带干掉所有协程是一个道理。
 
+use std::any::Any;
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Weak};
+use std::thread::{self, JoinHandle, Thread};
 
+use arc_swap::ArcSwapOption;
 use futures_util::future::BoxFuture;
 use parking_lot::Mutex;
 
 use crate::context::{Ctx, Service};
 use crate::error::{Error, Result};
-use crate::ext::Extensions;
+use crate::exclusive::Exclusive;
 use crate::handle::HandleStorage;
 use crate::message::{Addr, Message, MsgType, Payload};
 use crate::module::Registry;
@@ -40,6 +44,11 @@ pub(crate) struct ServiceContext {
     pub(crate) mailbox: Mailbox,
     pub(crate) sessions: SessionTable,
     service: Arc<dyn Service>,
+    /// 独占线程服务的另一副面孔，与 `service` 是同一个对象；普通服务是 `None`。
+    /// 它同时兼作「本服务由自己那条线程执行，不进运行队列」的标记。
+    exclusive: Option<Arc<dyn Exclusive>>,
+    /// 独占线程的句柄，投递方靠它把那条线程从 park 里叫醒。
+    thread: ArcSwapOption<Thread>,
     tasks: TaskSet,
     /// 已被摘出 handle 表，等待某个 worker 领走做销毁。
     dead: AtomicBool,
@@ -90,6 +99,15 @@ impl ServiceContext {
         CURRENT_SERVICE.with(|cell| cell.get()) == me
     }
 
+    /// 顶着「本线程正在执行本服务」的标记跑一段同步代码。
+    ///
+    /// 独占线程的 [`Exclusive::idle`] 用它，于是那个钩子里也能直接 `ctx.spawn`、
+    /// 碰服务自己的 [`crate::SvcCell`]，与在 `dispatch` 里一样。
+    pub(crate) fn with_ownership<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _running = Running::enter(self);
+        f()
+    }
+
     pub(crate) fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Acquire)
     }
@@ -102,21 +120,67 @@ impl ServiceContext {
         self.dead.store(true, Ordering::Release);
     }
 
+    /// 本服务是否独占一条线程。
+    pub(crate) fn is_exclusive(&self) -> bool {
+        self.exclusive.is_some()
+    }
+
+    /// 有活干了，把服务交给它的执行者。
+    ///
+    /// `queued` 是邮箱状态机的回话：`true` 表示这件活刚把服务从「没人管」推成
+    /// 「有人管」，该由投递方负责递交。普通服务的执行者是运行队列上的某个
+    /// worker，独占服务的执行者是它自己那条线程。
+    ///
+    /// 独占分支同样只在 `queued` 为真时才叫人，这一点是对的也是必须的：状态机里
+    /// 进入 `QUEUED` 的路径只有「投递方 CAS 成功」这一条（服务刚创建那次除外，
+    /// 而那次的接手方正是即将启动的专属线程），所以每一次「线程可能正睡着」都
+    /// 恰好对应一次 `queued`。反过来若每条消息都叫一次，忙起来就是每条消息一次
+    /// 系统调用。
+    fn wake(self: &Arc<Self>, queued: bool) {
+        if !queued {
+            return;
+        }
+        match &self.exclusive {
+            None => self.node.sched.push(self.clone()),
+            Some(service) => {
+                self.unpark();
+                service.interrupt();
+            }
+        }
+    }
+
+    /// 无条件把独占线程从阻塞里敲出来，普通服务无事可做。节点收工时用它。
+    pub(crate) fn interrupt(&self) {
+        if let Some(service) = &self.exclusive {
+            self.unpark();
+            service.interrupt();
+        }
+    }
+
+    fn unpark(&self) {
+        if let Some(thread) = self.thread.load_full() {
+            thread.unpark();
+        }
+    }
+
+    /// 登记专属线程的句柄。必须在服务可能被投递之前做掉，见 [`crate::Idler`]。
+    pub(crate) fn bind_thread(&self) {
+        self.thread.store(Some(Arc::new(thread::current())));
+    }
+
     /// 投递一条消息。这是所有消息进入服务的唯一入口。
     ///
     /// 收 `&Arc<Self>` 而不是 `&self`：投递方手上本来就有 `Arc`，这样入队时只需
     /// 一次普通 `Arc::clone`，省掉每条消息一次 `Weak::upgrade`（那是个 CAS 循环）。
     pub(crate) fn push(self: &Arc<Self>, msg: Message) {
-        if self.mailbox.push_message(msg) {
-            self.node.sched.push(self.clone());
-        }
+        let queued = self.mailbox.push_message(msg);
+        self.wake(queued);
     }
 
-    /// 唤醒服务内的某个任务，与消息投递走同一条「进入运行队列」的路径。
+    /// 唤醒服务内的某个任务，与消息投递走同一条「交给执行者」的路径。
     pub(crate) fn wake_task(self: &Arc<Self>, task: usize) {
-        if self.mailbox.push_ready(Ready::Task(task)) {
-            self.node.sched.push(self.clone());
-        }
+        let queued = self.mailbox.push_ready(Ready::Task(task));
+        self.wake(queued);
     }
 
     /// 起一个服务内任务，等价于 skynet 的 `skynet.fork`。
@@ -127,8 +191,9 @@ impl ServiceContext {
     pub(crate) fn spawn(self: &Arc<Self>, future: BoxFuture<'static, ()>) {
         if self.owns_current_thread() {
             self.install_task(future, None);
-        } else if self.mailbox.push_ready(Ready::Spawn(future)) {
-            self.node.sched.push(self.clone());
+        } else {
+            let queued = self.mailbox.push_ready(Ready::Spawn(future));
+            self.wake(queued);
         }
     }
 
@@ -274,22 +339,53 @@ impl ServiceContext {
     }
 }
 
+/// 一轮 [`Node::run_service`] 的结局。
+pub(crate) enum Ran {
+    /// 邮箱与就绪队列都空了，服务已经放生（状态落回 `IDLE`），调用方不再持有它。
+    Idle,
+    /// 本轮预算用完，服务仍归调用方持有。
+    Yielded,
+    /// 服务已被摘除，仍归调用方持有，等着被销毁。
+    Dead,
+}
+
+impl Ran {
+    pub(crate) fn is_dead(&self) -> bool {
+        matches!(self, Ran::Dead)
+    }
+}
+
+/// join 一批线程，返回其中第一个没接住的 panic。
+fn join_all(threads: Vec<JoinHandle<()>>) -> Option<Box<dyn Any + Send + 'static>> {
+    let mut panic = None;
+    for thread in threads {
+        if let Err(payload) = thread.join() {
+            panic = panic.or(Some(payload));
+        }
+    }
+    panic
+}
+
 /// 一个 rskynet 节点。
 pub(crate) struct Node {
     pub(crate) sched: Scheduler,
     pub(crate) handles: HandleStorage,
     pub(crate) timer: Timer,
     modules: Registry,
-    /// 插件登记的扩展对象，启动阶段一次性填好，之后只读。
+    /// 独占服务的线程句柄，节点收尾时按它逐个 join。
     ///
-    /// 用 `OnceLock` 而不是普通字段，是因为插件的 `init` 需要一个
-    /// [`crate::NodeRef`]（也就是 `Arc<Node>`）才跑得起来——节点得先造出来。
-    /// 只写一次、之后纯读，所以读路径上没有锁也没有原子 RMW。
-    extensions: OnceLock<Extensions>,
+    /// 不能用 `thread::scope` 那种 scoped 线程：独占服务可以在运行期被 `launch`，
+    /// 那时启动阶段的作用域早就建好了。所以这里是普通线程加一张表，代价是收尾
+    /// 得自己 join（见 [`Node::join_exclusives`]）。
+    exclusives: Mutex<HashMap<u32, JoinHandle<()>>>,
     /// 活着的服务数，归零即整个节点退出，对照 `skynet_context_total`。
     total: AtomicI64,
     /// logger 服务的 handle，0 表示还没起来。
     logger: AtomicU32,
+    /// 节点配置原样留一份：服务在自己的 `init` 里靠 [`crate::NodeRef::section`]
+    /// 读属于自己的那一段（网络层的 `[net]` 之类）。`init` 只收得到一个字符串
+    /// 参数，成段的配置只能从这里来。
+    config: Config,
     profile: bool,
 }
 
@@ -300,9 +396,10 @@ impl Node {
             handles: HandleStorage::new(config.harbor),
             timer: Timer::new(),
             modules,
-            extensions: OnceLock::new(),
+            exclusives: Mutex::new(HashMap::new()),
             total: AtomicI64::new(0),
             logger: AtomicU32::new(0),
+            config: config.clone(),
             profile: config.profile,
         })
     }
@@ -311,14 +408,8 @@ impl Node {
         self.total.load(Ordering::Acquire)
     }
 
-    /// 填扩展槽。只能在任何服务创建之前调一次，多余的调用直接忽略。
-    pub(crate) fn set_extensions(&self, extensions: Extensions) {
-        let _ = self.extensions.set(extensions);
-    }
-
-    /// 扩展槽。没有插件时一直是 `None`。
-    pub(crate) fn extensions(&self) -> Option<&Extensions> {
-        self.extensions.get()
+    pub(crate) fn config(&self) -> &Config {
+        &self.config
     }
 
     pub(crate) fn profile(&self) -> bool {
@@ -376,11 +467,12 @@ impl Node {
             .modules
             .get(kind)
             .ok_or_else(|| Error::UnknownService(kind.to_string()))?;
-        let service = factory();
+        let instance = factory();
+        let service = instance.service.clone();
+        let exclusive = instance.exclusive.clone();
 
         let node = self.clone();
         let kind_name = kind.to_string();
-        let instance = service.clone();
         let ctx = self.handles.register_with(move |handle| {
             Arc::new_cyclic(|me| ServiceContext {
                 handle,
@@ -388,7 +480,9 @@ impl Node {
                 node,
                 mailbox: Mailbox::new(),
                 sessions: SessionTable::new(),
-                service: instance,
+                service: instance.service,
+                exclusive: instance.exclusive,
+                thread: ArcSwapOption::empty(),
                 tasks: TaskSet::new(),
                 dead: AtomicBool::new(false),
                 reserved: AtomicBool::new(false),
@@ -439,9 +533,72 @@ impl Node {
         }
 
         self.log(handle, format!("LAUNCH {kind} {args}"));
-        // in_global 自创建起就是置位的，这里补上真正的入队，服务开始接受调度
-        self.sched.push(ctx);
+        match exclusive {
+            // in_global 自创建起就是置位的，这里补上真正的入队，服务开始接受调度
+            None => self.sched.push(ctx),
+            // 独占服务的执行者是它自己那条线程，起来就接管
+            Some(service) => self.spawn_exclusive(ctx, service),
+        }
         Ok(handle)
+    }
+
+    /// 给一个独占服务起专属线程，见 [`crate::exclusive`]。
+    fn spawn_exclusive(self: &Arc<Self>, ctx: Arc<ServiceContext>, service: Arc<dyn Exclusive>) {
+        let handle = ctx.handle;
+        let name = format!("rskynet-{}-{handle:08x}", ctx.kind);
+        let thread = thread::Builder::new()
+            .name(name)
+            .spawn(move || crate::exclusive::exclusive_loop(ctx, service))
+            .expect("独占服务的线程创建失败");
+        let mut table = self.exclusives.lock();
+        // 顺手清掉已经收工的：反复 launch / kill 独占服务时别让这张表一直长
+        table.retain(|_, thread| !thread.is_finished());
+        table.insert(handle, thread);
+    }
+
+    /// join 掉那些服务已经被摘除的独占线程。
+    ///
+    /// 摘除即意味着那条线程一定会收工（`retire` 会把它叫醒），所以这一步不会
+    /// 等到天荒地老。返回线程里没接住的 panic，由调用方重抛。
+    pub(crate) fn join_retired_exclusives(&self) -> Option<Box<dyn Any + Send + 'static>> {
+        let retired: Vec<_> = {
+            let mut table = self.exclusives.lock();
+            let gone: Vec<u32> = table
+                .keys()
+                .copied()
+                .filter(|handle| self.handles.grab(*handle).is_none())
+                .collect();
+            // join 必须在锁外做：那条线程收尾时可能还要 launch / kill，会来抢这把锁
+            gone.iter()
+                .filter_map(|handle| table.remove(handle))
+                .collect()
+        };
+        join_all(retired)
+    }
+
+    /// join 掉全部独占线程。
+    ///
+    /// **调用前必须保证它们的服务都已被摘除**，否则那些线程还在等活，这里会等死。
+    pub(crate) fn join_exclusives(&self) -> Option<Box<dyn Any + Send + 'static>> {
+        let all: Vec<_> = self
+            .exclusives
+            .lock()
+            .drain()
+            .map(|(_, thread)| thread)
+            .collect();
+        join_all(all)
+    }
+
+    /// 宣布节点收工：叫醒所有 worker，也把独占线程从阻塞里敲出来。
+    ///
+    /// 对照 C 版的 `CHECK_ABORT`。独占线程那一下不是非有不可（它们真正的退出
+    /// 条件是自己被摘除，而摘除自带唤醒），但让 `idle` 里那些盯着 `is_quit` 的
+    /// 服务早一点看到收工信号总是好的。
+    pub(crate) fn quit(&self) {
+        self.sched.set_quit();
+        for ctx in self.handles.contexts() {
+            ctx.interrupt();
+        }
     }
 
     /// 摘除服务，对照 `skynet_handle_retire`。
@@ -457,9 +614,10 @@ impl Node {
                 // 服务自己调 exit 时，趁请求还记在账上立刻通知所有等着回话的人；
                 // 跨线程 kill 则什么都不做，由销毁它的那个 worker 在 cleanup 里补
                 ctx.fail_inflight();
-                if ctx.mailbox.notify() {
-                    self.sched.push(ctx);
-                }
+                // 与投递一件活同一条路：保证这个服务一定会被执行者再领走一次，
+                // 好让它把销毁做掉
+                let queued = ctx.mailbox.notify();
+                ctx.wake(queued);
                 true
             }
         }
@@ -487,8 +645,15 @@ impl Node {
     }
 
     /// 送走保留服务，节点收尾的最后一步。
-    pub(crate) fn retire_reserved(&self) {
+    ///
+    /// `keep_logger` 为真时把 logger 留着：别人销毁时那句「KILL」还要指着它写，
+    /// logger 先走的话就只能退回 stderr 了。
+    pub(crate) fn retire_reserved(&self, keep_logger: bool) {
+        let logger = self.logger.load(Ordering::Acquire);
         for handle in self.handles.handles() {
+            if keep_logger && handle == logger {
+                continue;
+            }
             self.retire(handle);
         }
     }
@@ -505,8 +670,8 @@ impl Node {
             return;
         }
         if self.total.fetch_sub(1, Ordering::AcqRel) <= 1 {
-            // 最后一个服务也走了，通知 worker 收工，对照 C 版的 CHECK_ABORT
-            self.sched.set_quit();
+            // 最后一个服务也走了，通知所有线程收工
+            self.quit();
         }
     }
 
@@ -522,30 +687,55 @@ impl Node {
             Some(ctx) => ctx,
             None => self.sched.pop()?,
         };
-        if ctx.is_dead() {
-            self.destroy(&ctx);
-            return self.sched.pop();
+        match self.run_service(&ctx, Some(weight)) {
+            Ran::Dead => {
+                self.destroy(&ctx);
+                self.sched.pop()
+            }
+            Ran::Idle => {
+                // 放生的那一瞬间可能正好有人在 kill 它：对方的 notify 撞上我们
+                // 的「落回 IDLE」，于是谁都不会再把它推进运行队列，销毁也就没人
+                // 做了。这里补一次入队，让它一定被某个 worker 领走并销毁。
+                if ctx.is_dead() && ctx.mailbox.notify() {
+                    self.sched.push(ctx);
+                }
+                self.sched.pop()
+            }
+            // 让渡：运行队列里还有别的服务在等，就把自己交回去
+            Ran::Yielded => match self.sched.pop() {
+                Some(next) => {
+                    self.sched.push(ctx);
+                    Some(next)
+                }
+                None => Some(ctx),
+            },
         }
+    }
 
-        // 权重批处理：weight 为负表示一次只处理一条消息，否则处理 len >> weight 条
-        let mut budget = 1usize;
+    /// 在当前线程上执行一个自己持有的服务，直到没活干、预算用完或者服务已死。
+    ///
+    /// worker 与独占线程共用这一段：区别只在预算与「干完之后怎么处置」，
+    /// 都由调用方决定。
+    ///
+    /// `weight` 是批处理预算，对照 C 版那张权重表：负数表示一次只处理一条消息
+    /// （响应快），非负表示一次处理 `队列长度 >> weight` 条（吞吐高）。传 `None`
+    /// 则一次把活干完——独占线程只有这一个服务，让渡给谁都没有意义。
+    pub(crate) fn run_service(&self, ctx: &Arc<ServiceContext>, weight: Option<i32>) -> Ran {
+        if ctx.is_dead() {
+            return Ran::Dead;
+        }
+        let mut budget = if weight.is_some() { 1 } else { usize::MAX };
         let mut handled = 0usize;
         loop {
             match ctx.mailbox.take_work() {
-                // 邮箱和就绪队列都空了，状态已落回 IDLE，把这个服务放生
-                None => {
-                    // 放生的那一瞬间可能正好有人在 kill 它：对方的 notify 撞上我们
-                    // 的「落回 IDLE」，于是谁都不会再把它推进运行队列，销毁也就没人
-                    // 做了。这里补一次入队，让它一定被某个 worker 领走并销毁。
-                    if ctx.is_dead() && ctx.mailbox.notify() {
-                        self.sched.push(ctx);
-                    }
-                    return self.sched.pop();
-                }
+                // 邮箱和就绪队列都空了，状态已落回 IDLE，服务就此放生
+                None => return Ran::Idle,
                 Some(Work::Ready(ready)) => ctx.run_ready(ready),
                 Some(Work::Message(msg)) => {
-                    if handled == 0 && weight >= 0 {
-                        budget = (ctx.mailbox.len() >> weight).max(1);
+                    if handled == 0 {
+                        if let Some(weight) = weight.filter(|weight| *weight >= 0) {
+                            budget = (ctx.mailbox.len() >> weight).max(1);
+                        }
                     }
                     let overload = ctx.mailbox.take_overload();
                     if overload > 0 {
@@ -559,21 +749,32 @@ impl Node {
                 }
             }
             if ctx.is_dead() {
-                self.destroy(&ctx);
-                return self.sched.pop();
+                return Ran::Dead;
             }
             if handled >= budget {
-                break;
+                return Ran::Yielded;
             }
         }
+    }
 
-        // 让渡：运行队列里还有别的服务在等，就把自己交回去
-        match self.sched.pop() {
-            Some(next) => {
-                self.sched.push(ctx);
-                Some(next)
+    /// 把邮箱里已经积压的活干完，**忽略服务已死这件事**。
+    ///
+    /// 独占线程收尾时用它：`retire` 之后邮箱里往往还剩着消息，而销毁流程只会把
+    /// 它们丢掉（顶多给请求方回个错误）。日志服务全靠这一步把最后几行写出去。
+    ///
+    /// 预算按进来时的积压量给：清理期间别人可能还在往里投（比如别的服务还在写
+    /// 日志），无上限地跟下去就退不出来了。
+    pub(crate) fn drain_service(&self, ctx: &Arc<ServiceContext>) {
+        // 每条消息都会开一个任务，所以留够「一条消息一次 poll」的份额，另外
+        // 多给一点余量，好让 init 那种还没跑完的任务有机会收尾
+        let mut budget = ctx.mailbox.len() * 2 + 16;
+        while budget > 0 {
+            budget -= 1;
+            match ctx.mailbox.take_work() {
+                None => return,
+                Some(Work::Ready(ready)) => ctx.run_ready(ready),
+                Some(Work::Message(msg)) => ctx.handle_message(msg),
             }
-            None => Some(ctx),
         }
     }
 
@@ -586,7 +787,7 @@ impl Node {
         }
     }
 
-    /// 派发到期的定时器，由定时器线程调用，`wheel` 是它独占持有的时间轮。
+    /// 派发到期的定时器，由定时器服务调用，`wheel` 是它独占持有的时间轮。
     pub(crate) fn fire_timers(&self, wheel: &mut Wheel) {
         for event in self.timer.update(wheel) {
             let _ = self.send_raw(
@@ -634,12 +835,27 @@ pub(crate) mod tests {
         }
     }
 
+    /// 同上，但独占一条线程：起来就阻塞在 park 上，等着被摘除。
+    #[derive(Default)]
+    pub(crate) struct NullExclusive;
+
+    impl Service for NullExclusive {
+        fn dispatch(self: Arc<Self>, _ctx: Ctx, _msg: Message) -> BoxFuture<'static, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    impl Exclusive for NullExclusive {}
+
     pub(crate) fn test_node() -> Arc<Node> {
         test_node_with(Config::default())
     }
 
     pub(crate) fn test_node_with(config: Config) -> Arc<Node> {
-        Node::new(&config, Registry::new().with("null", NullService::default))
+        let registry = Registry::new()
+            .with("null", NullService::default)
+            .with_exclusive("solo", NullExclusive::default);
+        Node::new(&config, registry)
     }
 
     /// 给 handle 表的单元测试用：造一个不参与调度的空壳上下文。
@@ -656,6 +872,8 @@ pub(crate) mod tests {
             mailbox: Mailbox::new(),
             sessions: SessionTable::new(),
             service: Arc::new(NullService),
+            exclusive: None,
+            thread: ArcSwapOption::empty(),
             tasks: TaskSet::new(),
             dead: AtomicBool::new(false),
             reserved: AtomicBool::new(false),
@@ -718,6 +936,46 @@ pub(crate) mod tests {
         // 持有者接着跑一轮就该发现 dead 标志并善后
         assert!(node.dispatch(Some(ctx), 0).is_none());
         assert_eq!(node.total(), 0, "服务必须被销毁，否则节点永远等不到退出");
+    }
+
+    /// 独占服务不进运行队列，它自带一条线程；摘除之后那条线程要自己收工
+    #[test]
+    fn an_exclusive_service_brings_its_own_thread() {
+        let node = test_node();
+        let handle = node.new_service("solo", "").expect("应创建成功");
+        let ctx = node.handles.grab(handle).expect("应当能按地址找回来");
+        assert!(ctx.is_exclusive());
+        assert_eq!(node.sched.len(), 0, "独占服务不该进运行队列");
+        assert_eq!(node.total(), 1);
+
+        // 摘除就是通知：那条线程会被叫醒、看到 dead、自己把销毁做掉
+        assert!(node.retire(handle));
+        assert!(node.join_exclusives().is_none(), "线程不该 panic");
+        assert_eq!(node.total(), 0, "销毁记账要由那条线程自己做掉");
+        assert!(node.sched.is_quit(), "服务数归零应通知所有线程收工");
+    }
+
+    /// 投给独占服务的消息要能把它那条线程叫起来
+    #[test]
+    fn a_message_wakes_the_exclusive_thread() {
+        let node = test_node();
+        let handle = node.new_service("solo", "").expect("应创建成功");
+        let ctx = node.handles.grab(handle).unwrap();
+
+        // 等它睡下：状态落回 IDLE 就说明邮箱已经取空、线程正阻塞在 park 上
+        while ctx.mailbox.len() > 0 || !ctx.mailbox.is_idle() {
+            std::hint::spin_loop();
+        }
+        node.send_raw(0, handle, MsgType::USER, 0, Payload::None)
+            .expect("服务还活着");
+        // 被叫醒之后它会把这条消息处理掉，邮箱重新变空
+        while ctx.message_count() == 0 {
+            std::hint::spin_loop();
+        }
+        assert_eq!(ctx.mailbox.len(), 0);
+
+        node.retire(handle);
+        assert!(node.join_exclusives().is_none());
     }
 
     /// 发给不存在的地址应当报错而不是悄悄丢弃

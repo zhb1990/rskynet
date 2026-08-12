@@ -14,14 +14,19 @@
 //! 第三点在 skynet 里由 Lua 协程承载，这里换成 Rust 的 `Future`——
 //! 语义一致，还多了编译期类型检查，也不再需要 Lua。
 //!
+//! 服务默认跑在共享的 worker 池上，也可以让它[独占一条线程][Exclusive]——
+//! 日志、定时器、网络层都是后者，于是内核不必为「专用线程」另开一套东西。
+//!
 //! ## 模块划分
 //!
-//! 模块名刻意与 `skynet-src` 的文件名对齐，方便逐一比对；[`ext`] 是 C 版没有的
-//! 那一块——网络层住在独立 crate 里，得有一套公开接口才进得来内核。
+//! 模块名刻意与 `skynet-src` 的文件名对齐，方便逐一比对。C 版没有对应物的是
+//! 两块：[`Exclusive`] 那套独占线程的服务，以及 [`ext`] 里给内核之外的线程用的
+//! 接口——网络层住在独立 crate 里，总得有条公开的路进得来。
 
 mod bwos;
 mod context;
 mod error;
+mod exclusive;
 mod handle;
 mod message;
 mod module;
@@ -37,7 +42,8 @@ pub mod service;
 
 pub use context::{Ctx, Service};
 pub use error::{Error, Result};
-pub use ext::{NodeRef, Plugin, ReplyToken};
+pub use exclusive::{Exclusive, Idler};
+pub use ext::{NodeRef, ReplyToken};
 pub use message::{Addr, Message, MsgType, Payload};
 pub use module::Registry;
 pub use start::{Builder, Config, start};
