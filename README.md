@@ -359,14 +359,13 @@ crates/rskynet-timer/      分层时间轮与定时器服务
 crates/rskynet-bootstrap/  引导服务
 crates/rskynet-macros/     service / exclusive / msg 过程宏
 crates/rskynet-net/        TCP + UDP 网络层，一个独占线程的服务
-crates/rskynet-main/       可选标准启动器：读 TOML 并收集自动注册服务
 crates/rskynet-examples/   Ping / Pong / Echo 与统一示例入口
 ```
 
 使用方只写一行依赖，要什么按 feature 开：
 
 ```toml
-rskynet = { version = "0.1", features = ["net"] }   # macros / logger / timer / bootstrap 默认已开
+rskynet = { version = "0.1", features = ["net"] }   # macros / logger / timer / bootstrap / main 默认已开
 ```
 
 业务代码不需要放进本仓：`rskynet` 是 lib crate，对外提供 `Service` trait 与 `rskynet::start(config, registry)`，使用方在自己的 app crate 里写 `main` 并注册服务——对应 skynet 里「内核是宿主、服务是外挂模块」的形态。
@@ -382,11 +381,11 @@ struct Echo;
 impl Echo {}
 ```
 
-再让应用依赖可选的 `rskynet-main`，入口只剩：
+默认启用的 `main` feature 提供标准入口：
 
 ```rust
 fn main() -> std::process::ExitCode {
-    rskynet_main::run()
+    rskynet::main::run()
 }
 ```
 

@@ -239,7 +239,6 @@ name = "rskynet-examples"
 version = "0.1.0"
 dependencies = [
  "rskynet",
- "rskynet-main",
 ]
 
 [[package]]
@@ -258,13 +257,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "rskynet-main"
-version = "0.1.0"
-dependencies = [
- "rskynet",
 ]
 
 [[package]]

@@ -52,6 +52,7 @@
 //! | `rskynet-logger` | 日志服务，一个[独占线程的服务][Exclusive] | `logger`（默认开） |
 //! | `rskynet-timer` | 分层时间轮与定时器服务 | `timer`（默认开） |
 //! | `rskynet-bootstrap` | 引导服务：按清单拉起业务服务 | `bootstrap`（默认开） |
+//! | 标准命令行入口 | 读取 TOML 并启动自动注册服务 | `main`（默认开） |
 //! | `rskynet-net` | socket 层，一个[独占线程的服务][Exclusive] | `net` |
 //!
 //! 内核里一个服务都没有，连时间都不在里面：分层时间轮住在 `rskynet-timer`，内核
@@ -81,6 +82,74 @@ pub use rskynet_bootstrap as bootstrap;
 pub use rskynet_logger as logger;
 #[cfg(feature = "timer")]
 pub use rskynet_timer as timer;
+
+/// 标准命令行入口：读取 TOML，并启动所有配置的自动注册服务。
+#[cfg(feature = "main")]
+pub mod main {
+    use std::ffi::OsString;
+    use std::process::ExitCode;
+
+    use super::{Config, Error, Registry, Result};
+
+    /// 使用进程参数启动节点。要求且只接受一个 TOML 配置路径。
+    pub fn run() -> ExitCode {
+        match run_from(std::env::args_os()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("rskynet: {err}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+
+    /// 可测试、可嵌入的参数入口。第一项按程序名处理。
+    pub fn run_from<I>(args: I) -> Result<()>
+    where
+        I: IntoIterator<Item = OsString>,
+    {
+        let mut args = args.into_iter();
+        let program = args.next().unwrap_or_else(|| OsString::from("rskynet"));
+        let Some(path) = args.next() else {
+            return Err(usage(&program));
+        };
+        if args.next().is_some() {
+            return Err(usage(&program));
+        }
+
+        let config = Config::from_toml_file(path)?;
+        let registry = Registry::from_auto()?;
+        super::start(config, registry)
+    }
+
+    fn usage(program: &OsString) -> Error {
+        Error::Config(format!(
+            "用法：{} <config.toml>",
+            std::path::Path::new(program).display()
+        ))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn missing_config_path_reports_usage() {
+            let err = run_from([OsString::from("node")]).expect_err("缺参数应失败");
+            assert!(err.to_string().contains("用法：node <config.toml>"));
+        }
+
+        #[test]
+        fn extra_arguments_report_usage() {
+            let err = run_from([
+                OsString::from("node"),
+                OsString::from("one.toml"),
+                OsString::from("two.toml"),
+            ])
+            .expect_err("多余参数应失败");
+            assert!(err.to_string().contains("用法：node <config.toml>"));
+        }
+    }
+}
 
 /// 引导清单的链式写法：`Config::default().with_bootstrap(["echo"])`。
 #[cfg(feature = "bootstrap")]

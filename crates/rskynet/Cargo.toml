@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["macros", "logger", "timer", "bootstrap"]
+default = ["macros", "logger", "timer", "bootstrap", "main"]
 # 服务样板宏。默认打开，因为它是写服务的常规姿势
 macros = ["dep:rskynet-macros"]
 # 日志服务。关掉之后 ctx.log 退回 stderr
@@ -17,6 +17,8 @@ logger = ["dep:rskynet-logger"]
 timer = ["dep:rskynet-timer"]
 # 引导服务。关掉之后要自己拉起第一个业务服务
 bootstrap = ["dep:rskynet-bootstrap"]
+# 标准命令行入口：读取 TOML，并从链接进来的服务构造自动注册表
+main = []
 # 网络层。要用 socket / gate 时打开
 net = ["dep:rskynet-net"]
 

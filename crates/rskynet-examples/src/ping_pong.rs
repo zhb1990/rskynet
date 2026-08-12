@@ -6,6 +6,7 @@ use rskynet::{Ctx, Message, Payload, Result, SvcCell};
 enum Ask {
     Ball(u64),
     Delayed { centis: u32, tag: String },
+    Shutdown,
 }
 
 #[derive(Default)]
@@ -37,6 +38,10 @@ impl Pong {
                 ctx.sleep(centis).await;
                 let _ = ctx.reply(&msg, Payload::text(tag));
             }
+            Ask::Shutdown => {
+                ctx.log("pong 收到关闭通知，退出");
+                ctx.exit();
+            }
         }
     }
 }
@@ -64,10 +69,11 @@ impl Ping {
         rskynet::log!(ctx, "心跳共跳了 {} 次", self.beats.borrow());
         rskynet::log!(
             ctx,
-            "ping 处理过 {} 条消息，收工关停节点",
+            "ping 处理过 {} 条消息，通知 pong 后退出",
             ctx.message_count()
         );
-        ctx.abort();
+        ctx.post(".pong", Payload::of(Ask::Shutdown))?;
+        ctx.exit();
         Ok(())
     }
 

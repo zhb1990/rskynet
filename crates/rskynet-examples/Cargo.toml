@@ -10,4 +10,3 @@ publish = false
 
 [dependencies]
 rskynet = { path = "../rskynet", features = ["net"] }
-rskynet-main = { path = "../rskynet-main" }
