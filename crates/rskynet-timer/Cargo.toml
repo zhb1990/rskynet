@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 rskynet-core = { workspace = true }
+rskynet-macros = { workspace = true }
 
 crossbeam-queue = { workspace = true }
 serde = { workspace = true }

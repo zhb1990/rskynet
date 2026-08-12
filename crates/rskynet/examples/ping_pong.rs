@@ -9,10 +9,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use rskynet::{
-    BoxFuture, Config, ConfigExt, Ctx, Message, MsgType, Payload, Registry, Result, Service,
-    SvcCell,
-};
+use rskynet::{Config, ConfigExt, Ctx, Message, MsgType, Payload, Registry, Result, SvcCell};
 
 /// ping 与 pong 之间的请求。同进程传递，直接塞对象，不需要序列化。
 enum Ask {
@@ -29,35 +26,32 @@ struct Pong {
     served: SvcCell<u64>,
 }
 
-impl Service for Pong {
-    fn init(self: Arc<Self>, ctx: Ctx, _args: String) -> BoxFuture<'static, Result<()>> {
-        Box::pin(async move {
-            if !ctx.register_name("pong") {
-                return Err(rskynet::Error::service("名字 .pong 已被占用"));
-            }
-            ctx.log("pong 就绪");
-            Ok(())
-        })
+#[rskynet::service]
+impl Pong {
+    async fn init(&self, ctx: Ctx) -> Result<()> {
+        if !ctx.register_name("pong") {
+            return Err(rskynet::Error::service("名字 .pong 已被占用"));
+        }
+        ctx.log("pong 就绪");
+        Ok(())
     }
 
-    fn dispatch(self: Arc<Self>, ctx: Ctx, mut msg: Message) -> BoxFuture<'static, ()> {
-        Box::pin(async move {
-            *self.served.borrow_mut() += 1;
-            let Ok(ask) = msg.take_payload().downcast::<Ask>() else {
-                let _ = ctx.reply_error(&msg);
-                return;
-            };
-            match *ask {
-                Ask::Ball(round) => {
-                    let _ = ctx.reply(&msg, Payload::of(Ask::Ball(round)));
-                }
-                Ask::Delayed { centis, tag } => {
-                    // 这里挂起的只是「处理这条消息」的任务，pong 仍在正常收其它消息
-                    ctx.sleep(centis).await;
-                    let _ = ctx.reply(&msg, Payload::text(tag));
-                }
+    async fn dispatch(&self, ctx: Ctx, mut msg: Message) {
+        *self.served.borrow_mut() += 1;
+        let Ok(ask) = msg.take_payload().downcast::<Ask>() else {
+            let _ = ctx.reply_error(&msg);
+            return;
+        };
+        match *ask {
+            Ask::Ball(round) => {
+                let _ = ctx.reply(&msg, Payload::of(Ask::Ball(round)));
             }
-        })
+            Ask::Delayed { centis, tag } => {
+                // 这里挂起的只是「处理这条消息」的任务，pong 仍在正常收其它消息
+                ctx.sleep(centis).await;
+                let _ = ctx.reply(&msg, Payload::text(tag));
+            }
+        }
     }
 }
 
@@ -69,42 +63,35 @@ struct Ping {
     beats: SvcCell<u64>,
 }
 
-impl Service for Ping {
-    fn init(self: Arc<Self>, ctx: Ctx, args: String) -> BoxFuture<'static, Result<()>> {
-        Box::pin(async move {
-            let rounds: u64 = args.trim().parse().unwrap_or(100);
-
-            // 心跳任务：与下面的主流程并发跑，证明服务不会被 await 卡住。
-            // 节点关停时它会随服务一起被丢弃，所以这里可以放心写死循环。
-            let beat_ctx = ctx.clone();
-            let beats = self.clone();
-            ctx.spawn(async move {
-                loop {
-                    beat_ctx.sleep(20).await;
-                    *beats.beats.borrow_mut() += 1;
-                }
-            });
-
-            self.round_trips(&ctx, rounds).await?;
-            self.concurrent_asks(&ctx).await?;
-
-            rskynet::log!(ctx, "心跳共跳了 {} 次", self.beats.borrow());
-            rskynet::log!(
-                ctx,
-                "ping 处理过 {} 条消息，收工关停节点",
-                ctx.message_count()
-            );
-            ctx.abort();
-            Ok(())
-        })
-    }
-
-    fn dispatch(self: Arc<Self>, _ctx: Ctx, _msg: Message) -> BoxFuture<'static, ()> {
-        Box::pin(async {})
-    }
-}
-
+#[rskynet::service]
 impl Ping {
+    async fn init(&self, ctx: Ctx, args: String) -> Result<()> {
+        let rounds: u64 = args.trim().parse().unwrap_or(100);
+
+        // 心跳任务：与下面的主流程并发跑，证明服务不会被 await 卡住。
+        // 节点关停时它会随服务一起被丢弃，所以这里可以放心写死循环。
+        let beat_ctx = ctx.clone();
+        let beats = self.clone();
+        ctx.spawn(async move {
+            loop {
+                beat_ctx.sleep(20).await;
+                *beats.beats.borrow_mut() += 1;
+            }
+        });
+
+        self.round_trips(&ctx, rounds).await?;
+        self.concurrent_asks(&ctx).await?;
+
+        rskynet::log!(ctx, "心跳共跳了 {} 次", self.beats.borrow());
+        rskynet::log!(
+            ctx,
+            "ping 处理过 {} 条消息，收工关停节点",
+            ctx.message_count()
+        );
+        ctx.abort();
+        Ok(())
+    }
+
     /// 连续往返，测一发消息一个来回的成本。
     async fn round_trips(&self, ctx: &Ctx, rounds: u64) -> Result<()> {
         let started = Instant::now();

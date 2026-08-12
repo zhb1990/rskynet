@@ -21,12 +21,9 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
-use std::sync::Arc;
 
 use rskynet_core::service::LOGGER;
-use rskynet_core::{
-    BoxFuture, Ctx, Exclusive, Message, MsgType, Registry, Result, Service, SvcCell,
-};
+use rskynet_core::{Ctx, Message, MsgType, Registry, Result, SvcCell};
 use serde::Deserialize;
 
 /// `[logger]` 段。`name` 归内核解析，这里只关心写到哪。
@@ -73,46 +70,41 @@ impl Logger {
     }
 }
 
-impl Service for Logger {
-    fn init(self: Arc<Self>, ctx: Ctx, _args: String) -> BoxFuture<'static, Result<()>> {
-        Box::pin(async move {
-            let config: LoggerConfig = ctx.node().section(LOGGER)?.unwrap_or_default();
-            let path = config.path.trim().to_string();
-            if !path.is_empty() {
-                self.open(&path)?;
-                *self.path.borrow_mut() = path;
-            }
-            Ok(())
-        })
+#[rskynet_macros::exclusive(crate = ::rskynet_core)]
+impl Logger {
+    async fn init(&self, ctx: Ctx) -> Result<()> {
+        let config: LoggerConfig = ctx.node().section(LOGGER)?.unwrap_or_default();
+        let path = config.path.trim().to_string();
+        if !path.is_empty() {
+            self.open(&path)?;
+            *self.path.borrow_mut() = path;
+        }
+        Ok(())
     }
 
-    fn dispatch(self: Arc<Self>, ctx: Ctx, msg: Message) -> BoxFuture<'static, ()> {
-        Box::pin(async move {
-            match msg.mtype {
-                MsgType::TEXT => {
-                    self.write(
-                        &ctx,
-                        msg.source,
-                        msg.payload.as_str().unwrap_or("<非法日志>"),
-                    );
-                }
-                // 对照 C 版收到 SIGHUP 后重开日志文件的做法
-                MsgType::SYSTEM => {
-                    let path = self.path.borrow().clone();
-                    if !path.is_empty() {
-                        *self.file.borrow_mut() = None;
-                        if let Err(err) = self.open(&path) {
-                            self.write(&ctx, ctx.handle(), &format!("重开日志文件失败：{err}"));
-                        }
+    async fn dispatch(&self, ctx: Ctx, msg: Message) {
+        match msg.mtype {
+            MsgType::TEXT => {
+                self.write(
+                    &ctx,
+                    msg.source,
+                    msg.payload.as_str().unwrap_or("<非法日志>"),
+                );
+            }
+            // 对照 C 版收到 SIGHUP 后重开日志文件的做法
+            MsgType::SYSTEM => {
+                let path = self.path.borrow().clone();
+                if !path.is_empty() {
+                    *self.file.borrow_mut() = None;
+                    if let Err(err) = self.open(&path) {
+                        self.write(&ctx, ctx.handle(), &format!("重开日志文件失败：{err}"));
                     }
                 }
-                _ => {}
             }
-        })
+            _ => {}
+        }
     }
 }
-
-impl Exclusive for Logger {}
 
 /// 把日志服务挂进注册表。
 pub trait RegistryExt {

@@ -845,23 +845,15 @@ pub(crate) mod tests {
     #[derive(Default)]
     pub(crate) struct NullService;
 
-    impl Service for NullService {
-        fn dispatch(self: Arc<Self>, _ctx: Ctx, _msg: Message) -> BoxFuture<'static, ()> {
-            Box::pin(async {})
-        }
-    }
+    #[rskynet_macros::service(crate = crate)]
+    impl NullService {}
 
     /// 同上，但独占一条线程：起来就阻塞在 park 上，等着被摘除。
     #[derive(Default)]
     pub(crate) struct NullExclusive;
 
-    impl Service for NullExclusive {
-        fn dispatch(self: Arc<Self>, _ctx: Ctx, _msg: Message) -> BoxFuture<'static, ()> {
-            Box::pin(async {})
-        }
-    }
-
-    impl Exclusive for NullExclusive {}
+    #[rskynet_macros::exclusive(crate = crate)]
+    impl NullExclusive {}
 
     /// 测试用的时间来源：刻度从不前进，挂上的表也不会到期。内核的单元测试只关心
     /// 消息与调度，真正的时间轮在 `rskynet-timer` 里自测。
@@ -1025,12 +1017,14 @@ pub(crate) mod tests {
         #[derive(Default)]
         struct SelfWaker;
 
-        impl Service for SelfWaker {
-            fn dispatch(self: Arc<Self>, _ctx: Ctx, _msg: Message) -> BoxFuture<'static, ()> {
-                Box::pin(std::future::poll_fn(|cx| {
+        #[rskynet_macros::service(crate = crate)]
+        impl SelfWaker {
+            async fn dispatch(&self) {
+                std::future::poll_fn(|cx| {
                     cx.waker().wake_by_ref();
                     std::task::Poll::Pending
-                }))
+                })
+                .await
             }
         }
 

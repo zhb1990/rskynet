@@ -19,10 +19,8 @@
 //! 自己读。C 版把类型名和参数挤在一个字符串里靠 `sscanf` 按首个空格拆，这里各占
 //! 一个字段，于是参数里带空格、带分号都不再是问题。
 
-use std::sync::Arc;
-
 use rskynet_core::service::BOOTSTRAP;
-use rskynet_core::{BoxFuture, Config, Ctx, Error, Message, Registry, Result, Service, log};
+use rskynet_core::{Config, Ctx, Error, Registry, Result, log};
 use serde::{Deserialize, Serialize};
 
 /// 一条服务启动项：类型名加参数。
@@ -78,28 +76,23 @@ struct BootstrapConfig {
 #[derive(Default)]
 pub struct Bootstrap;
 
-impl Service for Bootstrap {
-    fn init(self: Arc<Self>, ctx: Ctx, _args: String) -> BoxFuture<'static, Result<()>> {
-        Box::pin(async move {
-            let config: BootstrapConfig = ctx.node().section(BOOTSTRAP)?.unwrap_or_default();
-            for (index, spec) in config.services.iter().enumerate() {
-                if spec.name.trim().is_empty() {
-                    return Err(Error::Config(format!(
-                        "[bootstrap] 清单第 {} 项没写 name",
-                        index + 1
-                    )));
-                }
-                let handle = ctx.launch(&spec.name, &spec.args).await?;
-                log!(ctx, "bootstrap 拉起 {} -> :{handle:08x}", spec.name);
+#[rskynet_macros::service(crate = ::rskynet_core)]
+impl Bootstrap {
+    async fn init(&self, ctx: Ctx) -> Result<()> {
+        let config: BootstrapConfig = ctx.node().section(BOOTSTRAP)?.unwrap_or_default();
+        for (index, spec) in config.services.iter().enumerate() {
+            if spec.name.trim().is_empty() {
+                return Err(Error::Config(format!(
+                    "[bootstrap] 清单第 {} 项没写 name",
+                    index + 1
+                )));
             }
-            // 引导完成即退场，把舞台交给业务服务
-            ctx.exit();
-            Ok(())
-        })
-    }
-
-    fn dispatch(self: Arc<Self>, _ctx: Ctx, _msg: Message) -> BoxFuture<'static, ()> {
-        Box::pin(async {})
+            let handle = ctx.launch(&spec.name, &spec.args).await?;
+            log!(ctx, "bootstrap 拉起 {} -> :{handle:08x}", spec.name);
+        }
+        // 引导完成即退场，把舞台交给业务服务
+        ctx.exit();
+        Ok(())
     }
 }
 

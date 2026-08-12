@@ -17,8 +17,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rskynet::{
-    BoxFuture, Builder, BuilderExt, Config, ConfigExt, Ctx, Error, Exclusive, Idler, Message,
-    MsgType, Payload, Registry, Result, Service, SvcCell,
+    Builder, BuilderExt, Config, ConfigExt, Ctx, Error, Idler, Message, MsgType, Payload, Registry,
+    Result, SvcCell,
 };
 use serde::Deserialize;
 
@@ -91,42 +91,37 @@ impl Drop for Poller {
     }
 }
 
-impl Service for Poller {
-    fn init(self: Arc<Self>, ctx: Ctx, args: String) -> BoxFuture<'static, Result<()>> {
-        Box::pin(async move {
-            // 成段的配置从节点上取：`init` 只收得到那个字符串参数
-            let section: PollerConfig = ctx
-                .node()
-                .section("poller")?
-                .expect("应当读到自己的 [poller] 段");
-            *self.greeting.borrow_mut() = section.greeting.clone();
-            *self.trace.greeting.lock().unwrap() = section.greeting;
-            self.trace.inited.fetch_add(1, SeqCst);
-            // 运行期另起的那个实例不抢名字
-            if args.trim().is_empty() {
-                ctx.register_name("poller");
-            }
-            Ok(())
-        })
+#[rskynet::exclusive]
+impl Poller {
+    async fn init(&self, ctx: Ctx, args: String) -> Result<()> {
+        // 成段的配置从节点上取：`init` 只收得到那个字符串参数
+        let section: PollerConfig = ctx
+            .node()
+            .section("poller")?
+            .expect("应当读到自己的 [poller] 段");
+        *self.greeting.borrow_mut() = section.greeting.clone();
+        *self.trace.greeting.lock().unwrap() = section.greeting;
+        self.trace.inited.fetch_add(1, SeqCst);
+        // 运行期另起的那个实例不抢名字
+        if args.trim().is_empty() {
+            ctx.register_name("poller");
+        }
+        Ok(())
     }
 
-    fn dispatch(self: Arc<Self>, ctx: Ctx, mut msg: Message) -> BoxFuture<'static, ()> {
-        Box::pin(async move {
-            let payload = msg.take_payload();
-            if msg.mtype == POKE_REQUEST {
-                // 把活交给自己那条线程的事件源，等它下一轮醒来再办
-                let dest = *payload.downcast::<u32>().expect("敲门对象应当是个 handle");
-                let _ = self.events.send(Event::Poke(dest));
-                return;
-            }
-            let text = payload.as_str().unwrap_or_default();
-            let reversed: String = text.chars().rev().collect();
-            let _ = ctx.reply(&msg, Payload::text(reversed));
-        })
+    async fn dispatch(&self, ctx: Ctx, mut msg: Message) {
+        let payload = msg.take_payload();
+        if msg.mtype == POKE_REQUEST {
+            // 把活交给自己那条线程的事件源，等它下一轮醒来再办
+            let dest = *payload.downcast::<u32>().expect("敲门对象应当是个 handle");
+            let _ = self.events.send(Event::Poke(dest));
+            return;
+        }
+        let text = payload.as_str().unwrap_or_default();
+        let reversed: String = text.chars().rev().collect();
+        let _ = ctx.reply(&msg, Payload::text(reversed));
     }
-}
 
-impl Exclusive for Poller {
     fn idle(&self, ctx: &Ctx, idler: &Idler) {
         let inbox = self.inbox.lock().unwrap();
         let inbox = inbox.as_ref().expect("接收端只由 idle 使用");
@@ -164,56 +159,53 @@ struct Probe {
     poked: SvcCell<bool>,
 }
 
-impl Service for Probe {
-    fn init(self: Arc<Self>, ctx: Ctx, _args: String) -> BoxFuture<'static, Result<()>> {
-        Box::pin(async move {
-            // 邮箱：独占线程正阻塞在自己的事件源上，这一次 call 全靠 interrupt
-            // 把它叫回来。真要是没叫醒，下面这句会等满 5 秒的超时
-            let reply = ctx.request(".poller", Payload::text("hello")).await?;
-            note(&self.journal, reply.as_str().unwrap_or("<非字节负载>"));
+#[rskynet::service]
+impl Probe {
+    async fn init(&self, ctx: Ctx) -> Result<()> {
+        // 邮箱：独占线程正阻塞在自己的事件源上，这一次 call 全靠 interrupt
+        // 把它叫回来。真要是没叫醒，下面这句会等满 5 秒的超时
+        let reply = ctx.request(".poller", Payload::text("hello")).await?;
+        note(&self.journal, reply.as_str().unwrap_or("<非字节负载>"));
 
-            // 回执单被丢弃（外部线程半路撂挑子）时要拿到错误，而不是永久挂着
-            let dropped = ctx.call_external(drop).await;
-            note(
-                &self.journal,
-                format!("撂挑子={}", matches!(dropped, Err(Error::CallFailed(_)))),
-            );
+        // 回执单被丢弃（外部线程半路撂挑子）时要拿到错误，而不是永久挂着
+        let dropped = ctx.call_external(drop).await;
+        note(
+            &self.journal,
+            format!("撂挑子={}", matches!(dropped, Err(Error::CallFailed(_)))),
+        );
 
-            // 独占线程把外部事件投成消息：请它敲自己一下，然后等那一下到
-            ctx.send(".poller", POKE_REQUEST, Payload::of(ctx.handle()))?;
-            while !self.poked.get() {
-                ctx.sleep(1).await;
-            }
-            note(&self.journal, "收到敲门");
+        // 独占线程把外部事件投成消息：请它敲自己一下，然后等那一下到
+        ctx.send(".poller", POKE_REQUEST, Payload::of(ctx.handle()))?;
+        while !self.poked.get() {
+            ctx.sleep(1).await;
+        }
+        note(&self.journal, "收到敲门");
 
-            // 运行期起一个独占服务再杀掉：它那条线程必须自己收工
-            let before = self.trace.dropped.load(SeqCst);
-            let handle = ctx.launch("poller", "anonymous").await?;
-            assert!(ctx.kill(handle));
-            let mut rounds = 0;
-            while self.trace.dropped.load(SeqCst) == before && rounds < 500 {
-                ctx.sleep(1).await;
-                rounds += 1;
-            }
-            note(
-                &self.journal,
-                format!(
-                    "杀掉后线程收工={}",
-                    self.trace.dropped.load(SeqCst) > before
-                ),
-            );
+        // 运行期起一个独占服务再杀掉：它那条线程必须自己收工
+        let before = self.trace.dropped.load(SeqCst);
+        let handle = ctx.launch("poller", "anonymous").await?;
+        assert!(ctx.kill(handle));
+        let mut rounds = 0;
+        while self.trace.dropped.load(SeqCst) == before && rounds < 500 {
+            ctx.sleep(1).await;
+            rounds += 1;
+        }
+        note(
+            &self.journal,
+            format!(
+                "杀掉后线程收工={}",
+                self.trace.dropped.load(SeqCst) > before
+            ),
+        );
 
-            ctx.abort();
-            Ok(())
-        })
+        ctx.abort();
+        Ok(())
     }
 
-    fn dispatch(self: Arc<Self>, _ctx: Ctx, msg: Message) -> BoxFuture<'static, ()> {
-        Box::pin(async move {
-            if msg.mtype == POKE {
-                self.poked.set(true);
-            }
-        })
+    async fn dispatch(&self, _ctx: Ctx, msg: Message) {
+        if msg.mtype == POKE {
+            self.poked.set(true);
+        }
     }
 }
 
@@ -283,47 +275,37 @@ struct Sink {
     written: Arc<Mutex<Vec<String>>>,
 }
 
-impl Service for Sink {
-    fn init(self: Arc<Self>, ctx: Ctx, _args: String) -> BoxFuture<'static, Result<()>> {
-        Box::pin(async move {
-            ctx.register_name("sink");
-            Ok(())
-        })
+#[rskynet::exclusive]
+impl Sink {
+    async fn init(&self, ctx: Ctx) -> Result<()> {
+        ctx.register_name("sink");
+        Ok(())
     }
 
-    fn dispatch(self: Arc<Self>, _ctx: Ctx, mut msg: Message) -> BoxFuture<'static, ()> {
-        Box::pin(async move {
-            let text = msg.take_payload().as_str().unwrap_or_default().to_string();
-            // 第一条故意写得很慢，好让后面那些在邮箱里排上队。这条线程是自己的，
-            // 阻塞它不影响任何 worker
-            if text == "0" {
-                std::thread::sleep(Duration::from_millis(150));
-            }
-            self.written.lock().unwrap().push(text);
-        })
+    async fn dispatch(&self, _ctx: Ctx, mut msg: Message) {
+        let text = msg.take_payload().as_str().unwrap_or_default().to_string();
+        // 第一条故意写得很慢，好让后面那些在邮箱里排上队。这条线程是自己的，
+        // 阻塞它不影响任何 worker
+        if text == "0" {
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        self.written.lock().unwrap().push(text);
     }
 }
-
-impl Exclusive for Sink {}
 
 /// 灌一批消息进去，趁对方还在写第一条就关停节点。
 struct Flooder {
     total: usize,
 }
 
-impl Service for Flooder {
-    fn init(self: Arc<Self>, ctx: Ctx, _args: String) -> BoxFuture<'static, Result<()>> {
-        Box::pin(async move {
-            for index in 0..self.total {
-                ctx.post(".sink", Payload::text(index.to_string()))?;
-            }
-            ctx.abort();
-            Ok(())
-        })
-    }
-
-    fn dispatch(self: Arc<Self>, _ctx: Ctx, _msg: Message) -> BoxFuture<'static, ()> {
-        Box::pin(async {})
+#[rskynet::service]
+impl Flooder {
+    async fn init(&self, ctx: Ctx) -> Result<()> {
+        for index in 0..self.total {
+            ctx.post(".sink", Payload::text(index.to_string()))?;
+        }
+        ctx.abort();
+        Ok(())
     }
 }
 

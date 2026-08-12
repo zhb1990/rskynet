@@ -162,24 +162,20 @@ C 版给每个 worker 分了档：前 4 条线程一次只处理一条消息（�
 ## 快速上手
 
 ```rust
-use std::sync::Arc;
-use rskynet::{BoxFuture, Config, Ctx, Message, Payload, Registry, Result, Service};
+use rskynet::{Config, ConfigExt, Ctx, Message, Registry, Result};
 
 struct Echo;
 
-impl Service for Echo {
-    fn init(self: Arc<Self>, ctx: Ctx, _args: String) -> BoxFuture<'static, Result<()>> {
-        Box::pin(async move {
-            ctx.register_name("echo");
-            Ok(())
-        })
+#[rskynet::service]
+impl Echo {
+    async fn init(&self, ctx: Ctx) -> Result<()> {
+        ctx.register_name("echo");
+        Ok(())
     }
 
-    fn dispatch(self: Arc<Self>, ctx: Ctx, mut msg: Message) -> BoxFuture<'static, ()> {
-        Box::pin(async move {
-            let payload = msg.take_payload();
-            let _ = ctx.reply(&msg, payload);
-        })
+    async fn dispatch(&self, ctx: Ctx, mut msg: Message) {
+        let payload = msg.take_payload();
+        let _ = ctx.reply(&msg, payload);
     }
 }
 

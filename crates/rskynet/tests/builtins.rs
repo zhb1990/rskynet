@@ -8,8 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rskynet::{
-    BoxFuture, Builder, BuilderExt, Config, ConfigExt, Ctx, Error, Message, Registry, Result,
-    Service, Timer,
+    BoxFuture, Builder, BuilderExt, Config, ConfigExt, Ctx, Error, Registry, Result, Timer,
 };
 
 /// 用例里那个「跑一段逻辑然后关停节点」的驱动服务。
@@ -28,23 +27,18 @@ where
     }
 }
 
-impl<F> Service for Driver<F>
+#[rskynet::service]
+impl<F> Driver<F>
 where
     F: FnOnce(Ctx) -> BoxFuture<'static, ()> + Send + Sync + 'static,
 {
-    fn init(self: Arc<Self>, ctx: Ctx, _args: String) -> BoxFuture<'static, Result<()>> {
-        Box::pin(async move {
-            let scenario = self.scenario.lock().unwrap().take();
-            if let Some(scenario) = scenario {
-                scenario(ctx.clone()).await;
-            }
-            ctx.abort();
-            Ok(())
-        })
-    }
-
-    fn dispatch(self: Arc<Self>, _ctx: Ctx, _msg: Message) -> BoxFuture<'static, ()> {
-        Box::pin(async {})
+    async fn init(&self, ctx: Ctx) -> Result<()> {
+        let scenario = self.scenario.lock().unwrap().take();
+        if let Some(scenario) = scenario {
+            scenario(ctx.clone()).await;
+        }
+        ctx.abort();
+        Ok(())
     }
 }
 

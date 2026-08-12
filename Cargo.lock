@@ -203,6 +203,7 @@ name = "rskynet-bootstrap"
 version = "0.1.0"
 dependencies = [
  "rskynet-core",
+ "rskynet-macros",
  "serde",
  "toml",
 ]
@@ -228,6 +229,7 @@ name = "rskynet-logger"
 version = "0.1.0"
 dependencies = [
  "rskynet-core",
+ "rskynet-macros",
  "serde",
 ]
 
@@ -246,6 +248,7 @@ version = "0.1.0"
 dependencies = [
  "mio",
  "rskynet-core",
+ "rskynet-macros",
  "serde",
 ]
 
@@ -255,6 +258,7 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-queue",
  "rskynet-core",
+ "rskynet-macros",
  "serde",
 ]
 

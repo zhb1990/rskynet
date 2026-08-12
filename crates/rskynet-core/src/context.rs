@@ -25,16 +25,15 @@ use crate::server::ServiceContext;
 ///
 /// 两个方法都返回 `BoxFuture` 而不是写成 `async fn`，因为内核需要
 /// `dyn Service`（trait 里的 `async fn` 目前还不能做成 trait object）。
-/// 实现时把函数体裹进 `Box::pin(async move { ... })` 即可。
+/// 应用代码通常使用 `#[rskynet::service]`，由宏生成这层底层实现。
 ///
 /// ```ignore
 /// struct Echo;
 ///
-/// impl Service for Echo {
-///     fn dispatch(self: Arc<Self>, ctx: Ctx, msg: Message) -> BoxFuture<'static, ()> {
-///         Box::pin(async move {
-///             let _ = ctx.reply(&msg, msg.payload);
-///         })
+/// #[rskynet::service]
+/// impl Echo {
+///     async fn dispatch(&self, ctx: Ctx, msg: Message) {
+///         let _ = ctx.reply(&msg, msg.payload);
 ///     }
 /// }
 /// ```

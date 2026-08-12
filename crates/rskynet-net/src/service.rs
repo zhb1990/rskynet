@@ -28,10 +28,7 @@ use mio::event::Event;
 use mio::net::{TcpListener, TcpStream, UdpSocket};
 use mio::{Events, Poll, Registry, Token, Waker};
 
-use rskynet_core::{
-    BoxFuture, Ctx, Error, Exclusive, Idler, Message, MsgType, Payload, Result, Service, SvcCell,
-    log,
-};
+use rskynet_core::{Ctx, Error, Idler, Message, MsgType, Payload, Result, SvcCell, log};
 
 use crate::NAME;
 use crate::buffer::Chunk;
@@ -135,56 +132,51 @@ impl Default for NetService {
     }
 }
 
-impl Service for NetService {
-    fn init(self: Arc<Self>, ctx: Ctx, args: String) -> BoxFuture<'static, Result<()>> {
-        Box::pin(async move {
-            let config: NetConfig = ctx.node().section(NAME)?.unwrap_or_default();
-            config.validate()?;
-            self.sockets
-                .replace(Sockets::new(config.max_socket, config.min_read_buffer));
-            self.events.replace(Events::with_capacity(config.events));
-            self.config.replace(config);
+#[rskynet_macros::exclusive(crate = ::rskynet_core)]
+impl NetService {
+    async fn init(&self, ctx: Ctx, args: String) -> Result<()> {
+        let config: NetConfig = ctx.node().section(NAME)?.unwrap_or_default();
+        config.validate()?;
+        self.sockets
+            .replace(Sockets::new(config.max_socket, config.min_read_buffer));
+        self.events.replace(Events::with_capacity(config.events));
+        self.config.replace(config);
 
-            // 名字默认是约定的 `.net`；参数里写了别的就用那个，于是一个节点里能跑
-            // 两套网络层（比如内外网各一套）
-            let name = match args.trim() {
-                "" => NAME,
-                given => given,
-            };
-            if !ctx.register_name(name) {
-                return Err(Error::Service(format!("名字 `.{name}` 已经被占了")));
-            }
-            Ok(())
-        })
+        // 名字默认是约定的 `.net`；参数里写了别的就用那个，于是一个节点里能跑
+        // 两套网络层（比如内外网各一套）
+        let name = match args.trim() {
+            "" => NAME,
+            given => given,
+        };
+        if !ctx.register_name(name) {
+            return Err(Error::Service(format!("名字 `.{name}` 已经被占了")));
+        }
+        Ok(())
     }
 
-    fn dispatch(self: Arc<Self>, ctx: Ctx, mut msg: Message) -> BoxFuture<'static, ()> {
-        Box::pin(async move {
-            if msg.mtype != MsgType::USER {
-                log!(
-                    ctx,
-                    "网络层只认 MsgType::USER 的命令，收到的是 {:?}",
-                    msg.mtype
-                );
+    async fn dispatch(&self, ctx: Ctx, mut msg: Message) {
+        if msg.mtype != MsgType::USER {
+            log!(
+                ctx,
+                "网络层只认 MsgType::USER 的命令，收到的是 {:?}",
+                msg.mtype
+            );
+            let _ = ctx.reply_error(&msg);
+            return;
+        }
+        let waiting = Pending {
+            source: msg.source,
+            session: msg.session,
+        };
+        match msg.take_payload().downcast::<Command>() {
+            Ok(command) => self.perform(&ctx, *command, waiting),
+            Err(_) => {
+                log!(ctx, "网络层收到认不出的命令负载，来自 :{:08x}", msg.source);
                 let _ = ctx.reply_error(&msg);
-                return;
             }
-            let waiting = Pending {
-                source: msg.source,
-                session: msg.session,
-            };
-            match msg.take_payload().downcast::<Command>() {
-                Ok(command) => self.perform(&ctx, *command, waiting),
-                Err(_) => {
-                    log!(ctx, "网络层收到认不出的命令负载，来自 :{:08x}", msg.source);
-                    let _ = ctx.reply_error(&msg);
-                }
-            }
-        })
+        }
     }
-}
 
-impl Exclusive for NetService {
     /// 阻塞在 `poll` 上等 IO，醒来把事件派发成消息。
     ///
     /// 超时给的是 `None`（无限等）：邮箱里的命令靠 [`Exclusive::interrupt`] 敲

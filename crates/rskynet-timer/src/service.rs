@@ -10,10 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use rskynet_core::{
-    BoxFuture, Ctx, Error, Exclusive, Idler, Message, MsgType, Payload, Result, Service, SvcCell,
-    Timer, service,
-};
+use rskynet_core::{Ctx, Error, Idler, Message, MsgType, Payload, Result, SvcCell, Timer, service};
 use serde::Deserialize;
 
 use crate::wheel::Wheel;
@@ -65,39 +62,34 @@ impl TimerService {
     }
 }
 
-impl Service for TimerService {
-    fn init(self: Arc<Self>, ctx: Ctx, _args: String) -> BoxFuture<'static, Result<()>> {
-        Box::pin(async move {
-            let config: TimerConfig = ctx.node().section(service::TIMER)?.unwrap_or_default();
-            if config.tick_micros == 0 {
-                return Err(Error::Config("[timer] tick_micros 必须大于 0".into()));
-            }
-            self.tick.set(Duration::from_micros(config.tick_micros));
-            Ok(())
-        })
+#[rskynet_macros::exclusive(crate = ::rskynet_core)]
+impl TimerService {
+    async fn init(&self, ctx: Ctx) -> Result<()> {
+        let config: TimerConfig = ctx.node().section(service::TIMER)?.unwrap_or_default();
+        if config.tick_micros == 0 {
+            return Err(Error::Config("[timer] tick_micros 必须大于 0".into()));
+        }
+        self.tick.set(Duration::from_micros(config.tick_micros));
+        Ok(())
     }
 
     /// 定时器也是个正常的服务：挂表不走邮箱，但查时间走。
-    fn dispatch(self: Arc<Self>, ctx: Ctx, mut msg: Message) -> BoxFuture<'static, ()> {
-        Box::pin(async move {
-            if msg.mtype != MsgType::USER {
-                return;
-            }
-            match msg.take_payload().downcast::<Request>() {
-                Ok(request) => match *request {
-                    Request::Timestamp => {
-                        let _ = ctx.reply(&msg, Payload::of(self.stamp()));
-                    }
-                },
-                Err(_) => {
-                    let _ = ctx.reply_error(&msg);
+    async fn dispatch(&self, ctx: Ctx, mut msg: Message) {
+        if msg.mtype != MsgType::USER {
+            return;
+        }
+        match msg.take_payload().downcast::<Request>() {
+            Ok(request) => match *request {
+                Request::Timestamp => {
+                    let _ = ctx.reply(&msg, Payload::of(self.stamp()));
                 }
+            },
+            Err(_) => {
+                let _ = ctx.reply_error(&msg);
             }
-        })
+        }
     }
-}
 
-impl Exclusive for TimerService {
     /// 一个 tick，对照 C 版 `thread_timer` 的循环体。
     ///
     /// `interrupt` 走默认实现（什么都不做）：内核那记 `unpark` 顶多让这一觉早醒

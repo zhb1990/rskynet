@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use rskynet::{
-    BoxFuture, Config, ConfigExt, Ctx, Error, Message, MsgType, Payload, Registry, Service, SvcCell,
+    BoxFuture, Config, ConfigExt, Ctx, Error, Message, MsgType, Payload, Registry, SvcCell,
 };
 
 /// 用例观察到的现象，跨线程收集，节点退出后统一断言。
@@ -21,19 +21,16 @@ type Scenario = Arc<dyn Fn(Ctx, Journal) -> BoxFuture<'static, ()> + Send + Sync
 #[derive(Default)]
 struct Echo;
 
-impl Service for Echo {
-    fn init(self: Arc<Self>, ctx: Ctx, _args: String) -> BoxFuture<'static, rskynet::Result<()>> {
-        Box::pin(async move {
-            ctx.register_name("echo");
-            Ok(())
-        })
+#[rskynet::service]
+impl Echo {
+    async fn init(&self, ctx: Ctx) -> rskynet::Result<()> {
+        ctx.register_name("echo");
+        Ok(())
     }
 
-    fn dispatch(self: Arc<Self>, ctx: Ctx, mut msg: Message) -> BoxFuture<'static, ()> {
-        Box::pin(async move {
-            let text = msg.take_payload().as_str().unwrap_or_default().to_string();
-            let _ = ctx.reply(&msg, Payload::text(format!("{text}!")));
-        })
+    async fn dispatch(&self, ctx: Ctx, mut msg: Message) {
+        let text = msg.take_payload().as_str().unwrap_or_default().to_string();
+        let _ = ctx.reply(&msg, Payload::text(format!("{text}!")));
     }
 }
 
@@ -41,24 +38,21 @@ impl Service for Echo {
 #[derive(Default)]
 struct SlowEcho;
 
-impl Service for SlowEcho {
-    fn init(self: Arc<Self>, ctx: Ctx, _args: String) -> BoxFuture<'static, rskynet::Result<()>> {
-        Box::pin(async move {
-            ctx.register_name("slow");
-            Ok(())
-        })
+#[rskynet::service]
+impl SlowEcho {
+    async fn init(&self, ctx: Ctx) -> rskynet::Result<()> {
+        ctx.register_name("slow");
+        Ok(())
     }
 
-    fn dispatch(self: Arc<Self>, ctx: Ctx, mut msg: Message) -> BoxFuture<'static, ()> {
-        Box::pin(async move {
-            let centis: u32 = msg
-                .take_payload()
-                .as_str()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1);
-            ctx.sleep(centis).await;
-            let _ = ctx.reply(&msg, Payload::text(format!("睡了{centis}")));
-        })
+    async fn dispatch(&self, ctx: Ctx, mut msg: Message) {
+        let centis: u32 = msg
+            .take_payload()
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        ctx.sleep(centis).await;
+        let _ = ctx.reply(&msg, Payload::text(format!("睡了{centis}")));
     }
 }
 
@@ -66,18 +60,15 @@ impl Service for SlowEcho {
 #[derive(Default)]
 struct Quitter;
 
-impl Service for Quitter {
-    fn init(self: Arc<Self>, ctx: Ctx, _args: String) -> BoxFuture<'static, rskynet::Result<()>> {
-        Box::pin(async move {
-            ctx.register_name("quitter");
-            Ok(())
-        })
+#[rskynet::service]
+impl Quitter {
+    async fn init(&self, ctx: Ctx) -> rskynet::Result<()> {
+        ctx.register_name("quitter");
+        Ok(())
     }
 
-    fn dispatch(self: Arc<Self>, ctx: Ctx, _msg: Message) -> BoxFuture<'static, ()> {
-        Box::pin(async move {
-            ctx.exit();
-        })
+    async fn dispatch(&self, ctx: Ctx) {
+        ctx.exit();
     }
 }
 
@@ -87,23 +78,20 @@ struct Counter {
     received: SvcCell<u64>,
 }
 
-impl Service for Counter {
-    fn init(self: Arc<Self>, ctx: Ctx, _args: String) -> BoxFuture<'static, rskynet::Result<()>> {
-        Box::pin(async move {
-            ctx.register_name("counter");
-            Ok(())
-        })
+#[rskynet::service]
+impl Counter {
+    async fn init(&self, ctx: Ctx) -> rskynet::Result<()> {
+        ctx.register_name("counter");
+        Ok(())
     }
 
-    fn dispatch(self: Arc<Self>, ctx: Ctx, msg: Message) -> BoxFuture<'static, ()> {
-        Box::pin(async move {
-            if msg.needs_reply() {
-                let total = *self.received.borrow();
-                let _ = ctx.reply(&msg, Payload::text(total.to_string()));
-            } else {
-                *self.received.borrow_mut() += 1;
-            }
-        })
+    async fn dispatch(&self, ctx: Ctx, msg: Message) {
+        if msg.needs_reply() {
+            let total = *self.received.borrow();
+            let _ = ctx.reply(&msg, Payload::text(total.to_string()));
+        } else {
+            *self.received.borrow_mut() += 1;
+        }
     }
 }
 
@@ -111,13 +99,10 @@ impl Service for Counter {
 #[derive(Default)]
 struct Stillborn;
 
-impl Service for Stillborn {
-    fn init(self: Arc<Self>, _ctx: Ctx, _args: String) -> BoxFuture<'static, rskynet::Result<()>> {
-        Box::pin(async { Err(Error::service("我起不来")) })
-    }
-
-    fn dispatch(self: Arc<Self>, _ctx: Ctx, _msg: Message) -> BoxFuture<'static, ()> {
-        Box::pin(async {})
+#[rskynet::service]
+impl Stillborn {
+    async fn init(&self) -> rskynet::Result<()> {
+        Err(Error::service("我起不来"))
     }
 }
 
@@ -142,24 +127,23 @@ struct Relay {
     shared: Arc<RelayShared>,
 }
 
-impl Service for Relay {
-    fn dispatch(self: Arc<Self>, ctx: Ctx, mut msg: Message) -> BoxFuture<'static, ()> {
-        Box::pin(async move {
-            let payload = msg.take_payload();
-            if msg.mtype == SETUP {
-                self.next.set(*payload.downcast::<u32>().unwrap());
-                return;
-            }
-            let left = *payload.downcast::<u64>().unwrap();
-            self.shared.hops.fetch_add(1, SeqCst);
-            if left > 1 {
-                let _ = ctx.send(self.next.get(), TOKEN, Payload::of(left - 1));
-            } else if self.shared.finished.fetch_add(1, SeqCst) == 0 {
-                // 第一个停下的令牌来记时：此刻其余令牌也都到期了，误差在一跳之内
-                let started = self.shared.started.lock().unwrap().unwrap();
-                *self.shared.elapsed.lock().unwrap() = Some(started.elapsed());
-            }
-        })
+#[rskynet::service]
+impl Relay {
+    async fn dispatch(&self, ctx: Ctx, mut msg: Message) {
+        let payload = msg.take_payload();
+        if msg.mtype == SETUP {
+            self.next.set(*payload.downcast::<u32>().unwrap());
+            return;
+        }
+        let left = *payload.downcast::<u64>().unwrap();
+        self.shared.hops.fetch_add(1, SeqCst);
+        if left > 1 {
+            let _ = ctx.send(self.next.get(), TOKEN, Payload::of(left - 1));
+        } else if self.shared.finished.fetch_add(1, SeqCst) == 0 {
+            // 第一个停下的令牌来记时：此刻其余令牌也都到期了，误差在一跳之内
+            let started = self.shared.started.lock().unwrap().unwrap();
+            *self.shared.elapsed.lock().unwrap() = Some(started.elapsed());
+        }
     }
 }
 
@@ -169,17 +153,12 @@ struct Driver {
     journal: Journal,
 }
 
-impl Service for Driver {
-    fn init(self: Arc<Self>, ctx: Ctx, _args: String) -> BoxFuture<'static, rskynet::Result<()>> {
-        Box::pin(async move {
-            (self.scenario)(ctx.clone(), self.journal.clone()).await;
-            ctx.abort();
-            Ok(())
-        })
-    }
-
-    fn dispatch(self: Arc<Self>, _ctx: Ctx, _msg: Message) -> BoxFuture<'static, ()> {
-        Box::pin(async {})
+#[rskynet::service]
+impl Driver {
+    async fn init(&self, ctx: Ctx) -> rskynet::Result<()> {
+        (self.scenario)(ctx.clone(), self.journal.clone()).await;
+        ctx.abort();
+        Ok(())
     }
 }
 
@@ -663,26 +642,19 @@ fn custom_message_types_work() {
     #[derive(Default)]
     struct Picky;
 
-    impl Service for Picky {
-        fn init(
-            self: Arc<Self>,
-            ctx: Ctx,
-            _args: String,
-        ) -> BoxFuture<'static, rskynet::Result<()>> {
-            Box::pin(async move {
-                ctx.register_name("picky");
-                Ok(())
-            })
+    #[rskynet::service]
+    impl Picky {
+        async fn init(&self, ctx: Ctx) -> rskynet::Result<()> {
+            ctx.register_name("picky");
+            Ok(())
         }
 
-        fn dispatch(self: Arc<Self>, ctx: Ctx, msg: Message) -> BoxFuture<'static, ()> {
-            Box::pin(async move {
-                if msg.mtype == MY_PROTO {
-                    let _ = ctx.reply(&msg, Payload::text("对味"));
-                } else {
-                    let _ = ctx.reply_error(&msg);
-                }
-            })
+        async fn dispatch(&self, ctx: Ctx, msg: Message) {
+            if msg.mtype == MY_PROTO {
+                let _ = ctx.reply(&msg, Payload::text("对味"));
+            } else {
+                let _ = ctx.reply_error(&msg);
+            }
         }
     }
 

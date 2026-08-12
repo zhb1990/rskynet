@@ -16,24 +16,20 @@
 //! ## 上手
 //!
 //! ```no_run
-//! use std::sync::Arc;
-//! use rskynet::{BoxFuture, Config, ConfigExt, Ctx, Message, Payload, Registry, Service};
+//! use rskynet::{Config, ConfigExt, Ctx, Message, Registry};
 //!
 //! struct Echo;
 //!
-//! impl Service for Echo {
-//!     fn init(self: Arc<Self>, ctx: Ctx, _args: String) -> BoxFuture<'static, rskynet::Result<()>> {
-//!         Box::pin(async move {
-//!             ctx.register_name("echo");
-//!             Ok(())
-//!         })
+//! #[rskynet::service]
+//! impl Echo {
+//!     async fn init(&self, ctx: Ctx) -> rskynet::Result<()> {
+//!         ctx.register_name("echo");
+//!         Ok(())
 //!     }
 //!
-//!     fn dispatch(self: Arc<Self>, ctx: Ctx, mut msg: Message) -> BoxFuture<'static, ()> {
-//!         Box::pin(async move {
-//!             let payload = msg.take_payload();
-//!             let _ = ctx.reply(&msg, payload);
-//!         })
+//!     async fn dispatch(&self, ctx: Ctx, mut msg: Message) {
+//!         let payload = msg.take_payload();
+//!         let _ = ctx.reply(&msg, payload);
 //!     }
 //! }
 //!
