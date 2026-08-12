@@ -7,6 +7,11 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# 只有测试用得上：验证 `#[service(crate = ::rskynet_core)]` 那条覆盖路径。内核本体
+# 不依赖宏，宏也不依赖内核，所以这不成环
+[dev-dependencies]
+rskynet-macros = { workspace = true }
+
 [dependencies]
 arc-swap = { workspace = true }
 crossbeam-queue = { workspace = true }

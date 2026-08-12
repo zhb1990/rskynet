@@ -68,6 +68,13 @@
 
 pub use rskynet_core::*;
 
+/// 消去 `Service` 实现样板的过程宏，用法见 [`service`] 与 [`exclusive`]。
+///
+/// `msg` 单独用没有意义（它由前两个宏在展开时摘走），导出它只是为了让写错地方时
+/// 报一句人话。
+#[cfg(feature = "macros")]
+pub use rskynet_macros::{exclusive, msg, service};
+
 /// 网络层：socket / gate / agent。
 #[cfg(feature = "net")]
 pub use rskynet_net as net;
@@ -117,6 +124,12 @@ impl BuilderExt for Builder {
         {
             use rskynet_timer::BuilderExt as _;
             builder = builder.with_wheel_timer();
+        }
+        // 网络层只注册类型，不拉起：它不是系统服务，什么时候起由 `[bootstrap]`
+        // 的清单说了算
+        #[cfg(feature = "net")]
+        {
+            builder = builder.exclusive_service(rskynet_net::NAME, rskynet_net::NetService::new);
         }
         builder
     }

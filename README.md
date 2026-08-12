@@ -208,8 +208,40 @@ cargo run --example ping_pong
 | `skynet.now()` / `skynet.time()` | `ctx.now()` / `ctx.time()` |
 | `skynet.error(...)` | `ctx.log(...)` / `rskynet::log!(ctx, "...")` |
 | `skynet.stat("mqlen"/"message"/"cpu")` | `ctx.mailbox_len()` / `ctx.message_count()` / `ctx.cpu_cost()` |
+| `socket.listen(addr, port)` / `socket.start(id)` | `net::listen(&ctx, addr).await` / `net::start(&ctx, id).await` |
+| `socket.open(addr, port)` | `net::connect(&ctx, addr).await` |
+| `socket.write(id, data)` / `socket.lwrite(id, data)` | `net::send(&ctx, id, data)` / `net::send_low(&ctx, id, data)` |
+| `socket.close(id)` / `socket.shutdown(id)` | `net::close(&ctx, id).await` / `net::shutdown(&ctx, id)` |
+| `socket.udp(...)` / `socket.sendto(...)` | `net::udp(&ctx, bind).await` / `net::udp_send(&ctx, id, to, data)` |
 
 寻址方式也照搬：`":0100000a"` 是十六进制 handle，`".name"` 是本地名字，直接传 `u32` 则是 handle。
+
+## 过程宏与网络层
+
+默认启用的 `#[service]` / `#[exclusive]` 会生成对应 trait 实现；`#[msg]` 按协议号
+路由，并通过 `FromPayload` 取参数。有返回值且发送方在等待时会自动回包，自定义对象
+用 `boxed_payload!(Ask, Answer)` 声明负载转换：
+
+```rust
+#[rskynet::service]
+impl Calculator {
+    async fn init(&self, ctx: Ctx) -> Result<()> {
+        ctx.register_name("calculator");
+        Ok(())
+    }
+
+    #[msg(MsgType::USER)]
+    async fn add(&self, ask: Add) -> Sum { Sum(ask.0 + ask.1) }
+
+    #[msg(default)]
+    async fn other(&self, _ctx: Ctx, _msg: Message) {}
+}
+```
+
+网络层用 `net` feature 打开。它只注册服务类型，不会自动拉起；在 `[bootstrap]`
+清单中先启动 `net`，业务服务再调用 `listen` / `connect` / `start` / `send`，并用
+`#[msg(MsgType::SOCKET)]` 接收 `SocketEvent`。可直接运行
+`cargo run --example echo_server`，再用 `telnet 127.0.0.1 8888` 验证回声。
 
 ## 源码对照
 
@@ -238,7 +270,8 @@ cargo run --example ping_pong
 | `rskynet-logger` | `service_logger.c` | 日志服务（独占一条线程） |
 | `rskynet-timer` | `skynet_timer.c` + `thread_timer` | 分层时间轮（256 格近期轮 + 4 层 64 格，精度 10ms）与推着它走的定时器服务 |
 | `rskynet-bootstrap` | `bootstrap.lua` | 引导服务 |
-| `rskynet-net` | `socket_server.c` | 网络层（骨架，未实现） |
+| `rskynet-net` | `socket_server.c` | TCP / UDP 网络层、槽位状态机、背压与域名解析 |
+| `rskynet-macros` | `lualib/skynet.lua` 的协议分发样板 | `service` / `exclusive` / `msg` 过程宏 |
 
 ## 为什么服务状态可以不加锁
 
@@ -269,11 +302,9 @@ struct Counter { hits: SvcCell<u64> }
 
 ## 现状与边界
 
-已实现：服务生命周期（launch / exit / kill / abort）、消息与自定义协议号、session RPC、服务内并发、本地名字表、分层时间轮、独占线程的服务（日志与定时器都是）、引导服务、TOML 配置、worker 权重调度与工作窃取、过载检测、退出时给在途请求回错误。
+已实现：服务生命周期（launch / exit / kill / abort）、消息与自定义协议号、session RPC、服务内并发、本地名字表、分层时间轮、独占线程的服务（日志、定时器与网络层都是）、引导服务、TCP / UDP、过程宏、TOML 配置、worker 权重调度与工作窃取、过载检测、退出时给在途请求回错误。
 
-尚未实现（下一版）：socket / gate / agent 网络层、消去 `Service` 样板的过程宏、harbor / cluster 跨节点、monitor 死循环检测、debug_console、消息序列化协议。
-
-前两项的 crate 与内核这侧的接缝已经就位（`crates/rskynet-net`、`crates/rskynet-macros`，见「网络层为什么在内核之外」），本体还没写。
+尚未实现（下一版）：gate / agent、harbor / cluster 跨节点、monitor 死循环检测、debug_console、消息序列化协议。
 
 因为内核不碰 epoll/kqueue，目前是**跨平台**的，Windows 上可以直接 `cargo run`。
 
@@ -308,15 +339,15 @@ config/dev.toml            节点配置示例
 crates/rskynet-core/       内核
   src/                     按 skynet-src 的文件名组织（bwos.rs / clock.rs / exclusive.rs / ext.rs 例外，C 版没有对应物）
 crates/rskynet/            门面：按 feature 把下面几个拼在一处，使用方只依赖它
-  examples/ping_pong.rs    示例
+  examples/                ping_pong 与 TCP echo_server 示例
   tests/kernel.rs          端到端测试
   tests/exclusive.rs       独占线程服务的端到端验证
   tests/builtins.rs        三个内置服务与内核的接缝：启动顺序、配置默认值、时间来源
 crates/rskynet-logger/     日志服务，一个独占线程的服务
 crates/rskynet-timer/      分层时间轮与定时器服务
 crates/rskynet-bootstrap/  引导服务
-crates/rskynet-macros/     过程宏，消去 Service 实现的样板（骨架，未实现）
-crates/rskynet-net/        网络层，一个独占线程的服务（骨架，未实现）
+crates/rskynet-macros/     service / exclusive / msg 过程宏
+crates/rskynet-net/        TCP + UDP 网络层，一个独占线程的服务
 ```
 
 使用方只写一行依赖，要什么按 feature 开：

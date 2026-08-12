@@ -215,6 +215,7 @@ dependencies = [
  "crossbeam-queue",
  "futures-util",
  "parking_lot",
+ "rskynet-macros",
  "serde",
  "serde_json",
  "slab",

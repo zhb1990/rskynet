@@ -34,6 +34,11 @@ pub enum Error {
     #[error("{0}")]
     Service(String),
 
+    /// 负载不是期待的类型，见 [`crate::FromPayload`]。分发时撞上它意味着两边对
+    /// 协议号的约定不一致——发送方按一个类型装，接收方按另一个类型取。
+    #[error("负载类型不符：{0}")]
+    Payload(String),
+
     #[error("配置错误：{0}")]
     Config(String),
 

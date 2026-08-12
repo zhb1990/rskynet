@@ -42,7 +42,13 @@ services = [
     { name = "ping", args = "100" },
 ]
 
-# 网络层读的是 [net] 这一段，用法与上面几段完全一样：
-#
-# [net]
-# listen = "0.0.0.0:8888"
+# 网络层。它不是系统服务，只有同时在 bootstrap 清单中写 `{ name = "net" }` 才会启动。
+[net]
+# 一轮 poll 最多预留多少个事件。
+events = 1024
+# socket 槽位数；id 对这个数取模得到 poll token。
+max_socket = 65536
+# 每条 TCP 流的初始/最小读缓冲字节数，读满时会自适应翻倍。
+min_read_buffer = 64
+# 单连接写缓冲第一次告警的字节数，之后每翻一倍再告警。
+warn_size = 1048576

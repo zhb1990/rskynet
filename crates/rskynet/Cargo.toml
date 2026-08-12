@@ -20,7 +20,10 @@ bootstrap = ["dep:rskynet-bootstrap"]
 # 网络层。要用 socket / gate 时打开
 net = ["dep:rskynet-net"]
 
+# net 在 dev-dependencies 里也列一份，好让 `cargo test` 不加 feature 也跑网络层的
+# 用例——那些用例直接用 `rskynet_net`，不经过 `rskynet::net` 那个 re-export
 [dev-dependencies]
+rskynet-net = { workspace = true }
 serde = { workspace = true }
 
 [dependencies]

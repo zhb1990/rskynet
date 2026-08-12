@@ -44,6 +44,7 @@ mod handle;
 mod message;
 mod module;
 mod mq;
+mod payload;
 mod server;
 mod session;
 mod start;
@@ -59,6 +60,7 @@ pub use exclusive::{Exclusive, Idler};
 pub use ext::{NodeRef, ReplyToken};
 pub use message::{Addr, Message, MsgType, Payload};
 pub use module::Registry;
+pub use payload::{FromPayload, IntoPayload};
 pub use start::{Builder, Config, start};
 pub use task::SvcCell;
 
