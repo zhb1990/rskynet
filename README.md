@@ -169,7 +169,8 @@ impl Service for Echo {
 }
 
 fn main() -> Result<()> {
-    let registry = Registry::new().with_builtins().with("echo", || Echo);
+    // 日志、定时器、引导这三个内置服务由 rskynet::start 按 feature 挂上
+    let registry = Registry::new().with("echo", || Echo);
     let config = Config::default().with_bootstrap(["echo"]);
     rskynet::start(config, registry)
 }
@@ -221,17 +222,23 @@ cargo run --example ping_pong
 | `bwos.rs` | 无对应 | BWoS 块式工作窃取队列，移植自 stdexec 的 `bwos_lifo_queue.hpp` |
 | `handle.rs` | `skynet_handle.c` | handle 分配（harbor 占高 8 位）、槽位倍增、本地名字表 |
 | `server.rs` | `skynet_server.c` | `ServiceContext`、`Node`、消息分发主循环、服务生命周期 |
-| `timer.rs` | `skynet_timer.c` | 分层时间轮，256 格近期轮 + 4 层 64 格，精度 10ms |
+| `clock.rs` | 无对应 | `Timer` 抽象：内核只认它，实现由启动方注入 |
 | `module.rs` | `skynet_module.c` | 服务类型注册表（静态注册取代 `dlopen`） |
 | `start.rs` | `skynet_start.c` | 配置、线程池、引导、退出 |
 | `context.rs` | `lualib/skynet.lua` | 用户侧 API：`call` / `send` / `fork` / `sleep` |
 | `session.rs` | `lualib/skynet.lua` | `session_id_coroutine` 的对应物 |
 | `task.rs` | Lua 协程池 | 服务内 executor、`SvcCell` |
 | `exclusive.rs` | 无对应 | 独占线程的服务：`Exclusive` 的 `idle` / `interrupt` 两个钩子与那条线程的主循环，见上文 |
-| `service/logger.rs` | `service_logger.c` | 日志服务（独占一条线程） |
-| `service/timer.rs` | `skynet_start.c` 的 `thread_timer` | 定时器服务（独占一条线程），C 版那是内核里的专用线程 |
-| `service/bootstrap.rs` | `bootstrap.lua` | 引导服务 |
 | `ext.rs` | 无对应 | 内核对外的扩展接口：`NodeRef` / `ReplyToken`，见下文 |
+
+内置服务一个都不在内核里，各是一个独立 crate（见下文「内核里为什么没有服务」）：
+
+| rskynet | skynet | 内容 |
+| --- | --- | --- |
+| `rskynet-logger` | `service_logger.c` | 日志服务（独占一条线程） |
+| `rskynet-timer` | `skynet_timer.c` + `thread_timer` | 分层时间轮（256 格近期轮 + 4 层 64 格，精度 10ms）与推着它走的定时器服务 |
+| `rskynet-bootstrap` | `bootstrap.lua` | 引导服务 |
+| `rskynet-net` | `socket_server.c` | 网络层（骨架，未实现） |
 
 ## 为什么服务状态可以不加锁
 
@@ -253,6 +260,7 @@ struct Counter { hits: SvcCell<u64> }
 
 - **全局队列换成每 worker 一条的窃取队列**：见上文「运行队列」。
 - **专用线程改成独占线程的服务**：C 版的定时器线程与 socket 线程是内核里两块独立代码，这里它们是普通服务，只是各占一条线程，见上文「独占一条线程的服务」。内核因此不必再为「跟着节点起落的线程」单开扩展点。
+- **内置服务全部搬出内核**：日志、定时器、引导各是一个独立 crate，与网络层同一套接入方式；时间也随定时器一起搬走，内核只留一个必须注入的 `Timer` 抽象，见下文「内核里为什么没有服务」。
 - **投递即唤醒**：C 版 `skynet_globalmq_push` 不唤醒 worker，靠定时器线程每 2.5ms 顺手唤醒，代价是所有 worker 都睡着时消息最坏要等一个 tick。这里改成投递方按空闲位图点名叫一个具体的 worker，延迟更低；定时器那记兜底唤醒保留。
 - **消息路径上没有锁**：邮箱、injector、唤醒、handle 表原先各有一把锁，一条消息从发出到被处理要抢四把。现在邮箱与 injector 是无锁队列，唤醒是位图加 `park`/`unpark`，handle 表与名字表用 `arc-swap` 做快照读（`grab()` 常态下连 RMW 都没有，`ctx.request(".pong", …)` 这种每次按名字寻址的写法也不再抢锁）。挂定时器同样不再抢时间轮的锁：投递方把事件压进一条无锁队列，定时器服务每 tick 排空后插进轮子——精度本来就是 10ms，晚一个 tick 插入无影响。`parking_lot` 只留给写者互斥这类冷路径（handle 分配、槽位扩容）。
 - **节点不再是全局单例**：C 版用文件级静态变量，这里收进 `Arc<Node>`，同进程可以跑多个互不干扰的节点，单元测试因此能并行。
@@ -298,11 +306,15 @@ cargo test --release -- --ignored --nocapture
 Cargo.toml                 workspace 根
 config/dev.toml            节点配置示例
 crates/rskynet-core/       内核
-  src/                     按 skynet-src 的文件名组织（bwos.rs / exclusive.rs / ext.rs 例外，C 版没有对应物）
-  tests/exclusive.rs       独占线程服务的端到端验证
+  src/                     按 skynet-src 的文件名组织（bwos.rs / clock.rs / exclusive.rs / ext.rs 例外，C 版没有对应物）
 crates/rskynet/            门面：按 feature 把下面几个拼在一处，使用方只依赖它
   examples/ping_pong.rs    示例
   tests/kernel.rs          端到端测试
+  tests/exclusive.rs       独占线程服务的端到端验证
+  tests/builtins.rs        三个内置服务与内核的接缝：启动顺序、配置默认值、时间来源
+crates/rskynet-logger/     日志服务，一个独占线程的服务
+crates/rskynet-timer/      分层时间轮与定时器服务
+crates/rskynet-bootstrap/  引导服务
 crates/rskynet-macros/     过程宏，消去 Service 实现的样板（骨架，未实现）
 crates/rskynet-net/        网络层，一个独占线程的服务（骨架，未实现）
 ```
@@ -310,10 +322,38 @@ crates/rskynet-net/        网络层，一个独占线程的服务（骨架，�
 使用方只写一行依赖，要什么按 feature 开：
 
 ```toml
-rskynet = { version = "0.1", features = ["net"] }   # macros 默认已开
+rskynet = { version = "0.1", features = ["net"] }   # macros / logger / timer / bootstrap 默认已开
 ```
 
 业务代码不需要放进本仓：`rskynet` 是 lib crate，对外提供 `Service` trait 与 `rskynet::start(config, registry)`，使用方在自己的 app crate 里写 `main` 并注册服务——对应 skynet 里「内核是宿主、服务是外挂模块」的形态。
+
+### 内核里为什么没有服务
+
+日志、定时器、引导在 C 版都是内核的一部分，这里一个都不在：它们与网络层走同一条接入路子——用 `Registry` 注册类型，在配置里占一段，要独占线程就用 `with_exclusive`。图的和网络层拆出去是同一件事：**内核不碰系统调用**，不碰 epoll、不碰文件 IO、也不碰系统时钟，于是它是纯跨平台的，单元测试跑一条消息不必拉起这些东西。
+
+时间是其中最需要解释的一个。内核里没有时间轮，只有一个 `Timer` trait，实现必须在启动前注入：
+
+```rust
+pub trait Timer: Send + Sync + 'static {
+    fn timeout(&self, handle: u32, session: i32, ticks: u32);
+    fn now(&self) -> u64;
+    fn wall_clock(&self) -> u64;
+    fn start_seconds(&self) -> u64;
+}
+```
+
+`ctx.sleep()` 是往它记一笔账，`ctx.now()` 是问它要个数——都是同步的本地调用，不走消息（日志每写一行都要读时间，走一趟邮箱不划算）。`rskynet-timer` 提供的实现分成配合的两半：**记账**的那一半（`WheelTimer`，注入给内核的就是它）和**推刻度**的那一半（`TimerService`，一个独占线程的服务）。分家的好处是记账那一半在节点建起来之前就存在，于是引导期间挂的表一条都不会丢，哪怕那时推刻度的线程还没上线。
+
+三个系统服务的启动顺序是**日志 → 定时器 → 引导**。日志最先，好让后面每一步的岔子都有人记；定时器排在引导之前，于是引导期间刻度就在走——引导拉起的服务在 `init` 里 `sleep` 立刻开始计时，日志时间戳也不再是一片 0。代价是定时器不能光看「服务数归零」就宣布收工（它出场时服务数本来就是 0），得先问一句 `node.is_booted()`。
+
+内核为此保留的只有三个约定名字（`logger` / `timer` / `bootstrap`）与拉起它们的顺序。类型名可以在配置里换成自己的实现，写成空串就是不拉起：
+
+```toml
+[logger]
+name = "my-logger"   # 换掉实现
+[timer]
+name = ""            # 不起定时器服务，自己注入 Timer 实现
+```
 
 ### 网络层为什么在内核之外
 
@@ -328,7 +368,7 @@ C 版的 socket 线程与内核同住一个编译单元，`skynet_socket_*` 直�
 
 于是网络层写起来是这样的：socket 服务用 `with_exclusive` 注册，它的 `idle` 就是 `poll.poll(events, None)`，`interrupt` 敲 mio 的 `Waker`；业务服务的 `listen` / `connect` / `send` / `close` 是发给它的消息，办完由它 `reply`，调用方写成一句 `await`；socket 事件以 `MsgType::SOCKET` 投给连接的属主服务，与定时器回包同一条路径。真要再起子线程（比如把阻塞的域名解析挪出去），那条线程靠 `NodeRef` 与 `ReplyToken` 回话。
 
-`crates/rskynet-core/tests/exclusive.rs` 拿一个最小的「轮询器」把这套路整个走了一遍：自定义阻塞、被 `interrupt` 叫醒、外部事件转成消息、被 kill 时线程自己退掉、关停时积压的消息一条不丢。
+`crates/rskynet/tests/exclusive.rs` 拿一个最小的「轮询器」把这套路整个走了一遍：自定义阻塞、被 `interrupt` 叫醒、外部事件转成消息、被 kill 时线程自己退掉、关停时积压的消息一条不丢。
 
 ## 测试
 

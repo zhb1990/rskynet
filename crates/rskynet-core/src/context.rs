@@ -213,6 +213,9 @@ impl Ctx {
     }
 
     /// 挂起 `ticks` 厘秒（10ms 一格），对照 `skynet.sleep`。
+    ///
+    /// 挂表交给注入的 [`crate::Timer`]，到期时它投一条 `RESPONSE` 回来。挂表本身
+    /// 从节点建起来那一刻就可用，哪怕推刻度的那条线程还没上线。
     pub async fn sleep(&self, ticks: u32) {
         let session = self.inner.sessions.alloc();
         self.inner.node.timeout(self.handle(), ticks, session);

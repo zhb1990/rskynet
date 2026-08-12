@@ -47,7 +47,12 @@ pub enum Error {
     #[error("解析配置失败：{0}")]
     ConfigParse(#[from] toml::de::Error),
 
-    /// 服务参数用 JSON 承载时的编解码失败，见 [`crate::service::Bootstrap`]。
+    /// 启动前没有注入时间来源，见 [`crate::Builder::timer`]。
+    #[error("启动前必须注入 timer 对象，现成的实现见 rskynet-timer")]
+    MissingTimer,
+
+    /// 服务参数用 JSON 承载时的编解码失败。内核自己不用 JSON，这个变体是留给
+    /// 服务包的（网络层的协议、跨节点的负载都可能用得上）。
     #[error("服务参数不是合法的 JSON：{0}")]
     Json(#[from] serde_json::Error),
 

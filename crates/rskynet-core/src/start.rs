@@ -3,22 +3,31 @@
 //! 线程构成与 C 版一样多，只是归属变了（少了 monitor 线程，见 README 的取舍说明）：
 //!
 //! - N 个 worker 线程：从运行队列取服务、跑消息与任务
-//! - 每个独占服务一条线程：定时器与日志各一条，将来网络层也是一条。
+//! - 每个独占服务一条线程：定时器与日志各一条，网络层也是一条。
 //!   C 版那是内核里的专用线程，这里它们是普通服务，见 [`crate::Exclusive`]
 //!
 //! worker 的 `weight` 沿用 C 版那张表：前 4 个线程一次只处理一条消息（响应快），
 //! 后面的线程一次处理 `队列长度 >> weight` 条（吞吐高）。
+//!
+//! # 系统服务
+//!
+//! 日志、定时器、引导这三个服务的实现都不在内核里（各是一个独立 crate），内核
+//! 只做两件事：按配置里那一段的 `name` 把它们拉起来，以及定下先后顺序。顺序是
+//! 日志 → 定时器 → 引导：日志最先，好让后面每一步出的岔子都有人记；定时器排在
+//! 引导之前，于是引导期间刻度就在走，那时挂的表、打的日志时间戳都是准的。
 
 use std::any::Any;
 use std::sync::Arc;
 use std::thread;
 
+use serde::Deserialize;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
 
+use crate::clock::Timer;
 use crate::error::{Error, Result};
 use crate::module::Registry;
 use crate::server::Node;
+use crate::service;
 
 /// 各 worker 线程的消息批处理权重，直接照搬 C 版 `skynet_start.c` 里的常量表。
 const WORKER_WEIGHTS: [i32; 32] = [
@@ -26,81 +35,20 @@ const WORKER_WEIGHTS: [i32; 32] = [
     3, 3,
 ];
 
-/// 一条服务启动项：类型名加参数。
-///
-/// C 版把这两截挤在一个字符串里，靠 `sscanf` 按首个空格拆；这里各占一个字段，
-/// 于是参数里带空格、带分号都不再是问题。
-///
-/// 可以序列化，是因为服务的 `init` 只收得到一个字符串：整张清单编成 JSON 递过去，
-/// 由引导服务解回来，见 [`crate::service::Bootstrap`]。
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+/// 系统服务在配置里的样子。内核只认一个 `name`（服务类型名），段里其余的键
+/// 一概不看——那是认领这一段的服务自己的事，它在 `init` 里用
+/// [`crate::NodeRef::section`] 取。
+#[derive(Debug, Default, Deserialize)]
 #[serde(default)]
-pub struct ServiceSpec {
-    /// 服务类型名，也就是注册表里的那个键。
-    pub name: String,
-    /// 传给服务 `init` 的参数，不需要就留空。
-    pub args: String,
-}
-
-impl ServiceSpec {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            args: String::new(),
-        }
-    }
-
-    #[must_use]
-    pub fn with_args(mut self, args: impl Into<String>) -> Self {
-        self.args = args.into();
-        self
-    }
-}
-
-impl From<&str> for ServiceSpec {
-    fn from(name: &str) -> Self {
-        Self::new(name)
-    }
-}
-
-impl From<String> for ServiceSpec {
-    fn from(name: String) -> Self {
-        Self::new(name)
-    }
-}
-
-impl<N: Into<String>, A: Into<String>> From<(N, A)> for ServiceSpec {
-    fn from((name, args): (N, A)) -> Self {
-        Self::new(name).with_args(args)
-    }
-}
-
-/// 引导配置，对照 skynet config 里 `bootstrap` 那一行：
-///
-/// ```toml
-/// [bootstrap]
-/// name = "bootstrap"
-/// services = [{ name = "pong" }, { name = "ping", args = "100" }]
-/// ```
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct BootstrapConfig {
-    /// 引导服务的类型名，默认是内置的 `bootstrap`。
-    pub name: String,
-    /// 引导服务按顺序拉起的服务，写在前面的先起。
-    pub services: Vec<ServiceSpec>,
-}
-
-impl Default for BootstrapConfig {
-    fn default() -> Self {
-        Self {
-            name: crate::service::BOOTSTRAP.to_string(),
-            services: Vec::new(),
-        }
-    }
+struct SystemService {
+    name: Option<String>,
 }
 
 /// 节点配置，对照 skynet 的 `config` 文件。
+///
+/// 内核认的只有这三个标量，剩下的全是段：`[logger]`、`[timer]`、`[bootstrap]`
+/// 归三个内置服务，`[net]` 之类归各自的服务。内核对系统服务的段只读一个 `name`，
+/// 段里其余内容原样留着，由服务自己解析。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -108,19 +56,12 @@ pub struct Config {
     pub thread: usize,
     /// 本节点编号，会占据 handle 的高 8 位。
     pub harbor: u32,
-    /// 引导服务及它要拉起的服务清单，用 [`Config::with_bootstrap`] 与
-    /// [`Config::with_bootstrap_service`] 改写。
-    pub(crate) bootstrap: BootstrapConfig,
-    /// 日志服务的类型名。
-    pub logservice: String,
-    /// 传给日志服务的参数：日志文件路径，留空表示只写标准输出。
-    pub logger: String,
     /// 是否统计各服务的消息处理耗时。
     pub profile: bool,
-    /// 扩展的配置段：`[net]` 这类内核不认领的表原样留在这里，
-    /// 由认领它的服务在自己的 `init` 里用 [`Config::section`] 各取所需。
+    /// 所有配置段原样留一份，认领它的服务在自己的 `init` 里用
+    /// [`Config::section`] 各取所需。
     #[serde(flatten)]
-    extra: toml::Table,
+    sections: toml::Table,
 }
 
 impl Default for Config {
@@ -130,11 +71,8 @@ impl Default for Config {
                 .map(|n| n.get())
                 .unwrap_or(4),
             harbor: 0,
-            bootstrap: BootstrapConfig::default(),
-            logservice: crate::service::LOGGER.to_string(),
-            logger: String::new(),
             profile: true,
-            extra: toml::Table::new(),
+            sections: toml::Table::new(),
         }
     }
 }
@@ -155,30 +93,6 @@ impl Config {
         Self::from_toml_str(&text)
     }
 
-    /// 覆盖引导清单，链式配置用。只有类型名的写字符串，要带参数的写成一对：
-    ///
-    /// ```
-    /// # use rskynet_core::Config;
-    /// Config::default().with_bootstrap(["pong", "ping"]);
-    /// Config::default().with_bootstrap([("pong", ""), ("ping", "100")]);
-    /// ```
-    #[must_use]
-    pub fn with_bootstrap<I>(mut self, services: I) -> Self
-    where
-        I: IntoIterator,
-        I::Item: Into<ServiceSpec>,
-    {
-        self.bootstrap.services = services.into_iter().map(Into::into).collect();
-        self
-    }
-
-    /// 换掉引导服务本身的类型名，默认是内置的 `bootstrap`。
-    #[must_use]
-    pub fn with_bootstrap_service(mut self, name: impl Into<String>) -> Self {
-        self.bootstrap.name = name.into();
-        self
-    }
-
     #[must_use]
     pub fn with_thread(mut self, thread: usize) -> Self {
         self.thread = thread;
@@ -188,8 +102,9 @@ impl Config {
     /// 取某一段配置，例如 `config.section::<NetConfig>("net")`。
     ///
     /// 段不存在时返回 `Ok(None)`，由认领它的服务自己决定是走默认值还是报错。
+    /// 段里多出来的键一律忽略，所以服务不必把 `name` 这类内核字段也声明一遍。
     pub fn section<T: DeserializeOwned>(&self, name: &str) -> Result<Option<T>> {
-        match self.extra.get(name) {
+        match self.sections.get(name) {
             None => Ok(None),
             Some(value) => Ok(Some(T::deserialize(value.clone())?)),
         }
@@ -198,8 +113,35 @@ impl Config {
     /// 塞一个配置段，给「不从 TOML 来」的场景（测试、代码里搭配置）用。
     #[must_use]
     pub fn with_section(mut self, name: impl Into<String>, section: toml::Table) -> Self {
-        self.extra.insert(name.into(), toml::Value::Table(section));
+        self.sections
+            .insert(name.into(), toml::Value::Table(section));
         self
+    }
+
+    /// 取某一段的可写引用，段不存在就先建一张空表。
+    ///
+    /// 服务包用它给自己那一段加链式配置方法，例如 `rskynet-bootstrap` 的
+    /// `with_bootstrap`。段里原本是个标量（写配置的人拼错了）时按空表处理，
+    /// 反正 [`Config::validate`] 会在启动前把它拦下来。
+    pub fn section_mut(&mut self, name: &str) -> &mut toml::Table {
+        let entry = self
+            .sections
+            .entry(name.to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if !entry.is_table() {
+            *entry = toml::Value::Table(toml::Table::new());
+        }
+        entry.as_table_mut().expect("上一句已经保证它是表")
+    }
+
+    /// 某个系统服务该用哪个类型名：段里写了就用段里的，没写就用内置的默认名。
+    ///
+    /// 返回空串表示「不拉起这个服务」，写配置的人可以用 `name = ""` 显式关掉。
+    fn system_kind(&self, section: &str, fallback: &str) -> Result<String> {
+        let spec: Option<SystemService> = self.section(section)?;
+        Ok(spec
+            .and_then(|spec| spec.name)
+            .unwrap_or_else(|| fallback.to_string()))
     }
 
     fn validate(&self) -> Result<()> {
@@ -209,20 +151,9 @@ impl Config {
         if self.harbor > 0xff {
             return Err(Error::Config("harbor 编号必须在 0..=255 之间".into()));
         }
-        if self.bootstrap.name.trim().is_empty() {
-            return Err(Error::Config("必须指定引导服务".into()));
-        }
-        if let Some(pos) = self
-            .bootstrap
-            .services
-            .iter()
-            .position(|spec| spec.name.trim().is_empty())
-        {
-            return Err(Error::Config(format!("引导清单第 {} 项没写 name", pos + 1)));
-        }
-        // `flatten` 把不认识的键统统收进 extra，于是「拼错内核字段就报错」这条防线
-        // 得自己补上：扩展的配置一律写成表，落在顶层的散键只可能是拼错
-        for (key, value) in &self.extra {
+        // `flatten` 把不认识的键统统收进 sections，于是「拼错内核字段就报错」这条
+        // 防线得自己补上：配置段一律是表，落在顶层的散键只可能是拼错
+        for (key, value) in &self.sections {
             if !value.is_table() {
                 return Err(Error::Config(format!(
                     "不认识的配置项 `{key}`；扩展的配置要写成 `[{key}]` 这样的段"
@@ -235,16 +166,28 @@ impl Config {
 
 /// 节点构建器，[`start`] 的链式写法。
 ///
+/// 时间来源必须注入，内核里没有现成的实现：
+///
 /// ```no_run
-/// # use rskynet_core::{Builder, Config, Registry};
+/// # use std::sync::Arc;
+/// # use rskynet_core::{Builder, Config, Registry, Timer};
+/// # struct MyTimer;
+/// # impl Timer for MyTimer {
+/// #     fn timeout(&self, _handle: u32, _session: i32, _ticks: u32) {}
+/// #     fn now(&self) -> u64 { 0 }
+/// #     fn wall_clock(&self) -> u64 { 0 }
+/// #     fn start_seconds(&self) -> u64 { 0 }
+/// # }
 /// Builder::new(Config::default())
-///     .registry(Registry::new().with_builtins())
+///     .registry(Registry::new())
+///     .timer(Arc::new(MyTimer))
 ///     .run()
 ///     .unwrap();
 /// ```
 pub struct Builder {
     config: Config,
     registry: Registry,
+    timer: Option<Arc<dyn Timer>>,
 }
 
 impl Builder {
@@ -252,6 +195,7 @@ impl Builder {
         Self {
             config,
             registry: Registry::new(),
+            timer: None,
         }
     }
 
@@ -262,24 +206,55 @@ impl Builder {
         self
     }
 
+    /// 注入时间来源，不注入就起不来，见 [`crate::Timer`]。
+    #[must_use]
+    pub fn timer(mut self, timer: Arc<dyn Timer>) -> Self {
+        self.timer = Some(timer);
+        self
+    }
+
+    /// 往注册表里补一个服务类型，[`Registry::register`] 的链式转发。
+    #[must_use]
+    pub fn service<S, F>(mut self, kind: impl Into<String>, factory: F) -> Self
+    where
+        F: Fn() -> S + Send + Sync + 'static,
+        S: crate::Service,
+    {
+        self.registry.register(kind, factory);
+        self
+    }
+
+    /// 往注册表里补一个独占线程的服务类型，[`Registry::register_exclusive`] 的
+    /// 链式转发。服务包用它把「注册类型」和「注入对象」写成一句话。
+    #[must_use]
+    pub fn exclusive_service<S, F>(mut self, kind: impl Into<String>, factory: F) -> Self
+    where
+        F: Fn() -> S + Send + Sync + 'static,
+        S: crate::Exclusive,
+    {
+        self.registry.register_exclusive(kind, factory);
+        self
+    }
+
     /// 启动节点并阻塞到所有服务退出。
     pub fn run(self) -> Result<()> {
-        run(self.config, self.registry)
+        self.config.validate()?;
+        let timer = self.timer.ok_or(Error::MissingTimer)?;
+        run(self.config, self.registry, timer)
     }
 }
 
 /// 启动节点并阻塞到所有服务退出。
 ///
 /// 流程与 C 版 `skynet_start` 一致：先起 logger 并占用 `.logger` 这个名字，
-/// 再起引导服务与定时器，最后拉起 worker 线程池。任何一个服务调用 `Ctx::abort`，
+/// 再起定时器与引导服务，最后拉起 worker 线程池。任何一个服务调用 `Ctx::abort`，
 /// 或者最后一个服务退出，都会让本函数返回。
-pub fn start(config: Config, registry: Registry) -> Result<()> {
-    Builder::new(config).registry(registry).run()
+pub fn start(config: Config, registry: Registry, timer: Arc<dyn Timer>) -> Result<()> {
+    Builder::new(config).registry(registry).timer(timer).run()
 }
 
-fn run(config: Config, registry: Registry) -> Result<()> {
-    config.validate()?;
-    let node = Node::new(&config, registry);
+fn run(config: Config, registry: Registry, timer: Arc<dyn Timer>) -> Result<()> {
+    let node = Node::new(&config, registry, timer);
 
     // 引导失败也要走一遍收尾：logger 可能已经起来了，它邮箱里的日志得刷出去，
     // 那条独占线程也得收工。对照 C 版的 skynet_context_dispatchall
@@ -288,6 +263,9 @@ fn run(config: Config, registry: Registry) -> Result<()> {
         let _ = shutdown(&node);
         return Err(err);
     }
+    // 从这一刻起，「服务数为 0」才真的意味着节点该收工了。定时器盯着这个信号，
+    // 见 [`crate::NodeRef::is_booted`]
+    node.mark_booted();
 
     // 各 worker 共享同一个不可变引用，&Node 是 Copy 的，每个闭包各拿一份
     let shared: &Node = &node;
@@ -321,25 +299,34 @@ fn run(config: Config, registry: Registry) -> Result<()> {
     Ok(())
 }
 
-/// 起 logger、引导服务与定时器，对照 C 版 `skynet_start` 里 worker 之前那一段。
+/// 按配置拉起三个系统服务，对照 C 版 `skynet_start` 里 worker 之前那一段。
 fn boot(node: &Arc<Node>, config: &Config) -> Result<()> {
-    let logger = node.new_service(&config.logservice, &config.logger)?;
-    node.set_logger(logger);
-    node.handles.register_name(logger, "logger");
-    // logger 不计入「服务数归零就退出」的判断，并且留到最后才送走，
-    // 这样关停过程中产生的日志仍然写得出来
-    node.reserve(logger);
+    // 日志最先：从这里开始，后面每一步的动静都有人记
+    let kind = config.system_kind(service::LOGGER, service::LOGGER)?;
+    if !kind.trim().is_empty() {
+        let logger = node.new_service(&kind, "")?;
+        node.set_logger(logger);
+        node.handles.register_name(logger, service::LOGGER);
+        // logger 不计入「服务数归零就退出」的判断，并且留到最后才送走，
+        // 这样关停过程中产生的日志仍然写得出来
+        node.reserve(logger);
+    }
 
-    // `init` 只递得动一个字符串，而清单是一张表，于是编成 JSON 交过去，
-    // 由引导服务自己解回来
-    let services = serde_json::to_string(&config.bootstrap.services)?;
-    node.new_service(&config.bootstrap.name, &services)?;
+    // 定时器排在引导之前，于是引导期间刻度就在走：那会儿挂的表立刻开始计时，
+    // 日志时间戳也不再是一片 0。代价是定时器服务得自己判断「节点是否已经
+    // 有过服务」，否则它一上来就会看到服务数为 0 而宣布收工
+    let kind = config.system_kind(service::TIMER, service::TIMER)?;
+    if !kind.trim().is_empty() {
+        let timer = node.new_service(&kind, "")?;
+        node.handles.register_name(timer, service::TIMER);
+        node.reserve(timer);
+    }
 
-    // 定时器必须排在引导服务之后：它一看到「活着的服务数归零」就宣布节点收工，
-    // 而引导服务出场之前那个数字本来就是 0
-    let timer = node.new_service(crate::service::TIMER, "")?;
-    node.handles.register_name(timer, "timer");
-    node.reserve(timer);
+    // 引导服务自己去读 `[bootstrap]` 段里的清单，内核不掺和
+    let kind = config.system_kind(service::BOOTSTRAP, service::BOOTSTRAP)?;
+    if !kind.trim().is_empty() {
+        node.new_service(&kind, "")?;
+    }
     Ok(())
 }
 
@@ -416,44 +403,54 @@ mod tests {
             r#"
             thread = 4
             harbor = 1
-            logger = "run/rskynet.log"
             profile = false
 
-            [bootstrap]
-            services = [{ name = "pong" }, { name = "ping", args = "100" }]
+            [logger]
+            path = "run/rskynet.log"
             "#,
         )
         .expect("配置应解析成功");
         assert_eq!(config.thread, 4);
         assert_eq!(config.harbor, 1);
-        assert_eq!(config.logger, "run/rskynet.log");
         assert!(!config.profile);
-        // 没写的字段走默认值，包括引导服务的类型名
-        assert_eq!(config.logservice, crate::service::LOGGER);
-        assert_eq!(config.bootstrap.name, crate::service::BOOTSTRAP);
-
-        let services = &config.bootstrap.services;
-        assert_eq!(services.len(), 2);
-        assert_eq!(services[0].name, "pong");
-        // 没写 args 的那项拿到空串，而不是把名字连着参数一块吞进去
-        assert_eq!(services[0].args, "");
-        assert_eq!(services[1].name, "ping");
-        assert_eq!(services[1].args, "100");
+        // 段里没写 name，系统服务就走内置的默认类型名
+        assert_eq!(
+            config
+                .system_kind(service::LOGGER, service::LOGGER)
+                .unwrap(),
+            service::LOGGER
+        );
+        // 段整个缺席也是一样
+        assert_eq!(
+            config.system_kind(service::TIMER, service::TIMER).unwrap(),
+            service::TIMER
+        );
     }
 
-    /// 参数里的空格与分号原样留给服务，不再像 sscanf 那样被拆开
+    /// 系统服务的类型名可以换掉，空串表示不拉起
     #[test]
-    fn spec_args_are_not_split() {
+    fn system_service_kind_is_configurable() {
         let config = Config::from_toml_str(
             r#"
-            [bootstrap]
-            services = [{ name = "gate", args = "0.0.0.0:8888; backlog 128" }]
+            [logger]
+            name = "my-logger"
+
+            [timer]
+            name = ""
             "#,
         )
         .expect("配置应解析成功");
         assert_eq!(
-            config.bootstrap.services[0].args,
-            "0.0.0.0:8888; backlog 128"
+            config
+                .system_kind(service::LOGGER, service::LOGGER)
+                .unwrap(),
+            "my-logger"
+        );
+        assert!(
+            config
+                .system_kind(service::TIMER, service::TIMER)
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -462,21 +459,26 @@ mod tests {
     fn invalid_config_is_rejected() {
         assert!(Config::from_toml_str("thread = 0").is_err());
         assert!(Config::from_toml_str("harbor = 256").is_err());
-        assert!(
-            Config::from_toml_str(
-                r#"[bootstrap]
-            name = "  ""#
-            )
-            .is_err()
-        );
-        assert!(
-            Config::from_toml_str(
-                r#"[bootstrap]
-            services = [{ args = "100" }]"#
-            )
-            .is_err()
-        );
         assert!(Config::from_toml_str("不认识的键 = 1").is_err());
+    }
+
+    /// 没注入时间来源就不许启动
+    #[test]
+    fn missing_timer_is_rejected() {
+        let err = Builder::new(Config::default())
+            .registry(Registry::new())
+            .run()
+            .expect_err("没注入 timer 应当启动失败");
+        assert!(matches!(err, Error::MissingTimer));
+    }
+
+    /// 配置错误比缺少 timer 先报，免得写配置的人被后一个错误带偏
+    #[test]
+    fn config_errors_come_first() {
+        let err = Builder::new(Config::default().with_thread(0))
+            .run()
+            .expect_err("线程数为 0 应当启动失败");
+        assert!(matches!(err, Error::Config(_)));
     }
 
     /// 扩展的配置段原样留着，由认领它的服务自己解析；内核不认识也不该报错
@@ -506,6 +508,21 @@ mod tests {
         assert!(config.section::<NetConfig>("cluster").unwrap().is_none());
         let empty = Config::default().with_section("net", toml::Table::new());
         assert!(empty.section::<NetConfig>("net").is_err());
+    }
+
+    /// section_mut 给服务包拼自己那一段用：段不存在就先建一张空表
+    #[test]
+    fn section_mut_creates_the_section() {
+        let mut config = Config::default();
+        config
+            .section_mut("bootstrap")
+            .insert("name".into(), "my-boot".into());
+        assert_eq!(
+            config
+                .system_kind(service::BOOTSTRAP, service::BOOTSTRAP)
+                .unwrap(),
+            "my-boot"
+        );
     }
 
     /// 仓库里附带的示例配置必须始终可用

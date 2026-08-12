@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use rskynet::{
-    BoxFuture, Config, Ctx, Error, Message, MsgType, Payload, Registry, Service, SvcCell,
+    BoxFuture, Config, ConfigExt, Ctx, Error, Message, MsgType, Payload, Registry, Service, SvcCell,
 };
 
 /// 用例观察到的现象，跨线程收集，节点退出后统一断言。
@@ -195,7 +195,6 @@ where
     let shared = journal.clone();
 
     let registry = Registry::new()
-        .with_builtins()
         .with("echo", Echo::default)
         .with("slow", SlowEcho::default)
         .with("quitter", Quitter::default)
@@ -553,7 +552,6 @@ fn relay_ring(
     let journal: Journal = Arc::new(Mutex::new(Vec::new()));
 
     let registry = Registry::new()
-        .with_builtins()
         .with("relay", move || Relay {
             next: SvcCell::new(0),
             shared: relay_state.clone(),
@@ -652,7 +650,7 @@ fn scheduling_throughput_with_idle_workers() {
 #[test]
 fn missing_bootstrap_service_fails_startup() {
     let config = Config::default().with_bootstrap_service("根本没这个服务");
-    let err = rskynet::start(config, Registry::new().with_builtins()).unwrap_err();
+    let err = rskynet::start(config, Registry::new()).unwrap_err();
     assert!(matches!(err, Error::UnknownService(_)));
 }
 
@@ -691,7 +689,6 @@ fn custom_message_types_work() {
     let journal: Journal = Arc::new(Mutex::new(Vec::new()));
     let shared = journal.clone();
     let registry = Registry::new()
-        .with_builtins()
         .with("picky", Picky::default)
         .with("driver", move || Driver {
             journal: shared.clone(),

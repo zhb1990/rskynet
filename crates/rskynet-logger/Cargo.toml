@@ -1,0 +1,13 @@
+[package]
+name = "rskynet-logger"
+description = "rskynet 的日志服务：独占一条线程写文件，业务线程只管投递"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rskynet-core = { workspace = true }
+
+serde = { workspace = true }

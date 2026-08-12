@@ -3,7 +3,7 @@
 //! [skynet](https://github.com/cloudwu/skynet) Actor 内核的 Rust 实现。
 //!
 //! **本 crate 是内核，不是给使用方直接依赖的门面**——业务代码请用 `rskynet`，
-//! 它按 feature 把内核、过程宏与网络层拼在一处。这里只放内核本体：
+//! 它按 feature 把内核、过程宏与各个服务包拼在一处。这里只放内核本体：
 //!
 //! 1. **服务即 Actor**：每个服务有独立地址与独立邮箱，彼此只靠消息往来。
 //! 2. **两级消息队列调度**：每服务一个邮箱，每 worker 一条运行队列（闲了去偷），
@@ -17,13 +17,26 @@
 //! 服务默认跑在共享的 worker 池上，也可以让它[独占一条线程][Exclusive]——
 //! 日志、定时器、网络层都是后者，于是内核不必为「专用线程」另开一套东西。
 //!
+//! ## 内核里没有服务
+//!
+//! 日志、定时器、引导这三样在 C 版里是内核的一部分，这里一个都不在：它们各是
+//! 一个独立 crate（`rskynet-logger` / `rskynet-timer` / `rskynet-bootstrap`），
+//! 与网络层走同一条接入路子——[`Registry`] 注册类型，配置里各占一段。内核这边
+//! 只留下三个约定俗成的名字（见 [`service`]）与拉起它们的顺序。
+//!
+//! 时间也一样。分层时间轮不在内核里，内核只认 [`Timer`] 这个抽象，启动前必须
+//! 由调用方注入一个实现（[`Builder::timer`]）。`ctx.sleep` 与 `ctx.now` 都从
+//! 那里取值。
+//!
 //! ## 模块划分
 //!
 //! 模块名刻意与 `skynet-src` 的文件名对齐，方便逐一比对。C 版没有对应物的是
-//! 两块：[`Exclusive`] 那套独占线程的服务，以及 [`ext`] 里给内核之外的线程用的
-//! 接口——网络层住在独立 crate 里，总得有条公开的路进得来。
+//! 三块：[`Exclusive`] 那套独占线程的服务、[`ext`] 里给内核之外的线程用的接口
+//! （服务住在独立 crate 里，总得有条公开的路进得来），以及 [`Timer`] 这个把
+//! 时间实现挡在内核之外的抽象。
 
 mod bwos;
+mod clock;
 mod context;
 mod error;
 mod exclusive;
@@ -35,11 +48,11 @@ mod server;
 mod session;
 mod start;
 mod task;
-mod timer;
 
 pub mod ext;
 pub mod service;
 
+pub use clock::Timer;
 pub use context::{Ctx, Service};
 pub use error::{Error, Result};
 pub use exclusive::{Exclusive, Idler};

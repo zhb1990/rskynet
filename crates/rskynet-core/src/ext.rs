@@ -61,6 +61,37 @@ impl NodeRef {
         self.node.sched.is_quit()
     }
 
+    /// 宣布节点收工，对照 C 版的 `CHECK_ABORT`：置上收工标记并叫醒所有服务。
+    ///
+    /// 与 [`crate::Ctx::abort`] 不同，这里不摘除任何服务，只是让 worker 与独占
+    /// 线程看到「该收摊了」。定时器实现用它来落实「最后一个服务退出即节点退出」。
+    pub fn quit(&self) {
+        self.node.quit();
+    }
+
+    /// 兜底唤醒：叫醒一个睡着的 worker 去运行队列里找活。
+    ///
+    /// 投递方漏叫的情况极少，但按节拍醒来的服务顺手 poke 一下，最坏也就是让
+    /// 睡着的 worker 早一个 tick 睁眼，代价可以忽略。
+    pub fn poke(&self) {
+        self.node.sched.poke();
+    }
+
+    /// 本节点当前活着的服务数，对照 `skynet_context_total`。
+    ///
+    /// 保留服务（日志、定时器）不计入，所以这个数归零就意味着业务全退场了。
+    pub fn service_count(&self) -> i64 {
+        self.node.total()
+    }
+
+    /// 系统服务是否都已拉起。
+    ///
+    /// 「服务数为 0」有两个截然不同的时刻：引导还没出场，和一切都已收场。想据此
+    /// 判断节点该收工的服务（定时器就是）必须先问一句这个，否则会把前者当成后者。
+    pub fn is_booted(&self) -> bool {
+        self.node.is_booted()
+    }
+
     /// 节点启动至今的厘秒数，对照 `skynet.now`。
     pub fn now(&self) -> u64 {
         self.node.timer.now()

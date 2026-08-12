@@ -2,6 +2,9 @@
 //!
 //! skynet 从 `cpath` 里 `dlopen` 加载 `.so` 模块，Rust 走静态链接，
 //! 所以改成启动前把「类型名 -> 构造函数」注册进表里，`launch` 时按名字取用。
+//!
+//! 内核不预置任何服务类型，连日志与定时器都要自己挂：它们住在各自的 crate 里，
+//! 由门面 crate `rskynet` 的 `with_builtins()` 按 feature 一次挂齐。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -92,20 +95,6 @@ impl Registry {
     {
         self.register_exclusive(kind, factory);
         self
-    }
-
-    /// 挂上内置服务：`logger`、`timer` 与 `bootstrap`，前两个各占一条线程。
-    ///
-    /// `timer` 是节点的必需品（`ctx.sleep` 与 `ctx.now` 都指着它推刻度），
-    /// [`crate::start`] 一定会拉起它，所以这一项不挂上，节点就起不来。
-    #[must_use]
-    pub fn with_builtins(self) -> Self {
-        self.with_exclusive(crate::service::LOGGER, crate::service::Logger::default)
-            .with_exclusive(crate::service::TIMER, crate::service::Timer::default)
-            .with(
-                crate::service::BOOTSTRAP,
-                crate::service::Bootstrap::default,
-            )
     }
 
     pub fn contains(&self, kind: &str) -> bool {

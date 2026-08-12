@@ -1,6 +1,6 @@
 [package]
 name = "rskynet"
-description = "用 Rust 复刻 skynet 的 Actor 内核：内核、宏与网络层的统一入口"
+description = "用 Rust 复刻 skynet 的 Actor 内核：内核、宏与各服务包的统一入口"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,13 +8,25 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["macros"]
+default = ["macros", "logger", "timer", "bootstrap"]
 # 服务样板宏。默认打开，因为它是写服务的常规姿势
 macros = ["dep:rskynet-macros"]
+# 日志服务。关掉之后 ctx.log 退回 stderr
+logger = ["dep:rskynet-logger"]
+# 定时器：时间轮加时间来源。关掉就得自己实现 Timer 并注入，否则节点起不来
+timer = ["dep:rskynet-timer"]
+# 引导服务。关掉之后要自己拉起第一个业务服务
+bootstrap = ["dep:rskynet-bootstrap"]
 # 网络层。要用 socket / gate 时打开
 net = ["dep:rskynet-net"]
 
+[dev-dependencies]
+serde = { workspace = true }
+
 [dependencies]
 rskynet-core = { workspace = true }
+rskynet-bootstrap = { workspace = true, optional = true }
+rskynet-logger = { workspace = true, optional = true }
 rskynet-macros = { workspace = true, optional = true }
 rskynet-net = { workspace = true, optional = true }
+rskynet-timer = { workspace = true, optional = true }

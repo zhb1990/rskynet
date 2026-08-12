@@ -189,9 +189,22 @@ dependencies = [
 name = "rskynet"
 version = "0.1.0"
 dependencies = [
+ "rskynet-bootstrap",
  "rskynet-core",
+ "rskynet-logger",
  "rskynet-macros",
  "rskynet-net",
+ "rskynet-timer",
+ "serde",
+]
+
+[[package]]
+name = "rskynet-bootstrap"
+version = "0.1.0"
+dependencies = [
+ "rskynet-core",
+ "serde",
+ "toml",
 ]
 
 [[package]]
@@ -210,6 +223,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rskynet-logger"
+version = "0.1.0"
+dependencies = [
+ "rskynet-core",
+ "serde",
+]
+
+[[package]]
 name = "rskynet-macros"
 version = "0.1.0"
 dependencies = [
@@ -223,6 +244,15 @@ name = "rskynet-net"
 version = "0.1.0"
 dependencies = [
  "mio",
+ "rskynet-core",
+ "serde",
+]
+
+[[package]]
+name = "rskynet-timer"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-queue",
  "rskynet-core",
  "serde",
 ]

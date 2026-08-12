@@ -10,7 +10,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use rskynet::{
-    BoxFuture, Config, Ctx, Message, MsgType, Payload, Registry, Result, Service, SvcCell,
+    BoxFuture, Config, ConfigExt, Ctx, Message, MsgType, Payload, Registry, Result, Service,
+    SvcCell,
 };
 
 /// ping 与 pong 之间的请求。同进程传递，直接塞对象，不需要序列化。
@@ -173,8 +174,8 @@ impl Ping {
 // ---------------------------------------------------------------- 启动
 
 fn main() -> Result<()> {
+    // 日志、定时器、引导这三个内置服务由 rskynet::start 按 feature 挂上
     let registry = Registry::new()
-        .with_builtins()
         .with("ping", Ping::default)
         .with("pong", Pong::default);
 

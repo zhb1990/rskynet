@@ -17,7 +17,7 @@
 //!
 //! ```no_run
 //! use std::sync::Arc;
-//! use rskynet::{BoxFuture, Config, Ctx, Message, Payload, Registry, Service};
+//! use rskynet::{BoxFuture, Config, ConfigExt, Ctx, Message, Payload, Registry, Service};
 //!
 //! struct Echo;
 //!
@@ -37,10 +37,13 @@
 //!     }
 //! }
 //!
-//! let registry = Registry::new().with_builtins().with("echo", || Echo);
+//! let registry = Registry::new().with("echo", || Echo);
 //! let config = Config::default().with_bootstrap(["echo"]);
 //! rskynet::start(config, registry).unwrap();
 //! ```
+//!
+//! 日志、定时器、引导这三个服务不必自己注册：[`start`] 会按 feature 把它们挂上，
+//! 并把时间来源注入节点。想换掉其中某一个，用 [`Builder`] 自己拼，见 [`BuilderExt`]。
 //!
 //! ## crate 构成
 //!
@@ -48,18 +51,84 @@
 //!
 //! | crate | 内容 | feature |
 //! | --- | --- | --- |
-//! | [`rskynet_core`] | Actor 内核：邮箱、调度、session、定时器 | 总是启用 |
+//! | [`rskynet_core`] | Actor 内核：邮箱、调度、session | 总是启用 |
 //! | `rskynet-macros` | 消去 `Service` 实现样板的过程宏 | `macros`（默认开） |
+//! | `rskynet-logger` | 日志服务，一个[独占线程的服务][Exclusive] | `logger`（默认开） |
+//! | `rskynet-timer` | 分层时间轮与定时器服务 | `timer`（默认开） |
+//! | `rskynet-bootstrap` | 引导服务：按清单拉起业务服务 | `bootstrap`（默认开） |
 //! | `rskynet-net` | socket 层，一个[独占线程的服务][Exclusive] | `net` |
 //!
-//! 网络层做成独立 crate 而不是内核的一个模块，是为了让内核不碰 epoll/kqueue
-//! ——它因此是纯跨平台的，也不必为了跑单元测试就拉起一套 IO。它进内核的路子
-//! 与别的服务没两样，只是用 [`Registry::with_exclusive`] 注册，于是那条阻塞在
-//! epoll 上的线程就是它自己的。真要再起子线程，[`rskynet_core::ext`] 里的
-//! [`NodeRef`] 与 [`ReplyToken`] 负责把消息与回话带回内核。
+//! 内核里一个服务都没有，连时间都不在里面：分层时间轮住在 `rskynet-timer`，内核
+//! 只认 [`Timer`] 这个抽象，启动前必须注入一个实现。这么切的好处与网络层独立是
+//! 同一个——内核不碰 epoll/kqueue、不碰文件 IO、不碰系统时钟，因此是纯跨平台的，
+//! 跑单元测试也不必拉起这些东西。服务进内核的路子彼此没两样：用 [`Registry`]
+//! 注册类型，在配置里占一段，要独占线程就用 [`Registry::with_exclusive`]。真要
+//! 再起子线程，[`rskynet_core::ext`] 里的 [`NodeRef`] 与 [`ReplyToken`] 负责把
+//! 消息与回话带回内核。
 
 pub use rskynet_core::*;
 
 /// 网络层：socket / gate / agent。
 #[cfg(feature = "net")]
 pub use rskynet_net as net;
+
+#[cfg(feature = "bootstrap")]
+pub use rskynet_bootstrap as bootstrap;
+#[cfg(feature = "logger")]
+pub use rskynet_logger as logger;
+#[cfg(feature = "timer")]
+pub use rskynet_timer as timer;
+
+/// 引导清单的链式写法：`Config::default().with_bootstrap(["echo"])`。
+#[cfg(feature = "bootstrap")]
+pub use rskynet_bootstrap::{ConfigExt, ServiceSpec};
+
+/// 把内置服务装进 [`Builder`]。
+pub trait BuilderExt {
+    /// 按 feature 挂上内置服务，并注入时间来源。
+    ///
+    /// 挂的都是约定名字（`logger` / `timer` / `bootstrap`），所以配置里不写
+    /// `name` 也能对上号。要换掉其中某一个，在这之后用自己的实现重新注册同名
+    /// 类型即可——后注册的覆盖先注册的。
+    #[must_use]
+    fn with_builtins(self) -> Self;
+}
+
+impl BuilderExt for Builder {
+    fn with_builtins(self) -> Self {
+        #[allow(unused_mut)]
+        let mut builder = self;
+        #[cfg(feature = "logger")]
+        {
+            builder = builder.exclusive_service(
+                rskynet_core::service::LOGGER,
+                rskynet_logger::Logger::default,
+            );
+        }
+        #[cfg(feature = "bootstrap")]
+        {
+            builder = builder.service(
+                rskynet_core::service::BOOTSTRAP,
+                rskynet_bootstrap::Bootstrap::default,
+            );
+        }
+        // 定时器要一次做两件事：注册服务，并把同一个时钟注入节点
+        #[cfg(feature = "timer")]
+        {
+            use rskynet_timer::BuilderExt as _;
+            builder = builder.with_wheel_timer();
+        }
+        builder
+    }
+}
+
+/// 启动节点并阻塞到所有服务退出。
+///
+/// 与 [`rskynet_core::start`] 的区别是这里会先挂上内置服务、注入时间来源，
+/// 所以使用方只管注册自己的服务类型。要自己拼这些，走 [`Builder`]。
+pub fn start(config: Config, registry: Registry) -> Result<()> {
+    Builder::new(config)
+        .registry(registry)
+        .with_builtins()
+        .run()
+}

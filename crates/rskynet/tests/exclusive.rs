@@ -1,6 +1,6 @@
 //! 独占线程服务的端到端验证。
 //!
-//! 网络层将来就长这样，所以这里拿一个最小的「轮询器」把那条路整个走一遍：它阻塞
+//! 网络层就长这样，所以这里拿一个最小的「轮询器」把那条路整个走一遍：它阻塞
 //! 在自己的事件源上（用 `mpsc` 冒充 mio 的 `Poll`），靠 `interrupt` 被叫醒，
 //! 把外部事件转成消息投给业务服务，收工时线程自己退掉。
 //!
@@ -16,9 +16,9 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rskynet_core::{
-    BoxFuture, Builder, Config, Ctx, Error, Exclusive, Idler, Message, MsgType, Payload, Registry,
-    Result, Service, SvcCell,
+use rskynet::{
+    BoxFuture, Builder, BuilderExt, Config, ConfigExt, Ctx, Error, Exclusive, Idler, Message,
+    MsgType, Payload, Registry, Result, Service, SvcCell,
 };
 use serde::Deserialize;
 
@@ -63,7 +63,7 @@ struct Trace {
     greeting: Mutex<String>,
 }
 
-/// 一个独占线程的服务：阻塞在自己的队列上，与将来的 socket 线程同形。
+/// 一个独占线程的服务：阻塞在自己的队列上，与网络层的 socket 线程同形。
 struct Poller {
     /// `interrupt` 与 `dispatch` 都往这里投事件，`idle` 在另一头等着。
     events: Sender<Event>,
@@ -227,7 +227,6 @@ fn an_exclusive_service_owns_its_thread() {
     let probe_trace = trace.clone();
     let shared = journal.clone();
     let registry = Registry::new()
-        .with_builtins()
         .with_exclusive("poller", move || Poller::new(poller_trace.clone()))
         .with("probe", move || Probe {
             journal: shared.clone(),
@@ -248,10 +247,7 @@ fn an_exclusive_service_owns_its_thread() {
     )
     .expect("配置应解析成功");
 
-    Builder::new(config)
-        .registry(registry)
-        .run()
-        .expect("节点应当正常启动并退出");
+    rskynet::start(config, registry).expect("节点应当正常启动并退出");
 
     let seen = journal.lock().unwrap();
     assert_eq!(
@@ -339,15 +335,16 @@ fn a_backlog_survives_the_shutdown() {
     let written: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let shared = written.clone();
     let registry = Registry::new()
-        .with_builtins()
         .with_exclusive("sink", move || Sink {
             written: shared.clone(),
         })
         .with("flooder", || Flooder { total: TOTAL });
 
     let config = Config::default().with_bootstrap(["sink", "flooder"]);
+    // 这条用 Builder 走一遍：与 rskynet::start 等价，顺便验证 with_builtins 的写法
     Builder::new(config)
         .registry(registry)
+        .with_builtins()
         .run()
         .expect("节点应当正常启动并退出");
 

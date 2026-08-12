@@ -23,6 +23,7 @@ use arc_swap::ArcSwapOption;
 use futures_util::future::BoxFuture;
 use parking_lot::Mutex;
 
+use crate::clock::Timer;
 use crate::context::{Ctx, Service};
 use crate::error::{Error, Result};
 use crate::exclusive::Exclusive;
@@ -33,7 +34,6 @@ use crate::mq::{Mailbox, Ready, Scheduler, Work};
 use crate::session::SessionTable;
 use crate::start::Config;
 use crate::task::TaskSet;
-use crate::timer::{Timer, Wheel};
 
 /// 一个服务的运行时上下文。
 pub(crate) struct ServiceContext {
@@ -370,7 +370,8 @@ fn join_all(threads: Vec<JoinHandle<()>>) -> Option<Box<dyn Any + Send + 'static
 pub(crate) struct Node {
     pub(crate) sched: Scheduler,
     pub(crate) handles: HandleStorage,
-    pub(crate) timer: Timer,
+    /// 时间来源，启动方注入，实现在内核之外，见 [`crate::Timer`]。
+    pub(crate) timer: Arc<dyn Timer>,
     modules: Registry,
     /// 独占服务的线程句柄，节点收尾时按它逐个 join。
     ///
@@ -380,6 +381,11 @@ pub(crate) struct Node {
     exclusives: Mutex<HashMap<u32, JoinHandle<()>>>,
     /// 活着的服务数，归零即整个节点退出，对照 `skynet_context_total`。
     total: AtomicI64,
+    /// 系统服务是否都已拉起。
+    ///
+    /// 定时器要靠它分辨两个同样是「服务数为 0」的时刻：引导还没出场，和一切都已
+    /// 收场。它自己排在引导之前起，光看服务数会把前者当成后者。
+    booted: AtomicBool,
     /// logger 服务的 handle，0 表示还没起来。
     logger: AtomicU32,
     /// 节点配置原样留一份：服务在自己的 `init` 里靠 [`crate::NodeRef::section`]
@@ -390,14 +396,15 @@ pub(crate) struct Node {
 }
 
 impl Node {
-    pub(crate) fn new(config: &Config, modules: Registry) -> Arc<Node> {
+    pub(crate) fn new(config: &Config, modules: Registry, timer: Arc<dyn Timer>) -> Arc<Node> {
         Arc::new(Node {
             sched: Scheduler::new(config.thread),
             handles: HandleStorage::new(config.harbor),
-            timer: Timer::new(),
+            timer,
             modules,
             exclusives: Mutex::new(HashMap::new()),
             total: AtomicI64::new(0),
+            booted: AtomicBool::new(false),
             logger: AtomicU32::new(0),
             config: config.clone(),
             profile: config.profile,
@@ -406,6 +413,15 @@ impl Node {
 
     pub(crate) fn total(&self) -> i64 {
         self.total.load(Ordering::Acquire)
+    }
+
+    /// 系统服务都拉起来了，见 [`Node::is_booted`]。
+    pub(crate) fn mark_booted(&self) {
+        self.booted.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_booted(&self) -> bool {
+        self.booted.load(Ordering::Acquire)
     }
 
     pub(crate) fn config(&self) -> &Config {
@@ -779,24 +795,14 @@ impl Node {
     }
 
     /// 挂定时器，对照 `skynet_timeout`。
+    ///
+    /// 零延迟不必惊动时间来源：直接回包，语义上等价于「本刻度就到期」，
+    /// 也让 `ctx.yield_now()` 这条最常走的路少绕一圈。
     pub(crate) fn timeout(&self, handle: u32, ticks: u32, session: i32) {
         if ticks == 0 {
             let _ = self.send_raw(0, handle, MsgType::RESPONSE, session, Payload::None);
         } else {
-            self.timer.add(handle, session, ticks);
-        }
-    }
-
-    /// 派发到期的定时器，由定时器服务调用，`wheel` 是它独占持有的时间轮。
-    pub(crate) fn fire_timers(&self, wheel: &mut Wheel) {
-        for event in self.timer.update(wheel) {
-            let _ = self.send_raw(
-                0,
-                event.handle,
-                MsgType::RESPONSE,
-                event.session,
-                Payload::None,
-            );
+            self.timer.timeout(handle, session, ticks);
         }
     }
 
@@ -847,6 +853,27 @@ pub(crate) mod tests {
 
     impl Exclusive for NullExclusive {}
 
+    /// 测试用的时间来源：刻度从不前进，挂上的表也不会到期。内核的单元测试只关心
+    /// 消息与调度，真正的时间轮在 `rskynet-timer` 里自测。
+    #[derive(Default)]
+    pub(crate) struct StubTimer;
+
+    impl Timer for StubTimer {
+        fn timeout(&self, _handle: u32, _session: i32, _ticks: u32) {}
+
+        fn now(&self) -> u64 {
+            0
+        }
+
+        fn wall_clock(&self) -> u64 {
+            0
+        }
+
+        fn start_seconds(&self) -> u64 {
+            0
+        }
+    }
+
     pub(crate) fn test_node() -> Arc<Node> {
         test_node_with(Config::default())
     }
@@ -855,7 +882,7 @@ pub(crate) mod tests {
         let registry = Registry::new()
             .with("null", NullService::default)
             .with_exclusive("solo", NullExclusive::default);
-        Node::new(&config, registry)
+        Node::new(&config, registry, Arc::new(StubTimer))
     }
 
     /// 给 handle 表的单元测试用：造一个不参与调度的空壳上下文。

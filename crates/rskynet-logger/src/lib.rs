@@ -1,23 +1,41 @@
+//! # rskynet-logger
+//!
 //! 日志服务，对照 `service-src/service_logger.c`。
 //!
 //! 内核的 `Ctx::log` 并不直接写文件，而是把日志当成一条 `TEXT` 消息发给本服务
 //! ——这样写日志就是一次投递，不会在业务线程上做 IO。
 //!
-//! 它是个[独占线程服务][crate::Exclusive]：写文件是阻塞 IO，让它占着共享 worker
-//! 不合适。两个钩子都走默认实现，也就是「没日志可写就阻塞在 park 上」。
+//! 它是个[独占线程服务][rskynet_core::Exclusive]：写文件是阻塞 IO，让它占着共享
+//! worker 不合适。两个钩子都走默认实现，也就是「没日志可写就阻塞在 park 上」。
+//!
+//! ## 配置
+//!
+//! ```toml
+//! [logger]
+//! # 换成自己的实现就改这里，内核按它去注册表里找
+//! name = "logger"
+//! # 日志文件路径，留空则只写标准输出
+//! path = "run/rskynet.log"
+//! ```
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
-use futures_util::future::BoxFuture;
+use rskynet_core::service::LOGGER;
+use rskynet_core::{
+    BoxFuture, Ctx, Exclusive, Message, MsgType, Registry, Result, Service, SvcCell,
+};
+use serde::Deserialize;
 
-use crate::context::{Ctx, Service};
-use crate::error::Result;
-use crate::exclusive::Exclusive;
-use crate::message::{Message, MsgType};
-use crate::task::SvcCell;
+/// `[logger]` 段。`name` 归内核解析，这里只关心写到哪。
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct LoggerConfig {
+    /// 日志文件路径，留空表示只写标准输出。
+    path: String,
+}
 
 #[derive(Default)]
 pub struct Logger {
@@ -56,9 +74,10 @@ impl Logger {
 }
 
 impl Service for Logger {
-    fn init(self: Arc<Self>, _ctx: Ctx, args: String) -> BoxFuture<'static, Result<()>> {
+    fn init(self: Arc<Self>, ctx: Ctx, _args: String) -> BoxFuture<'static, Result<()>> {
         Box::pin(async move {
-            let path = args.trim().to_string();
+            let config: LoggerConfig = ctx.node().section(LOGGER)?.unwrap_or_default();
+            let path = config.path.trim().to_string();
             if !path.is_empty() {
                 self.open(&path)?;
                 *self.path.borrow_mut() = path;
@@ -94,3 +113,16 @@ impl Service for Logger {
 }
 
 impl Exclusive for Logger {}
+
+/// 把日志服务挂进注册表。
+pub trait RegistryExt {
+    /// 用约定的名字注册 [`Logger`]，内核默认拉起的就是它。
+    #[must_use]
+    fn with_logger(self) -> Self;
+}
+
+impl RegistryExt for Registry {
+    fn with_logger(self) -> Self {
+        self.with_exclusive(LOGGER, Logger::default)
+    }
+}
