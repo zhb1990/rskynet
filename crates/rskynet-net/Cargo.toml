@@ -1,0 +1,13 @@
+[package]
+name = "rskynet-net"
+description = "rskynet 的网络层：一条 socket 线程驱动 mio，事件以 PTYPE_SOCKET 消息汇入内核"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rskynet-core = { workspace = true }
+mio = { workspace = true }
+serde = { workspace = true }

@@ -14,6 +14,7 @@ use std::task::{Context, Poll};
 use futures_util::future::BoxFuture;
 
 use crate::error::Result;
+use crate::ext::{NodeRef, ReplyToken};
 use crate::message::{Addr, Message, MsgType, Payload};
 use crate::server::ServiceContext;
 
@@ -77,6 +78,13 @@ impl Ctx {
         self.inner.node.handles.harbor()
     }
 
+    /// 节点的对外把手，扩展 crate（网络层等）由此进入内核。
+    ///
+    /// 业务代码用不着它：`send` / `call` / `launch` 这些都在 `Ctx` 上。
+    pub fn node(&self) -> NodeRef {
+        NodeRef::new(self.inner.node.clone())
+    }
+
     fn resolve(&self, addr: impl Into<Addr>) -> Result<u32> {
         self.inner.node.resolve(&addr.into())
     }
@@ -125,6 +133,42 @@ impl Ctx {
     /// `call` 的 `MsgType::USER` 快捷写法。
     pub async fn request(&self, dest: impl Into<Addr>, payload: Payload) -> Result<Payload> {
         self.call(dest, MsgType::USER, payload).await
+    }
+
+    /// 向内核之外的线程发起一次请求并等它回话。
+    ///
+    /// 与 [`Ctx::call`] 的区别只在对端不是服务：闭包收到一个
+    /// [`ReplyToken`]，把它交给别的线程（socket 线程、线程池、C 库的回调……），
+    /// 那边办完事调 [`ReplyToken::reply`]，这里的 `await` 就醒过来。
+    /// 挂起期间本服务照常处理其它消息，与 `call` 一模一样。
+    ///
+    /// 这是网络层「下一条命令给 socket 线程，等它返回结果」的底座。
+    ///
+    /// ```ignore
+    /// let reply = ctx.call_external(|token| {
+    ///     commands.send(Command::Listen { addr, token });
+    /// }).await?;
+    /// ```
+    ///
+    /// 闭包在返回前就被调用，所以对端抢先回话也不会丢——回包会存在 session 表里
+    /// 等第一次 poll 来取。token 被丢弃而没回话时，这里会得到
+    /// [`crate::Error::CallFailed`] 而不是永久挂起。
+    pub async fn call_external<F>(&self, f: F) -> Result<Payload>
+    where
+        F: FnOnce(ReplyToken),
+    {
+        let session = self.inner.sessions.alloc();
+        f(ReplyToken::new(
+            self.inner.node.clone(),
+            self.handle(),
+            session,
+        ));
+        Call {
+            ctx: &self.inner,
+            session,
+            finished: false,
+        }
+        .await
     }
 
     /// 应答一条请求，对照 `skynet.ret`。

@@ -207,6 +207,7 @@ cargo run --example ping_pong
 | `task.rs` | Lua 协程池 | 服务内 executor、`SvcCell` |
 | `service/logger.rs` | `service_logger.c` | 日志服务 |
 | `service/bootstrap.rs` | `bootstrap.lua` | 引导服务 |
+| `ext.rs` | 无对应 | 内核对外的扩展接口：`NodeRef` / `Plugin` / `ReplyToken`，见下文 |
 
 ## 为什么服务状态可以不加锁
 
@@ -237,9 +238,11 @@ struct Counter { hits: SvcCell<u64> }
 
 已实现：服务生命周期（launch / exit / kill / abort）、消息与自定义协议号、session RPC、服务内并发、本地名字表、分层时间轮、日志服务、引导服务、TOML 配置、worker 权重调度与工作窃取、过载检测、退出时给在途请求回错误。
 
-尚未实现（下一版）：socket / gate / agent 网络层、harbor / cluster 跨节点、monitor 死循环检测、debug_console、消息序列化协议。
+尚未实现（下一版）：socket / gate / agent 网络层、消去 `Service` 样板的过程宏、harbor / cluster 跨节点、monitor 死循环检测、debug_console、消息序列化协议。
 
-因为内核不碰 epoll/kqueue，目前是**跨平台**的，Windows 上可以直接 `cargo run`。网络层会以独立 crate（`crates/rskynet-net`）接入，socket 线程通过同一个「推消息进邮箱」的入口汇入，不影响内核。
+前两项的 crate 与内核这侧的接缝已经就位（`crates/rskynet-net`、`crates/rskynet-macros`，见「网络层为什么在内核之外」），本体还没写。
+
+因为内核不碰 epoll/kqueue，目前是**跨平台**的，Windows 上可以直接 `cargo run`。
 
 ## 性能
 
@@ -267,17 +270,41 @@ cargo test --release -- --ignored --nocapture
 ## 工程结构
 
 ```
-Cargo.toml              workspace 根
-config/dev.toml         节点配置示例
-crates/rskynet/         内核 crate
-  src/                  按 skynet-src 的文件名组织（bwos.rs 例外，C 版没有对应物）
-  examples/ping_pong.rs 示例
-  tests/kernel.rs       端到端测试
+Cargo.toml                 workspace 根
+config/dev.toml            节点配置示例
+crates/rskynet-core/       内核
+  src/                     按 skynet-src 的文件名组织（bwos.rs 与 ext.rs 例外，C 版没有对应物）
+  tests/plugin.rs          扩展点的端到端验证
+crates/rskynet/            门面：按 feature 把下面几个拼在一处，使用方只依赖它
+  examples/ping_pong.rs    示例
+  tests/kernel.rs          端到端测试
+crates/rskynet-macros/     过程宏，消去 Service 实现的样板（骨架，未实现）
+crates/rskynet-net/        网络层，以插件形式接入内核（骨架，未实现）
 ```
 
-第一版只有一个成员 crate。用 workspace 布局是为了将来加 `rskynet-net`、`rskynet-cluster`、`rskynet-macros` 时只需往 `members` 里加一行，不必挪目录改 import。
+使用方只写一行依赖，要什么按 feature 开：
 
-业务代码不需要放进本 crate：`rskynet` 是 lib crate，对外提供 `Service` trait 与 `rskynet::start(config, registry)`，使用方在自己的 app crate 里写 `main` 并注册服务——对应 skynet 里「内核是宿主、服务是外挂模块」的形态。
+```toml
+rskynet = { version = "0.1", features = ["net"] }   # macros 默认已开
+```
+
+业务代码不需要放进本仓：`rskynet` 是 lib crate，对外提供 `Service` trait 与 `rskynet::start(config, registry)`，使用方在自己的 app crate 里写 `main` 并注册服务——对应 skynet 里「内核是宿主、服务是外挂模块」的形态。
+
+### 网络层为什么在内核之外
+
+C 版的 socket 线程与内核同住一个编译单元，`skynet_socket_*` 直接碰内部结构。这里把它拆出去，图的是**内核不碰 epoll/kqueue**：内核因此是纯跨平台的，单元测试也不必为了跑一条消息就拉起一套 IO。
+
+代价是得有一套公开的接缝，`ext.rs` 就是那道缝，三件东西：
+
+| 扩展点 | 作用 | 对应 skynet |
+| --- | --- | --- |
+| `NodeRef` | 从任意线程往服务邮箱投消息 | `skynet_context_push` |
+| `Plugin` | 跟着节点一起起落的自有线程，三个钩子：`init` 建资源并把对象放进扩展槽、`run` 独占一条线程、`shutdown` 把它从阻塞里叫醒 | `thread_socket` |
+| `ReplyToken` | 一张可以跨线程搬的回执单，外部线程办完活调 `reply`，服务侧那句 `ctx.call_external(…).await` 就醒过来 | socket 线程回一条带 session 的 `PTYPE_RESPONSE` |
+
+于是网络层写起来是这样的：`SocketServer`（命令队列 + mio `Waker`）在 `init` 里进扩展槽，服务侧的扩展 trait 靠 `ctx.node().extension::<SocketServer>()` 取回它，`listen` / `connect` / `send` 都是「把命令连同一张回执单丢给 socket 线程，然后 `await`」；socket 事件则走 `NodeRef::send` 以 `MsgType::SOCKET` 投给连接的属主服务，与定时器回包同一条路径。配置各占一段（网络层读 `[net]`），内核只负责原样传过去。
+
+`Plugin` 的 `shutdown` 有一处时序是硬要求：它必须**在 worker 与定时器线程都 join 完之后**才调用，而 `run` 那条线程要等它返回后才被 join。顺序一颠倒，挂在 epoll 里的 socket 线程就永远醒不过来，`start()` 随之卡死。`crates/rskynet-core/tests/plugin.rs` 拿一个最小插件把这条时序连同扩展槽、外部回包一起钉住了。
 
 ## 测试
 

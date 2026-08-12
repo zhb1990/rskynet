@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/rskynet"]
+members = ["crates/*"]
 
 [workspace.package]
 version = "0.1.0"
@@ -9,14 +9,22 @@ rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/zhuhb/rskynet"
 
-# 统一管理依赖版本，后续新增 rskynet-net / rskynet-cluster 等成员时直接复用
+# 统一管理依赖版本，后续新增 rskynet-cluster 等成员时直接复用
 [workspace.dependencies]
+rskynet-core = { version = "0.1.0", path = "crates/rskynet-core" }
+rskynet-macros = { version = "0.1.0", path = "crates/rskynet-macros" }
+rskynet-net = { version = "0.1.0", path = "crates/rskynet-net" }
+
 arc-swap = "1"
 crossbeam-queue = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+mio = { version = "1", features = ["os-poll", "net"] }
 parking_lot = "0.12"
+proc-macro2 = "1"
+quote = "1"
 serde = { version = "1", features = ["derive"] }
 slab = "0.4"
+syn = { version = "2", features = ["full"] }
 thiserror = "2"
 toml = "0.9"
 

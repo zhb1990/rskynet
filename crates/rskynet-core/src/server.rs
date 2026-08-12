@@ -14,13 +14,14 @@
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 
 use futures_util::future::BoxFuture;
 use parking_lot::Mutex;
 
 use crate::context::{Ctx, Service};
 use crate::error::{Error, Result};
+use crate::ext::Extensions;
 use crate::handle::HandleStorage;
 use crate::message::{Addr, Message, MsgType, Payload};
 use crate::module::Registry;
@@ -279,6 +280,12 @@ pub(crate) struct Node {
     pub(crate) handles: HandleStorage,
     pub(crate) timer: Timer,
     modules: Registry,
+    /// 插件登记的扩展对象，启动阶段一次性填好，之后只读。
+    ///
+    /// 用 `OnceLock` 而不是普通字段，是因为插件的 `init` 需要一个
+    /// [`crate::NodeRef`]（也就是 `Arc<Node>`）才跑得起来——节点得先造出来。
+    /// 只写一次、之后纯读，所以读路径上没有锁也没有原子 RMW。
+    extensions: OnceLock<Extensions>,
     /// 活着的服务数，归零即整个节点退出，对照 `skynet_context_total`。
     total: AtomicI64,
     /// logger 服务的 handle，0 表示还没起来。
@@ -293,6 +300,7 @@ impl Node {
             handles: HandleStorage::new(config.harbor),
             timer: Timer::new(),
             modules,
+            extensions: OnceLock::new(),
             total: AtomicI64::new(0),
             logger: AtomicU32::new(0),
             profile: config.profile,
@@ -301,6 +309,16 @@ impl Node {
 
     pub(crate) fn total(&self) -> i64 {
         self.total.load(Ordering::Acquire)
+    }
+
+    /// 填扩展槽。只能在任何服务创建之前调一次，多余的调用直接忽略。
+    pub(crate) fn set_extensions(&self, extensions: Extensions) {
+        let _ = self.extensions.set(extensions);
+    }
+
+    /// 扩展槽。没有插件时一直是 `None`。
+    pub(crate) fn extensions(&self) -> Option<&Extensions> {
+        self.extensions.get()
     }
 
     pub(crate) fn profile(&self) -> bool {

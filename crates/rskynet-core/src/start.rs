@@ -1,19 +1,23 @@
 //! 节点启动与线程模型，对照 `skynet-src/skynet_start.c`。
 //!
-//! 线程构成与 C 版一致（少了 socket 线程与 monitor 线程，见 README 的取舍说明）：
+//! 线程构成与 C 版一致（少了 monitor 线程，见 README 的取舍说明）：
 //!
 //! - 1 个定时器线程：每 2.5ms 推进时间轮，派发到期消息，并兜底唤醒睡着的 worker
-//! - N 个 worker 线程：从全局队列取服务、跑消息与任务
+//! - N 个 worker 线程：从运行队列取服务、跑消息与任务
+//! - 每个 [`Plugin`] 一条线程：C 版的 socket 线程在这里是插件，见 [`crate::ext`]
 //!
 //! worker 的 `weight` 沿用 C 版那张表：前 4 个线程一次只处理一条消息（响应快），
 //! 后面的线程一次处理 `队列长度 >> weight` 条（吞吐高）。
 
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
 use crate::error::{Error, Result};
+use crate::ext::{Extensions, NodeRef, Plugin};
 use crate::module::Registry;
 use crate::server::Node;
 use crate::timer::Wheel;
@@ -26,7 +30,7 @@ const WORKER_WEIGHTS: [i32; 32] = [
 
 /// 节点配置，对照 skynet 的 `config` 文件。
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Config {
     /// worker 线程数。
     pub thread: usize,
@@ -40,6 +44,10 @@ pub struct Config {
     pub logger: String,
     /// 是否统计各服务的消息处理耗时。
     pub profile: bool,
+    /// 插件的配置段：`[net]` 这类内核不认领的表原样留在这里，
+    /// 由插件在 [`Plugin::init`] 里用 [`Config::section`] 各取所需。
+    #[serde(flatten)]
+    extra: toml::Table,
 }
 
 impl Default for Config {
@@ -53,6 +61,7 @@ impl Default for Config {
             logservice: crate::service::LOGGER.to_string(),
             logger: String::new(),
             profile: true,
+            extra: toml::Table::new(),
         }
     }
 }
@@ -86,6 +95,23 @@ impl Config {
         self
     }
 
+    /// 取某个插件的配置段，例如 `config.section::<NetConfig>("net")`。
+    ///
+    /// 段不存在时返回 `Ok(None)`，由插件自己决定是走默认值还是报错。
+    pub fn section<T: DeserializeOwned>(&self, name: &str) -> Result<Option<T>> {
+        match self.extra.get(name) {
+            None => Ok(None),
+            Some(value) => Ok(Some(T::deserialize(value.clone())?)),
+        }
+    }
+
+    /// 塞一个配置段，给「不从 TOML 来」的场景（测试、代码里搭配置）用。
+    #[must_use]
+    pub fn with_section(mut self, name: impl Into<String>, section: toml::Table) -> Self {
+        self.extra.insert(name.into(), toml::Value::Table(section));
+        self
+    }
+
     fn validate(&self) -> Result<()> {
         if self.thread == 0 {
             return Err(Error::Config("worker 线程数必须大于 0".into()));
@@ -96,7 +122,60 @@ impl Config {
         if self.bootstrap.trim().is_empty() {
             return Err(Error::Config("必须指定引导服务".into()));
         }
+        // `flatten` 把不认识的键统统收进 extra，于是「拼错内核字段就报错」这条防线
+        // 得自己补上：插件配置一律写成表，落在顶层的散键只可能是拼错
+        for (key, value) in &self.extra {
+            if !value.is_table() {
+                return Err(Error::Config(format!(
+                    "不认识的配置项 `{key}`；插件配置要写成 `[{key}]` 这样的段"
+                )));
+            }
+        }
         Ok(())
+    }
+}
+
+/// 节点构建器：要挂插件时用它，否则直接用 [`start`]。
+///
+/// ```no_run
+/// # use rskynet_core::{Builder, Config, Registry};
+/// Builder::new(Config::default())
+///     .registry(Registry::new().with_builtins())
+///     .run()
+///     .unwrap();
+/// ```
+pub struct Builder {
+    config: Config,
+    registry: Registry,
+    plugins: Vec<Arc<dyn Plugin>>,
+}
+
+impl Builder {
+    pub fn new(config: Config) -> Self {
+        Self {
+            config,
+            registry: Registry::new(),
+            plugins: Vec::new(),
+        }
+    }
+
+    /// 服务类型表，覆盖式设置。
+    #[must_use]
+    pub fn registry(mut self, registry: Registry) -> Self {
+        self.registry = registry;
+        self
+    }
+
+    /// 挂一个插件。按挂载顺序 `init`，倒序 `shutdown`。
+    #[must_use]
+    pub fn plugin<P: Plugin>(mut self, plugin: P) -> Self {
+        self.plugins.push(Arc::new(plugin));
+        self
+    }
+
+    /// 启动节点并阻塞到所有服务退出。
+    pub fn run(self) -> Result<()> {
+        run(self.config, self.registry, self.plugins)
     }
 }
 
@@ -115,8 +194,24 @@ pub(crate) fn split_cmdline(cmdline: &str) -> (&str, &str) {
 /// 再起引导服务，最后拉起线程池。任何一个服务调用 `Ctx::abort`，或者最后一个
 /// 服务退出，都会让本函数返回。
 pub fn start(config: Config, registry: Registry) -> Result<()> {
+    Builder::new(config).registry(registry).run()
+}
+
+fn run(config: Config, registry: Registry, plugins: Vec<Arc<dyn Plugin>>) -> Result<()> {
     config.validate()?;
     let node = Node::new(&config, registry);
+    let node_ref = NodeRef::new(node.clone());
+
+    // 插件的 init 排在所有服务之前：服务可能在自己的 init 里就去取扩展对象
+    let mut extensions = Extensions::new();
+    for plugin in &plugins {
+        if let Some(value) = plugin.init(&node_ref, &config)? {
+            // 注意不能写 value.type_id()：那取到的是 `Arc<dyn Any>` 自己的类型，
+            // 得先解引用成 trait object 才拿得到具体类型
+            extensions.insert(value.as_ref().type_id(), value);
+        }
+    }
+    node.set_extensions(extensions);
 
     let logger = node.new_service(&config.logservice, &config.logger)?;
     node.set_logger(logger);
@@ -138,17 +233,54 @@ pub fn start(config: Config, registry: Registry) -> Result<()> {
     // 各线程共享同一个不可变引用，&Node 是 Copy 的，每个闭包各拿一份
     let shared: &Node = &node;
     thread::scope(|scope| {
-        thread::Builder::new()
+        for plugin in &plugins {
+            let plugin = plugin.clone();
+            let node = node_ref.clone();
+            thread::Builder::new()
+                .name(format!("rskynet-{}", plugin.name()))
+                .spawn_scoped(scope, move || plugin.run(node))
+                .expect("插件线程创建失败");
+        }
+
+        let timer = thread::Builder::new()
             .name("rskynet-timer".into())
             .spawn_scoped(scope, move || timer_loop(shared))
             .expect("定时器线程创建失败");
 
+        let mut workers = Vec::with_capacity(config.thread);
         for id in 0..config.thread {
             let weight = WORKER_WEIGHTS.get(id).copied().unwrap_or(0);
-            thread::Builder::new()
-                .name(format!("rskynet-worker-{id}"))
-                .spawn_scoped(scope, move || worker_loop(shared, id, weight))
-                .expect("worker 线程创建失败");
+            workers.push(
+                thread::Builder::new()
+                    .name(format!("rskynet-worker-{id}"))
+                    .spawn_scoped(scope, move || worker_loop(shared, id, weight))
+                    .expect("worker 线程创建失败"),
+            );
+        }
+
+        // 这里必须显式 join。插件线程多半阻塞在自己的 IO 上（socket 线程就挂在
+        // epoll 里），只有 shutdown 钩子敲一下才会看到 is_quit——而 scope 收尾时
+        // 的隐式 join 排在钩子之前，两者的先后一颠倒，start 就永远不返回了。
+        //
+        // 代价是 panic 得自己接：隐式 join 会把线程里的 panic 一路抛出去，显式
+        // join 只是拿到一个 Err。服务里的 panic 不能就这么吞掉，所以留到最后重抛。
+        let mut panic = None;
+        for worker in workers {
+            if let Err(payload) = worker.join() {
+                panic = panic.or(Some(payload));
+            }
+        }
+        if let Err(payload) = timer.join() {
+            panic = panic.or(Some(payload));
+        }
+        // 倒序关停：后挂的插件可能用着先挂的那个的资源
+        for plugin in plugins.iter().rev() {
+            plugin.shutdown(&node_ref);
+        }
+        // 重抛必须排在钩子之后：插件线程还等着被叫醒，而 scope 在展开的路上也要
+        // 把它们 join 掉，钩子没调就成了死等
+        if let Some(payload) = panic {
+            std::panic::resume_unwind(payload);
         }
     });
 
@@ -255,6 +387,35 @@ mod tests {
         assert!(Config::from_toml_str("harbor = 256").is_err());
         assert!(Config::from_toml_str(r#"bootstrap = "  ""#).is_err());
         assert!(Config::from_toml_str("不认识的键 = 1").is_err());
+    }
+
+    /// 插件的配置段原样留着，由插件自己解析；内核不认识也不该报错
+    #[test]
+    fn plugin_sections_are_kept_for_plugins() {
+        #[derive(Debug, Deserialize)]
+        struct NetConfig {
+            listen: String,
+            backlog: u32,
+        }
+
+        let config = Config::from_toml_str(
+            r#"
+            thread = 2
+
+            [net]
+            listen = "0.0.0.0:8888"
+            backlog = 128
+            "#,
+        )
+        .expect("插件段不该被内核拒掉");
+        let net: NetConfig = config.section("net").unwrap().expect("应取到 net 段");
+        assert_eq!(net.listen, "0.0.0.0:8888");
+        assert_eq!(net.backlog, 128);
+
+        // 没有的段返回 None，段里的字段类型不对则报错
+        assert!(config.section::<NetConfig>("cluster").unwrap().is_none());
+        let empty = Config::default().with_section("net", toml::Table::new());
+        assert!(empty.section::<NetConfig>("net").is_err());
     }
 
     /// 仓库里附带的示例配置必须始终可用

@@ -1,18 +1,20 @@
 [package]
 name = "rskynet"
-description = "用 Rust 复刻 skynet 的 Actor 内核：每服务邮箱 + 全局队列 + worker 线程池，以 Future 取代 Lua 协程"
+description = "用 Rust 复刻 skynet 的 Actor 内核：内核、宏与网络层的统一入口"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["macros"]
+# 服务样板宏。默认打开，因为它是写服务的常规姿势
+macros = ["dep:rskynet-macros"]
+# 网络层。要用 socket / gate 时打开
+net = ["dep:rskynet-net"]
+
 [dependencies]
-arc-swap = { workspace = true }
-crossbeam-queue = { workspace = true }
-futures-util = { workspace = true }
-parking_lot = { workspace = true }
-serde = { workspace = true }
-slab = { workspace = true }
-thiserror = { workspace = true }
-toml = { workspace = true }
+rskynet-core = { workspace = true }
+rskynet-macros = { workspace = true, optional = true }
+rskynet-net = { workspace = true, optional = true }
