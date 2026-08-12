@@ -1,0 +1,18 @@
+thread = 4
+harbor = 0
+profile = true
+
+[logger]
+name = "logger"
+path = ""
+
+[timer]
+name = "timer"
+tick_micros = 2500
+
+[bootstrap]
+name = "bootstrap"
+services = [
+    { name = "pong" },
+    { name = "ping", args = "1000" },
+]

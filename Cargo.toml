@@ -21,6 +21,7 @@ rskynet-timer = { version = "0.1.0", path = "crates/rskynet-timer" }
 arc-swap = "1"
 crossbeam-queue = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+inventory = "0.3"
 mio = { version = "1", features = ["os-poll", "net"] }
 parking_lot = "0.12"
 proc-macro2 = "1"

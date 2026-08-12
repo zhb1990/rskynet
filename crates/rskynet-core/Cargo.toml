@@ -7,8 +7,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# 只有测试用得上：验证 `#[service(crate = ::rskynet_core)]` 那条覆盖路径。内核本体
-# 不依赖宏，宏也不依赖内核，所以这不成环
+# 只有测试用得上：内部单元测试与外部集成测试统一使用
+# `#[service(crate = ::rskynet_core)]`。内核本体不依赖宏，宏也不依赖内核，所以不成环。
 [dev-dependencies]
 rskynet-macros = { workspace = true }
 
@@ -16,6 +16,7 @@ rskynet-macros = { workspace = true }
 arc-swap = { workspace = true }
 crossbeam-queue = { workspace = true }
 futures-util = { workspace = true }
+inventory = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

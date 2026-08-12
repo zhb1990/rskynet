@@ -35,6 +35,10 @@
 //! （服务住在独立 crate 里，总得有条公开的路进得来），以及 [`Timer`] 这个把
 //! 时间实现挡在内核之外的抽象。
 
+// 给过程宏一个在 crate 内外都稳定的绝对路径；也避免 rust-analyzer 在单元测试
+// 的宏展开中把 `::rskynet_core` 误判成不存在的外部 crate。
+extern crate self as rskynet_core;
+
 mod bwos;
 mod clock;
 mod context;
@@ -59,13 +63,19 @@ pub use error::{Error, Result};
 pub use exclusive::{Exclusive, Idler};
 pub use ext::{NodeRef, ReplyToken};
 pub use message::{Addr, Message, MsgType, Payload};
-pub use module::Registry;
+pub use module::{AutoService, Registry};
 pub use payload::{FromPayload, IntoPayload};
 pub use start::{Builder, Config, start};
 pub use task::SvcCell;
 
 /// 服务方法的返回类型。从本 crate 导出，使用方不必再直接依赖 `futures`。
 pub use futures_util::future::BoxFuture;
+
+/// 过程宏展开所需的实现细节，不属于稳定的业务 API。
+#[doc(hidden)]
+pub mod __private {
+    pub use inventory;
+}
 
 /// 写日志的便捷宏，等价于 `ctx.log(format!(...))`。
 ///

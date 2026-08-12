@@ -9,8 +9,8 @@ use quote::quote;
 use syn::punctuated::Punctuated;
 use syn::token::Comma;
 use syn::{
-    Error, Expr, FnArg, Ident, ImplItem, ImplItemFn, ItemImpl, PatType, Path, Result, ReturnType,
-    Signature, Token, Type, parse_quote,
+    Error, Expr, FnArg, Ident, ImplItem, ImplItemFn, ItemImpl, LitStr, PatType, Path, Result,
+    ReturnType, Signature, Token, Type, parse_quote,
 };
 
 /// 注册方式：共享 worker 池还是独占一条线程。决定要不要认 `idle` / `interrupt`。
@@ -44,21 +44,47 @@ pub(crate) fn expand(attr: TokenStream, item: TokenStream, flavor: Flavor) -> To
     }
 }
 
-/// 宏参数，目前只有一个 `crate = <路径>`。
 struct Args {
     krate: Path,
+    name: Option<LitStr>,
+    factory: Option<Path>,
 }
 
 impl syn::parse::Parse for Args {
     fn parse(input: syn::parse::ParseStream) -> Result<Self> {
         let mut krate = None;
+        let mut name = None;
+        let mut factory = None;
         while !input.is_empty() {
             if input.peek(Token![crate]) {
                 input.parse::<Token![crate]>()?;
                 input.parse::<Token![=]>()?;
                 krate = Some(input.parse()?);
+            } else if input.peek(Ident) {
+                let key: Ident = input.parse()?;
+                input.parse::<Token![=]>()?;
+                match key.to_string().as_str() {
+                    "name" => {
+                        if name.is_some() {
+                            return Err(Error::new_spanned(key, "`name` 写了两遍"));
+                        }
+                        name = Some(input.parse()?);
+                    }
+                    "factory" => {
+                        if factory.is_some() {
+                            return Err(Error::new_spanned(key, "`factory` 写了两遍"));
+                        }
+                        factory = Some(input.parse()?);
+                    }
+                    _ => {
+                        return Err(Error::new_spanned(
+                            key,
+                            "只认 `crate`、`name` 与 `factory` 这三个参数",
+                        ));
+                    }
+                }
             } else {
-                return Err(input.error("只认 `crate = <路径>` 这一个参数"));
+                return Err(input.error("只认 `crate`、`name` 与 `factory` 这三个参数"));
             }
             if input.is_empty() {
                 break;
@@ -68,13 +94,32 @@ impl syn::parse::Parse for Args {
         // 默认引门面 crate：使用方绝大多数时候依赖的是它
         Ok(Args {
             krate: krate.unwrap_or_else(|| parse_quote!(::rskynet)),
+            name,
+            factory,
         })
     }
 }
 
 fn try_expand(attr: TokenStream, item: TokenStream, flavor: Flavor) -> Result<TokenStream> {
-    let Args { krate } = syn::parse2(attr)?;
+    let Args {
+        krate,
+        name,
+        factory,
+    } = syn::parse2(attr)?;
     let mut block: ItemImpl = syn::parse2(item)?;
+
+    if factory.is_some() && name.is_none() {
+        return Err(Error::new(
+            Span::call_site(),
+            "`factory` 只有和 `name` 一起写才有意义",
+        ));
+    }
+    if name.is_some() && !block.generics.params.is_empty() {
+        return Err(Error::new_spanned(
+            &block.generics,
+            "泛型服务不能自动注册；请具体化类型后手工加入 Registry",
+        ));
+    }
 
     if let Some((_, path, _)) = &block.trait_ {
         return Err(Error::new_spanned(
@@ -182,6 +227,34 @@ fn try_expand(attr: TokenStream, item: TokenStream, flavor: Flavor) -> Result<To
         }
     });
 
+    let auto_registration = name.map(|name| {
+        let is_exclusive = flavor == Flavor::Exclusive;
+        let factory = factory
+            .map(|path| quote!(#path))
+            .unwrap_or_else(|| quote!(<#self_ty as ::core::default::Default>::default));
+        let registration = if is_exclusive {
+            quote!(registry.register_exclusive(#name, #factory);)
+        } else {
+            quote!(registry.register(#name, #factory);)
+        };
+        quote! {
+            const _: () = {
+                fn __rskynet_register(registry: &mut #krate::Registry) {
+                    #registration
+                }
+
+                #krate::__private::inventory::submit! {
+                    #krate::AutoService::new(
+                        #name,
+                        #is_exclusive,
+                        ::core::concat!(::core::module_path!(), "::", ::core::stringify!(#self_ty)),
+                        __rskynet_register,
+                    )
+                }
+            };
+        }
+    });
+
     Ok(quote! {
         #inherent
 
@@ -191,6 +264,8 @@ fn try_expand(attr: TokenStream, item: TokenStream, flavor: Flavor) -> Result<To
         }
 
         #exclusive
+
+        #auto_registration
     })
 }
 

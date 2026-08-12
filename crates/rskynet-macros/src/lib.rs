@@ -97,6 +97,9 @@ use proc_macro::TokenStream;
 /// 没有 `#[msg(default)]` 时，认不出协议号的消息会记一行日志，对方在等回话的话
 /// 还会收到一个错误应答——总比让它永久挂着好。
 ///
+/// 写上 `name = "echo"` 会把服务提交到链接期自动注册表，默认通过 `Default`
+/// 构造。特殊构造方式可写 `factory = make_echo`；不写 `name` 时完全不自动注册。
+///
 /// [`FromPayload`]: https://docs.rs/rskynet-core/latest/rskynet_core/trait.FromPayload.html
 /// [`IntoPayload`]: https://docs.rs/rskynet-core/latest/rskynet_core/trait.IntoPayload.html
 #[proc_macro_attribute]

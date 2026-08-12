@@ -1,32 +1,19 @@
-//! ping-pong 示例：展示 rskynet 的三件核心能力。
-//!
-//! 1. `call` 把「发请求 - 等回包」写成一句 `await`，读起来像同步代码
-//! 2. `spawn` 在服务内起并发任务，一个任务挂起时服务照常干活
-//! 3. `sleep` 走定时器回包，与 `call` 共用同一套 session 机制
-//!
-//! 跑法：`cargo run --example ping_pong`
-
 use std::sync::Arc;
 use std::time::Instant;
 
-use rskynet::{Config, ConfigExt, Ctx, Message, MsgType, Payload, Registry, Result, SvcCell};
+use rskynet::{Ctx, Message, Payload, Result, SvcCell};
 
-/// ping 与 pong 之间的请求。同进程传递，直接塞对象，不需要序列化。
 enum Ask {
-    /// 打一个回合，把球号原样打回来。
     Ball(u64),
-    /// 先睡 `centis` 厘秒再应答，用来观察并发。
     Delayed { centis: u32, tag: String },
 }
-
-// ---------------------------------------------------------------- pong
 
 #[derive(Default)]
 struct Pong {
     served: SvcCell<u64>,
 }
 
-#[rskynet::service]
+#[rskynet::service(name = "pong")]
 impl Pong {
     async fn init(&self, ctx: Ctx) -> Result<()> {
         if !ctx.register_name("pong") {
@@ -47,7 +34,6 @@ impl Pong {
                 let _ = ctx.reply(&msg, Payload::of(Ask::Ball(round)));
             }
             Ask::Delayed { centis, tag } => {
-                // 这里挂起的只是「处理这条消息」的任务，pong 仍在正常收其它消息
                 ctx.sleep(centis).await;
                 let _ = ctx.reply(&msg, Payload::text(tag));
             }
@@ -55,21 +41,15 @@ impl Pong {
     }
 }
 
-// ---------------------------------------------------------------- ping
-
 #[derive(Default)]
 struct Ping {
-    /// 心跳任务跑了多少轮。服务内是单线程的，所以 SvcCell 足够，不需要锁。
     beats: SvcCell<u64>,
 }
 
-#[rskynet::service]
+#[rskynet::service(name = "ping")]
 impl Ping {
     async fn init(&self, ctx: Ctx, args: String) -> Result<()> {
         let rounds: u64 = args.trim().parse().unwrap_or(100);
-
-        // 心跳任务：与下面的主流程并发跑，证明服务不会被 await 卡住。
-        // 节点关停时它会随服务一起被丢弃，所以这里可以放心写死循环。
         let beat_ctx = ctx.clone();
         let beats = self.clone();
         ctx.spawn(async move {
@@ -81,7 +61,6 @@ impl Ping {
 
         self.round_trips(&ctx, rounds).await?;
         self.concurrent_asks(&ctx).await?;
-
         rskynet::log!(ctx, "心跳共跳了 {} 次", self.beats.borrow());
         rskynet::log!(
             ctx,
@@ -92,7 +71,6 @@ impl Ping {
         Ok(())
     }
 
-    /// 连续往返，测一发消息一个来回的成本。
     async fn round_trips(&self, ctx: &Ctx, rounds: u64) -> Result<()> {
         let started = Instant::now();
         for round in 1..=rounds {
@@ -115,11 +93,9 @@ impl Ping {
         Ok(())
     }
 
-    /// 同时发三个「先睡再回」的请求，验证服务内真的是并发而不是排队。
     async fn concurrent_asks(&self, ctx: &Ctx) -> Result<()> {
         let delays = [30u32, 10, 20];
         let done: Arc<SvcCell<Vec<String>>> = Arc::new(SvcCell::default());
-
         for centis in delays {
             let task_ctx = ctx.clone();
             let done = done.clone();
@@ -138,42 +114,17 @@ impl Ping {
         }
 
         let started = Instant::now();
-        // 等三个任务都完成：自己也只是一个任务，睡着的时候别人照常跑
         while done.borrow().len() < delays.len() {
             ctx.sleep(1).await;
         }
         let cost = started.elapsed();
-
         rskynet::log!(
             ctx,
-            "三个请求（30/10/20 厘秒）的完成顺序是 {:?}，总耗时 {:?}",
+            "三个请求的完成顺序是 {:?}，总耗时 {:?}",
             done.borrow(),
             cost
         );
-        assert!(
-            cost.as_millis() < 500,
-            "并发执行的总耗时应接近最慢的那个请求，而不是三者之和"
-        );
+        assert!(cost.as_millis() < 500, "三个请求应并发执行");
         Ok(())
     }
-}
-
-// ---------------------------------------------------------------- 启动
-
-fn main() -> Result<()> {
-    // 日志、定时器、引导这三个内置服务由 rskynet::start 按 feature 挂上
-    let registry = Registry::new()
-        .with("ping", Ping::default)
-        .with("pong", Pong::default);
-
-    // 也可以用 Config::from_toml_file("config/dev.toml")
-    let config = Config::default()
-        .with_thread(4)
-        .with_bootstrap([("pong", ""), ("ping", "1000")]);
-
-    println!(
-        "=== rskynet ping-pong 示例，MsgType::USER = {:?} ===",
-        MsgType::USER
-    );
-    rskynet::start(config, registry)
 }

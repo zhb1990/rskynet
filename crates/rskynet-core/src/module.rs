@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use crate::context::Service;
 use crate::exclusive::Exclusive;
+use crate::{Error, Result};
 
 /// 一个新造出来的服务实例。
 ///
@@ -25,6 +26,35 @@ pub(crate) struct Instance {
 /// 服务构造函数。每次 `launch` 都会调用一次，产出一个全新的服务实例。
 pub(crate) type ServiceFactory = Arc<dyn Fn() -> Instance + Send + Sync>;
 
+/// 由 `#[service(name = "...")]` / `#[exclusive(name = "...")]` 提交的链接期服务描述。
+///
+/// 通常不需要手工构造；使用 [`Registry::from_auto`] 收集当前二进制中全部描述。
+pub struct AutoService {
+    pub name: &'static str,
+    pub exclusive: bool,
+    pub source: &'static str,
+    register: fn(&mut Registry),
+}
+
+impl AutoService {
+    #[doc(hidden)]
+    pub const fn new(
+        name: &'static str,
+        exclusive: bool,
+        source: &'static str,
+        register: fn(&mut Registry),
+    ) -> Self {
+        Self {
+            name,
+            exclusive,
+            source,
+            register,
+        }
+    }
+}
+
+inventory::collect!(AutoService);
+
 /// 服务类型表。
 #[derive(Clone, Default)]
 pub struct Registry {
@@ -34,6 +64,29 @@ pub struct Registry {
 impl Registry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 收集所有已经链接进当前二进制、且通过服务宏显式命名的服务类型。
+    ///
+    /// 名字重复时拒绝构造；链接顺序不会决定哪个实现胜出。
+    pub fn from_auto() -> Result<Self> {
+        let mut services: Vec<&'static AutoService> =
+            inventory::iter::<AutoService>.into_iter().collect();
+        services.sort_unstable_by_key(|service| (service.name, service.source));
+        for pair in services.windows(2) {
+            if pair[0].name == pair[1].name {
+                return Err(Error::Config(format!(
+                    "自动注册的服务类型 `{}` 重复：{} 与 {}",
+                    pair[0].name, pair[0].source, pair[1].source
+                )));
+            }
+        }
+
+        let mut registry = Self::new();
+        for service in services {
+            (service.register)(&mut registry);
+        }
+        Ok(registry)
     }
 
     /// 注册一个服务类型。

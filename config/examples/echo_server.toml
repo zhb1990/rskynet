@@ -1,0 +1,24 @@
+thread = 4
+harbor = 0
+profile = true
+
+[logger]
+name = "logger"
+path = ""
+
+[timer]
+name = "timer"
+tick_micros = 2500
+
+[bootstrap]
+name = "bootstrap"
+services = [
+    { name = "net" },
+    { name = "echo" },
+]
+
+[net]
+events = 1024
+max_socket = 65536
+min_read_buffer = 64
+warn_size = 1048576

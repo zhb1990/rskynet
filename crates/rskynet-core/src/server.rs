@@ -845,14 +845,14 @@ pub(crate) mod tests {
     #[derive(Default)]
     pub(crate) struct NullService;
 
-    #[rskynet_macros::service(crate = crate)]
+    #[rskynet_macros::service(crate = ::rskynet_core, name = "null")]
     impl NullService {}
 
     /// 同上，但独占一条线程：起来就阻塞在 park 上，等着被摘除。
     #[derive(Default)]
     pub(crate) struct NullExclusive;
 
-    #[rskynet_macros::exclusive(crate = crate)]
+    #[rskynet_macros::exclusive(crate = ::rskynet_core, name = "solo")]
     impl NullExclusive {}
 
     /// 测试用的时间来源：刻度从不前进，挂上的表也不会到期。内核的单元测试只关心
@@ -881,9 +881,9 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn test_node_with(config: Config) -> Arc<Node> {
-        let registry = Registry::new()
-            .with("null", NullService::default)
-            .with_exclusive("solo", NullExclusive::default);
+        let registry = Registry::from_auto().expect("测试服务的自动注册表应当有效");
+        assert!(registry.contains("null"), "共享测试服务应被自动注册");
+        assert!(registry.contains("solo"), "独占测试服务应被自动注册");
         Node::new(&config, registry, Arc::new(StubTimer))
     }
 
@@ -1017,7 +1017,7 @@ pub(crate) mod tests {
         #[derive(Default)]
         struct SelfWaker;
 
-        #[rskynet_macros::service(crate = crate)]
+        #[rskynet_macros::service(crate = ::rskynet_core)]
         impl SelfWaker {
             async fn dispatch(&self) {
                 std::future::poll_fn(|cx| {

@@ -1,11 +1,10 @@
-//! TCP 回声服务器：`cargo run --example echo_server`，然后 `telnet 127.0.0.1 8888`。
+use rskynet::net::{self, SocketEvent};
+use rskynet::{Ctx, MsgType, Result};
 
-use rskynet::{Config, ConfigExt, Ctx, MsgType, Registry, Result};
-use rskynet_net::{self as net, RegistryExt, SocketEvent};
-
+#[derive(Default)]
 struct Echo;
 
-#[rskynet::service]
+#[rskynet::service(name = "echo")]
 impl Echo {
     async fn init(&self, ctx: Ctx) -> Result<()> {
         let listener = net::listen(&ctx, "127.0.0.1:8888").await?;
@@ -33,10 +32,4 @@ impl Echo {
             SocketEvent::Udp { .. } => {}
         }
     }
-}
-
-fn main() -> Result<()> {
-    let registry = Registry::new().with_net().with("echo", || Echo);
-    let config = Config::default().with_bootstrap(["net", "echo"]);
-    rskynet::start(config, registry)
 }

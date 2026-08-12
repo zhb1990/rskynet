@@ -190,7 +190,7 @@ fn main() -> Result<()> {
 跑内置示例：
 
 ```bash
-cargo run --example ping_pong
+cargo run -p rskynet-examples -- config/examples/ping_pong.toml
 ```
 
 它会演示三件事：`call` 的同步写法、`spawn` 的服务内并发、`sleep` 走定时器。输出大致是：
@@ -252,7 +252,8 @@ impl Calculator {
 网络层用 `net` feature 打开。它只注册服务类型，不会自动拉起；在 `[bootstrap]`
 清单中先启动 `net`，业务服务再调用 `listen` / `connect` / `start` / `send`，并用
 `#[msg(MsgType::SOCKET)]` 接收 `SocketEvent`。可直接运行
-`cargo run --example echo_server`，再用 `telnet 127.0.0.1 8888` 验证回声。
+`cargo run -p rskynet-examples -- config/examples/echo_server.toml`，再用
+`telnet 127.0.0.1 8888` 验证回声。
 
 ## 源码对照
 
@@ -350,7 +351,6 @@ config/dev.toml            节点配置示例
 crates/rskynet-core/       内核
   src/                     按 skynet-src 的文件名组织（bwos.rs / clock.rs / exclusive.rs / ext.rs 例外，C 版没有对应物）
 crates/rskynet/            门面：按 feature 把下面几个拼在一处，使用方只依赖它
-  examples/                ping_pong 与 TCP echo_server 示例
   tests/kernel.rs          端到端测试
   tests/exclusive.rs       独占线程服务的端到端验证
   tests/builtins.rs        三个内置服务与内核的接缝：启动顺序、配置默认值、时间来源
@@ -359,6 +359,8 @@ crates/rskynet-timer/      分层时间轮与定时器服务
 crates/rskynet-bootstrap/  引导服务
 crates/rskynet-macros/     service / exclusive / msg 过程宏
 crates/rskynet-net/        TCP + UDP 网络层，一个独占线程的服务
+crates/rskynet-main/       可选标准启动器：读 TOML 并收集自动注册服务
+crates/rskynet-examples/   Ping / Pong / Echo 与统一示例入口
 ```
 
 使用方只写一行依赖，要什么按 feature 开：
@@ -368,6 +370,33 @@ rskynet = { version = "0.1", features = ["net"] }   # macros / logger / timer / 
 ```
 
 业务代码不需要放进本仓：`rskynet` 是 lib crate，对外提供 `Service` trait 与 `rskynet::start(config, registry)`，使用方在自己的 app crate 里写 `main` 并注册服务——对应 skynet 里「内核是宿主、服务是外挂模块」的形态。
+
+服务也可以选择链接期自动注册。给服务宏写上 `name`，默认用 `Default` 创建实例；
+特殊构造函数可通过 `factory` 指定：
+
+```rust
+#[derive(Default)]
+struct Echo;
+
+#[rskynet::service(name = "echo")]
+impl Echo {}
+```
+
+再让应用依赖可选的 `rskynet-main`，入口只剩：
+
+```rust
+fn main() -> std::process::ExitCode {
+    rskynet_main::run()
+}
+```
+
+它要求命令行提供一份 TOML，并从已经链接进当前二进制的服务中构造注册表。配置
+只能选择启动哪些已链接服务，不能动态加载未成为应用依赖的 Rust crate。仓库内示例：
+
+```bash
+cargo run -p rskynet-examples -- config/examples/ping_pong.toml
+cargo run -p rskynet-examples -- config/examples/echo_server.toml
+```
 
 ### 内核里为什么没有服务
 
@@ -417,7 +446,7 @@ C 版的 socket 线程与内核同住一个编译单元，`skynet_socket_*` 直�
 ```bash
 cargo test                                   # 单元测试 + 端到端测试
 cargo test --release -- --ignored            # 压测（单服务吞吐 + 两个调度吞吐）
-cargo run --example ping_pong                # 示例
+cargo run -p rskynet-examples -- config/examples/ping_pong.toml  # 示例
 ```
 
 几个压测跑在同一个进程里会互相干扰，要单独看某一个的读数就加上用例名：
