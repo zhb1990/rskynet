@@ -28,7 +28,13 @@ fn named_macros_populate_the_auto_registry() -> Result<()> {
     kinds.sort_unstable();
     assert_eq!(
         kinds,
-        vec![("auto-dedicated", true), ("auto-shared", false)]
+        vec![
+            ("auto-dedicated", true),
+            ("auto-shared", false),
+            ("bootstrap", false),
+            ("logger", true),
+            ("net", true),
+        ]
     );
     Ok(())
 }

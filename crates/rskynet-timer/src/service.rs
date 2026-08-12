@@ -62,6 +62,9 @@ impl TimerService {
     }
 }
 
+// 这里不能写 `name = "timer"` 做宏自动注册：TimerService::new 需要接收由
+// Builder 同时注入内核的同一个 Arc<WheelTimer>，而自动注册工厂只能是无参数函数。
+// 注册与注入必须由 BuilderExt::with_wheel_timer 一次完成。
 #[rskynet_macros::exclusive(crate = ::rskynet_core)]
 impl TimerService {
     async fn init(&self, ctx: Ctx) -> Result<()> {

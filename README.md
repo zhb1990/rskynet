@@ -381,6 +381,11 @@ struct Echo;
 impl Echo {}
 ```
 
+内置的 `logger`、`bootstrap` 和 `net` 都使用这种宏注册；其中 `net` 指定
+`factory = NetService::new`。`timer` 是例外：它的工厂需要捕获一个
+`Arc<WheelTimer>`，而且同一个时钟还要注入内核，无法由无参数的宏工厂独立完成，
+所以仍由 `BuilderExt::with_wheel_timer` 同时注册服务并注入时钟。
+
 默认启用的 `main` feature 提供标准入口：
 
 ```rust

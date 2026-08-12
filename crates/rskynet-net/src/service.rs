@@ -132,7 +132,11 @@ impl Default for NetService {
     }
 }
 
-#[rskynet_macros::exclusive(crate = ::rskynet_core)]
+#[rskynet_macros::exclusive(
+    crate = ::rskynet_core,
+    name = "net",
+    factory = NetService::new
+)]
 impl NetService {
     async fn init(&self, ctx: Ctx, args: String) -> Result<()> {
         let config: NetConfig = ctx.node().section(NAME)?.unwrap_or_default();

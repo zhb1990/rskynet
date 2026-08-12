@@ -70,7 +70,7 @@ impl Logger {
     }
 }
 
-#[rskynet_macros::exclusive(crate = ::rskynet_core)]
+#[rskynet_macros::exclusive(crate = ::rskynet_core, name = "logger")]
 impl Logger {
     async fn init(&self, ctx: Ctx) -> Result<()> {
         let config: LoggerConfig = ctx.node().section(LOGGER)?.unwrap_or_default();

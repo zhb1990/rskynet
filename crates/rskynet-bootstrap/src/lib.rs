@@ -76,7 +76,7 @@ struct BootstrapConfig {
 #[derive(Default)]
 pub struct Bootstrap;
 
-#[rskynet_macros::service(crate = ::rskynet_core)]
+#[rskynet_macros::service(crate = ::rskynet_core, name = "bootstrap")]
 impl Bootstrap {
     async fn init(&self, ctx: Ctx) -> Result<()> {
         let config: BootstrapConfig = ctx.node().section(BOOTSTRAP)?.unwrap_or_default();
