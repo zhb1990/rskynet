@@ -29,6 +29,8 @@ tls = ["net", "dep:rskynet-tls"]
 http = ["net", "dep:rskynet-http"]
 # 为 HTTP 层增加 HTTPS 客户端与 TLS 服务端传输
 https = ["http", "tls", "rskynet-http/tls"]
+# WebSocket 协议；wss 另外组合 `https` feature
+websocket = ["http", "rskynet-http/websocket"]
 # 跨节点通信：按需开启，同时带上底层网络服务
 cluster = ["net", "bootstrap", "dep:rskynet-cluster", "dep:toml"]
 

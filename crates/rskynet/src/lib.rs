@@ -88,6 +88,10 @@ pub use rskynet_tls as tls;
 #[cfg(feature = "http")]
 pub use rskynet_http as http;
 
+/// WebSocket 客户端、服务端升级与消息类型。
+#[cfg(feature = "websocket")]
+pub use rskynet_http::websocket;
+
 /// 可选的 Protobuf 跨节点通信层。
 #[cfg(feature = "cluster")]
 pub use rskynet_cluster as cluster;

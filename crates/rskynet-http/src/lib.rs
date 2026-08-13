@@ -6,6 +6,8 @@ mod config;
 mod error;
 mod server;
 mod transport;
+#[cfg(feature = "websocket")]
+pub mod websocket;
 
 use rskynet_core::Registry;
 
@@ -15,6 +17,11 @@ pub use config::{HttpClientConfig, HttpServerConfig};
 pub use error::HttpError;
 pub use server::{HttpListenerId, HttpServer, ServerRequest, ServerResponder};
 pub use ureq_proto::http;
+#[cfg(feature = "websocket")]
+pub use websocket::{
+    WebSocket, WebSocketClient, WebSocketClientConfig, WebSocketId, WebSocketSender,
+    WebSocketUpgradeOptions,
+};
 
 pub type Result<T> = std::result::Result<T, HttpError>;
 pub const NAME: &str = client::NAME;

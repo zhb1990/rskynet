@@ -26,6 +26,8 @@ enum ServerProto {
     Provide(Reply<ProvideResponse>),
     SendBody(Reply<SendBody>),
     Responding,
+    #[cfg(feature = "websocket")]
+    WebSocket(Arc<crate::websocket::SharedSocket>),
 }
 
 struct Connection {
@@ -48,6 +50,8 @@ struct Connection {
 #[derive(Default)]
 struct ServerState {
     next_listener: u64,
+    #[cfg(feature = "websocket")]
+    next_websocket: u64,
     listeners: HashMap<TransportId, HttpListenerId>,
     connections: HashMap<TransportId, Connection>,
 }
@@ -216,6 +220,54 @@ pub struct ServerRequest {
     pub responder: ServerResponder,
 }
 
+#[cfg(feature = "websocket")]
+impl ServerRequest {
+    /// 验证 WebSocket Upgrade 请求、发送 101，并把连接切换到 WebSocket 协议。
+    pub async fn upgrade_websocket(
+        self,
+        ctx: &Ctx,
+        options: crate::websocket::WebSocketUpgradeOptions,
+    ) -> Result<crate::websocket::WebSocket> {
+        options.validate()?;
+        let Self {
+            request,
+            mut responder,
+            ..
+        } = self;
+        let request = request.map(|_| ());
+        if let Some(protocol) = options.protocol.as_deref() {
+            let offered = request
+                .headers()
+                .get_all("Sec-WebSocket-Protocol")
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .flat_map(|value| value.split(','))
+                .map(str::trim)
+                .any(|value| value == protocol);
+            if !offered {
+                return Err(HttpError::Protocol(
+                    "选中的 WebSocket 子协议不在客户端候选列表中".into(),
+                ));
+            }
+        }
+        let mut response = tungstenite::handshake::server::create_response(&request)?;
+        if let Some(protocol) = options.protocol.as_deref() {
+            response.headers_mut().insert(
+                "Sec-WebSocket-Protocol",
+                protocol
+                    .parse()
+                    .map_err(|_| HttpError::Protocol("WebSocket 子协议无效".into()))?,
+            );
+        }
+        let socket = responder
+            .handle
+            .upgrade_websocket(ctx, response, &options)
+            .await?;
+        responder.active = false;
+        Ok(crate::websocket::WebSocket::new(socket))
+    }
+}
+
 #[derive(Clone)]
 pub struct ServerResponder {
     handle: ServerBodyHandle,
@@ -276,6 +328,91 @@ pub(crate) struct ServerBodyHandle {
 }
 
 impl ServerBodyHandle {
+    #[cfg(feature = "websocket")]
+    async fn upgrade_websocket(
+        &self,
+        ctx: &Ctx,
+        response: Response<()>,
+        options: &crate::websocket::WebSocketUpgradeOptions,
+    ) -> Result<Arc<crate::websocket::SharedSocket>> {
+        let (transport, bytes, tail, websocket_id) = {
+            let mut state = self.core.state.borrow_mut();
+            state.next_websocket = state.next_websocket.wrapping_add(1).max(1);
+            let websocket_id = crate::websocket::WebSocketId(state.next_websocket);
+            let connection = state
+                .connections
+                .get_mut(&self.transport)
+                .ok_or(HttpError::BodyClosed)?;
+            let proto = connection
+                .proto
+                .take()
+                .ok_or(HttpError::InvalidState("服务端协议状态丢失"))?;
+            let provide = match proto {
+                ServerProto::Provide(value) => value,
+                other => {
+                    connection.proto = Some(other);
+                    return Err(HttpError::InvalidState("WebSocket 请求体尚未结束"));
+                }
+            };
+            let mut send = provide.provide(response)?;
+            let mut bytes = Vec::new();
+            while !send.is_finished() {
+                let mut output = vec![
+                    0;
+                    self.core
+                        .config
+                        .max_header_size
+                        .saturating_sub(bytes.len())
+                        .max(1)
+                ];
+                let used = send.write(&mut output)?;
+                if used == 0 {
+                    return Err(HttpError::Protocol("序列化 101 响应没有进展".into()));
+                }
+                bytes.extend_from_slice(&output[..used]);
+                if bytes.len() > self.core.config.max_header_size {
+                    return Err(HttpError::BackpressureLimit {
+                        actual: bytes.len(),
+                        limit: self.core.config.max_header_size,
+                    });
+                }
+            }
+            if !matches!(send.proceed(), SendResponseResult::Cleanup(_)) {
+                return Err(HttpError::Protocol("101 响应不应包含 body".into()));
+            }
+            let tail = std::mem::take(&mut connection.input);
+            (connection.transport, bytes, tail, websocket_id)
+        };
+        let shared =
+            crate::websocket::SharedSocket::server(ctx, websocket_id, transport, tail, options, {
+                let core = Arc::downgrade(&self.core);
+                Arc::new(move || {
+                    if let Some(core) = core.upgrade() {
+                        core.remove_connection(transport);
+                    }
+                })
+            })?;
+        {
+            let mut state = self.core.state.borrow_mut();
+            let connection = state
+                .connections
+                .get_mut(&self.transport)
+                .ok_or(HttpError::BodyClosed)?;
+            connection.proto = Some(ServerProto::WebSocket(shared.clone()));
+            connection.body_ended = true;
+            connection.chunks.clear();
+        }
+        if let Err(error) = transport.send_wait(ctx, bytes).await {
+            shared.abort();
+            self.core.remove_connection(transport);
+            return Err(error);
+        }
+        // `tail` 已由 `from_partially_read` 放入 tungstenite 的读缓冲。即使网络层不再
+        // 产生 Data 事件，也要立即驱动一次，避免与请求头同包到达的首帧滞留。
+        shared.on_data(ctx, Vec::new()).await?;
+        Ok(shared)
+    }
+
     pub(crate) fn abort_incoming(&self) {
         let should_abort = self
             .core
@@ -571,6 +708,22 @@ impl ServerCore {
         transport: TransportId,
         data: Vec<u8>,
     ) -> Result<Vec<ServerRequest>> {
+        #[cfg(feature = "websocket")]
+        {
+            let websocket =
+                self.state
+                    .borrow()
+                    .connections
+                    .get(&transport)
+                    .and_then(|connection| match connection.proto.as_ref() {
+                        Some(ServerProto::WebSocket(shared)) => Some(shared.clone()),
+                        _ => None,
+                    });
+            if let Some(websocket) = websocket {
+                websocket.on_data(ctx, data).await?;
+                return Ok(Vec::new());
+            }
+        }
         {
             let mut state = self.state.borrow_mut();
             let Some(connection) = state.connections.get_mut(&transport) else {
@@ -697,6 +850,23 @@ impl ServerCore {
         if self.state.borrow().listeners.contains_key(&transport) {
             self.state.borrow_mut().listeners.remove(&transport);
             return;
+        }
+        #[cfg(feature = "websocket")]
+        {
+            let websocket =
+                self.state
+                    .borrow()
+                    .connections
+                    .get(&transport)
+                    .and_then(|connection| match connection.proto.as_ref() {
+                        Some(ServerProto::WebSocket(shared)) => Some(shared.clone()),
+                        _ => None,
+                    });
+            if let Some(websocket) = websocket {
+                self.state.borrow_mut().connections.remove(&transport);
+                websocket.on_closed(error);
+                return;
+            }
         }
         if let Some(connection) = self.state.borrow_mut().connections.get_mut(&transport) {
             connection.error = Some(error.unwrap_or_else(|| "连接已关闭".into()));

@@ -29,6 +29,9 @@ pub enum HttpError {
     ServiceUnavailable(String),
     #[error("当前状态不允许该操作：{0}")]
     InvalidState(&'static str),
+    #[cfg(feature = "websocket")]
+    #[error("WebSocket 错误：{0}")]
+    WebSocket(#[from] tungstenite::Error),
 }
 
 impl From<ureq_proto::Error> for HttpError {

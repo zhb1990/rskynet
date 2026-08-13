@@ -277,6 +277,87 @@ HTTP/1.1 用 `http` feature 打开，HTTPS 用 `https`（会同时启用 `http` 
 `ureq-proto` 的 Sans-IO HTTP/1.1 状态机，支持 keep-alive、chunked、
 `100-continue`、流式 body、超时和高低水位背压。
 
+WebSocket 用 `websocket` feature 打开，协议和握手由 `tungstenite` 驱动。服务端仍
+内嵌在业务 actor 的 `HttpServer` 中；客户端则由业务 actor 自己持有
+`WebSocketClient`，不使用共享 `.http-client` 服务或 HTTP 连接池。`websocket`
+支持 `ws://`，同时启用 `https` 后支持由 `rskynet-tls` 承载的 `wss://`。运行时
+`ws://` 需要 `[net]`，`wss://` 需要 `[tls]`，但都不需要 `[http-client]`：
+
+```toml
+rskynet = { version = "0.1", features = ["websocket"] }          # ws
+rskynet = { version = "0.1", features = ["websocket", "https"] } # ws + wss
+```
+
+服务端在检查 Origin、Authorization 等业务头后升级请求；升级时会保留 HTTP 解析器
+尚未消费的首帧数据：
+
+```rust
+for request in self.http.on_socket(&ctx, event).await? {
+    if request.request.uri().path() == "/ws" {
+        let mut socket = request
+            .upgrade_websocket(
+                &ctx,
+                WebSocketUpgradeOptions::default().with_protocol("chat"),
+            )
+            .await?;
+        let task_ctx = ctx.clone();
+        ctx.spawn(async move {
+            while let Ok(Some(message)) = socket.recv(&task_ctx).await {
+                if message.is_text() || message.is_binary() {
+                    let _ = socket.send(&task_ctx, message).await;
+                }
+            }
+        });
+    }
+}
+```
+
+客户端连接应在 `init` 完成后启动的任务里创建：
+
+```rust
+let client = self.websockets.clone();
+let task_ctx = ctx.clone();
+ctx.spawn(async move {
+    let request = ClientRequestBuilder::new(
+        "wss://example.com/chat".parse().unwrap(),
+    )
+    .with_header("Authorization", "Bearer token")
+    .with_sub_protocol("chat");
+    let Ok((mut socket, _response)) = client.connect(&task_ctx, request).await else {
+        return;
+    };
+    while let Ok(Some(message)) = socket.recv(&task_ctx).await {
+        // 处理 message
+    }
+});
+```
+
+actor 把属于客户端的 transport 事件交回本地驱动器；同一 actor 还持有 HTTP 服务端
+时，先按 ID 路由客户端事件，剩余事件再交给 `HttpServer`：
+
+```rust
+#[msg(MsgType::SOCKET)]
+async fn on_socket(&self, ctx: Ctx, event: SocketEvent) {
+    if self.websockets.handles_socket(event.id()) {
+        let _ = self.websockets.on_socket(&ctx, event).await;
+    } else {
+        let _ = self.http.on_socket(&ctx, event).await;
+    }
+}
+
+#[msg(MsgType::TLS)]
+async fn on_tls(&self, ctx: Ctx, event: TlsEvent) {
+    if self.websockets.handles_tls(event.id()) {
+        let _ = self.websockets.on_tls(&ctx, event).await;
+    } else {
+        let _ = self.http.on_tls(&ctx, event).await;
+    }
+}
+```
+
+`WebSocket` 及其 `WebSocketSender` 只能在创建连接的 actor 内使用。其他 actor 应创建
+自己的连接，或通过业务消息请求属主 actor 代发。
+
 `[cluster]` 同样会自动补上 `net`。这些自动服务统一去重，不能再手工列入
 `[bootstrap].services`；配置了对应段却没有编译相应 feature 时，启动会明确报错。
 
@@ -444,7 +525,7 @@ crates/rskynet-macros/     service / exclusive / msg / signal 过程宏
 crates/rskynet-signal/     进程信号、优雅关停与独立崩溃报告
 crates/rskynet-net/        TCP + UDP 网络层，一个独占线程的服务
 crates/rskynet-tls/        基于 rustls、复用 net 的双向 TLS 协议服务
-crates/rskynet-http/       HTTP/1.1 客户端连接池与可嵌入服务端
+crates/rskynet-http/       HTTP/1.1 客户端/服务端及可选 WebSocket
 crates/rskynet-cluster/    可选的 Protobuf 跨节点通信层
 examples/                  本地与跨节点 Ping / Pong / Echo 示例
 ```
@@ -456,6 +537,8 @@ rskynet = { version = "0.1", features = ["net"] }   # macros / logger / timer / 
 rskynet = { version = "0.1", features = ["tls"] }   # TLS 会隐含启用 net
 rskynet = { version = "0.1", features = ["http"] }  # 明文 HTTP/1.1
 rskynet = { version = "0.1", features = ["https"] } # HTTP + TLS
+rskynet = { version = "0.1", features = ["websocket"] } # ws 客户端与服务端
+rskynet = { version = "0.1", features = ["websocket", "https"] } # ws + wss
 ```
 
 业务代码不需要放进本仓：`rskynet` 是 lib crate，对外提供 `Service` trait 与 `rskynet::start(config, registry)`，使用方在自己的 app crate 里写 `main` 并注册服务——对应 skynet 里「内核是宿主、服务是外挂模块」的形态。
