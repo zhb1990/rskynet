@@ -9,8 +9,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use minidump::Minidump;
-use minidump_unwind::{Symbolizer, simple_symbol_supplier};
+use minidump::{Minidump, MinidumpModuleList, MinidumpSystemInfo, Module};
+use minidump_unwind::{
+    FileError, FileKind, FillSymbolError, FrameSymbolizer, FrameWalker, MultiSymbolProvider,
+    SymbolProvider,
+};
+use minidump_unwind::{Symbolizer, debuginfo::DebugInfoSymbolProvider, simple_symbol_supplier};
 use minidumper::{Client, LoopAction, MinidumpBinary, Server, ServerHandler, SocketName};
 use rskynet_core::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -159,7 +163,10 @@ fn socket_path(directory: &Path, pid: u32) -> PathBuf {
         return PathBuf::from(format!("rskynet-crash-{pid}-{}", unix_millis()));
     }
     #[cfg(not(target_os = "linux"))]
-    directory.join(format!(".rskynet-crash-{pid}-{}.sock", unix_millis()))
+    {
+        let _ = directory;
+        std::env::temp_dir().join(format!("rsc-{pid}-{:x}.sock", unix_millis()))
+    }
 }
 
 fn helper_args() -> Result<Option<(PathBuf, PathBuf, u32)>> {
@@ -185,6 +192,12 @@ fn helper_args() -> Result<Option<(PathBuf, PathBuf, u32)>> {
 
 fn run_helper(socket: &Path, directory: &Path, pid: u32) -> Result<()> {
     std::fs::create_dir_all(directory)?;
+    // Minidumps commonly store the main module and its PDB/DWARF companion as
+    // relative names. Resolve those names beside this executable rather than
+    // against the crashed application's working directory.
+    if let Some(executable_directory) = std::env::current_exe()?.parent() {
+        std::env::set_current_dir(executable_directory)?;
+    }
     let mut server = Server::with_name(socket_name(socket))
         .map_err(|err| Error::service(format!("创建崩溃 helper IPC 失败：{err}")))?;
     let shutdown = AtomicBool::new(false);
@@ -336,31 +349,46 @@ impl ServerHandler for ReportHandler {
 
 fn write_report(dump_path: &Path, metadata: Option<PanicMetadata>) -> std::io::Result<()> {
     let mut report = Vec::new();
-    writeln!(report, "rskynet crash report")?;
-    writeln!(report, "minidump: {}", dump_path.display())?;
-    if let Some(metadata) = metadata {
-        writeln!(report, "kind: rust panic")?;
-        writeln!(report, "payload: {}", metadata.payload)?;
-        if let Some(location) = metadata.location {
-            writeln!(report, "location: {location}")?;
-        }
-        if let Some(thread) = metadata.thread {
-            writeln!(report, "thread: {thread}")?;
-        }
-        writeln!(report, "\nRust panic backtrace:\n{}", metadata.backtrace)?;
-    } else {
-        writeln!(report, "kind: native crash")?;
-    }
+    write_report_preamble(&mut report, dump_path, metadata.as_ref())?;
 
     match Minidump::read_path(dump_path) {
         Ok(dump) => {
-            let symbolizer = Symbolizer::new(simple_symbol_supplier(Vec::new()));
-            match futures_executor::block_on(minidump_processor::process_minidump(
-                &dump,
-                &symbolizer,
-            )) {
+            let state = futures_executor::block_on(async {
+                let system_info = dump.get_stream::<MinidumpSystemInfo>();
+                let modules = dump.get_stream::<MinidumpModuleList>();
+                if let (Ok(system_info), Ok(modules)) = (system_info, modules)
+                    && matches!(
+                        system_info.cpu,
+                        minidump::system_info::Cpu::X86_64 | minidump::system_info::Cpu::Arm64
+                    )
+                {
+                    let local_symbols = LocalDebugSymbolProvider::new(&modules);
+                    let unwind = DebugInfoSymbolProvider::builder()
+                        .build(&system_info, &modules)
+                        .await;
+                    let mut symbols = MultiSymbolProvider::new();
+                    symbols.add(Box::new(local_symbols));
+                    symbols.add(Box::new(unwind));
+                    minidump_processor::process_minidump(&dump, &symbols).await
+                } else {
+                    let symbols = Symbolizer::new(simple_symbol_supplier(Vec::new()));
+                    minidump_processor::process_minidump(&dump, &symbols).await
+                }
+            });
+            match state {
                 Ok(state) => {
-                    writeln!(report, "\nMinidump stackwalk:")?;
+                    if metadata.is_some() {
+                        writeln!(
+                            report,
+                            "\nPost-panic minidump snapshot (captured after the panic hook; \
+                             not the panic origin):"
+                        )?;
+                    } else {
+                        writeln!(
+                            report,
+                            "\nNative crash minidump stackwalk (crashing thread first):"
+                        )?;
+                    }
                     state.print(&mut report)?;
                 }
                 Err(err) => writeln!(report, "\nMinidump stackwalk failed: {err}")?,
@@ -372,6 +400,134 @@ fn write_report(dump_path: &Path, metadata: Option<PanicMetadata>) -> std::io::R
     let log_path = dump_path.with_extension("log");
     std::fs::write(&log_path, &report)?;
     eprintln!("{}", String::from_utf8_lossy(&report));
+    Ok(())
+}
+
+struct LocalDebugSymbolProvider {
+    dump_base: Option<u64>,
+    local_base: Option<usize>,
+}
+
+impl LocalDebugSymbolProvider {
+    fn new(modules: &MinidumpModuleList) -> Self {
+        Self {
+            dump_base: modules.main_module().map(Module::base_address),
+            local_base: local_module_base(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl SymbolProvider for LocalDebugSymbolProvider {
+    async fn fill_symbol(
+        &self,
+        module: &(dyn Module + Sync),
+        frame: &mut (dyn FrameSymbolizer + Send),
+    ) -> std::result::Result<(), FillSymbolError> {
+        let dump_base = self.dump_base.ok_or(FillSymbolError {})?;
+        let local_base = self.local_base.ok_or(FillSymbolError {})?;
+        if module.base_address() != dump_base {
+            return Err(FillSymbolError {});
+        }
+        let relative_address: usize = frame
+            .get_instruction()
+            .checked_sub(dump_base)
+            .and_then(|address| address.try_into().ok())
+            .ok_or(FillSymbolError {})?;
+        let local_address = (local_base + relative_address) as *mut std::ffi::c_void;
+        let mut resolved = None;
+        backtrace::resolve(local_address, |symbol| {
+            if resolved.is_none() {
+                resolved = Some((
+                    symbol.name().map(|name| name.to_string()),
+                    symbol.addr().map(|address| address as usize),
+                    symbol.filename().map(Path::to_path_buf),
+                    symbol.lineno(),
+                ));
+            }
+        });
+        let (name, symbol_address, filename, line) = resolved.ok_or(FillSymbolError {})?;
+        let name = name.ok_or(FillSymbolError {})?;
+        let function_base = symbol_address
+            .and_then(|address| address.checked_sub(local_base))
+            .map(|offset| dump_base + offset as u64)
+            .unwrap_or(frame.get_instruction());
+        frame.set_function(&name, function_base, 0);
+        if let Some(filename) = filename {
+            frame.set_source_file(
+                filename.to_string_lossy().as_ref(),
+                line.unwrap_or(0),
+                function_base,
+            );
+        }
+        Ok(())
+    }
+
+    async fn walk_frame(
+        &self,
+        _module: &(dyn Module + Sync),
+        _walker: &mut (dyn FrameWalker + Send),
+    ) -> Option<()> {
+        None
+    }
+
+    async fn get_file_path(
+        &self,
+        _module: &(dyn Module + Sync),
+        _file_kind: FileKind,
+    ) -> std::result::Result<PathBuf, FileError> {
+        Err(FileError::NotFound)
+    }
+}
+
+#[cfg(windows)]
+fn local_module_base() -> Option<usize> {
+    let module = unsafe { GetModuleHandleW(std::ptr::null()) };
+    (!module.is_null()).then_some(module as usize)
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetModuleHandleW(name: *const u16) -> *mut std::ffi::c_void;
+}
+
+#[cfg(unix)]
+fn local_module_base() -> Option<usize> {
+    unsafe {
+        let mut info = std::mem::zeroed::<libc::Dl_info>();
+        (libc::dladdr(
+            local_module_base as *const () as *const libc::c_void,
+            &mut info,
+        ) != 0)
+            .then_some(info.dli_fbase as usize)
+    }
+}
+
+fn write_report_preamble(
+    report: &mut Vec<u8>,
+    dump_path: &Path,
+    metadata: Option<&PanicMetadata>,
+) -> std::io::Result<()> {
+    writeln!(report, "rskynet crash report")?;
+    writeln!(report, "minidump: {}", dump_path.display())?;
+    if let Some(metadata) = metadata {
+        writeln!(report, "kind: rust panic")?;
+        writeln!(report, "payload: {}", metadata.payload)?;
+        if let Some(location) = &metadata.location {
+            writeln!(report, "location: {location}")?;
+        }
+        if let Some(thread) = &metadata.thread {
+            writeln!(report, "thread: {thread}")?;
+        }
+        writeln!(
+            report,
+            "\nRust panic backtrace (captured by the panic hook):\n{}",
+            metadata.backtrace
+        )?;
+    } else {
+        writeln!(report, "kind: native crash")?;
+    }
     Ok(())
 }
 
@@ -455,5 +611,31 @@ mod tests {
         let stamp = name.trim_start_matches("1234-").trim_end_matches(".dmp");
         assert_eq!(stamp.len(), 13);
         assert!(stamp.parse::<u64>().is_ok());
+    }
+
+    #[test]
+    fn panic_report_distinguishes_backtrace_from_later_snapshot() {
+        let metadata = PanicMetadata {
+            payload: "probe".into(),
+            location: Some("src/main.rs:7:9".into()),
+            thread: Some("main".into()),
+            backtrace: "trigger_panic\ncaller".into(),
+        };
+        let mut report = Vec::new();
+        write_report_preamble(&mut report, Path::new("probe.dmp"), Some(&metadata)).unwrap();
+        let report = String::from_utf8(report).unwrap();
+        assert!(report.contains("kind: rust panic"));
+        assert!(report.contains("Rust panic backtrace (captured by the panic hook):"));
+        assert!(report.contains("trigger_panic\ncaller"));
+        assert!(!report.contains("kind: native crash"));
+    }
+
+    #[test]
+    fn native_report_has_no_panic_metadata() {
+        let mut report = Vec::new();
+        write_report_preamble(&mut report, Path::new("probe.dmp"), None).unwrap();
+        let report = String::from_utf8(report).unwrap();
+        assert!(report.contains("kind: native crash"));
+        assert!(!report.contains("Rust panic backtrace"));
     }
 }

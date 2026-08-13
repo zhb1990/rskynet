@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
+backtrace = { workspace = true }
 crash-handler = { workspace = true }
 ctrlc = { workspace = true }
 futures-executor = { workspace = true }
@@ -24,3 +26,8 @@ serde_json = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 signal-hook = { workspace = true }
+
+[[test]]
+name = "native-crash"
+path = "tests/native_crash.rs"
+harness = false

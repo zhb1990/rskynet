@@ -424,6 +424,24 @@ fn on_term(ctx: &rskynet::Ctx) {
 致命信号由 crash helper 独占。同一信号只能注册一次，重复会产生同名导出符号并
 让编译失败。panic 或原生崩溃会在 `./crash/` 下生成同名的
 `<pid>-<毫秒时间戳>.log` 与 `.dmp`，文本报告也会打印到 stderr。
+原生访问违规测试默认跳过；需要手动验证时运行：
+
+```powershell
+$env:RSKYNET_RUN_NATIVE_CRASH_TEST='1'
+cargo test -p rskynet-signal --test native-crash
+```
+
+测试报告固定临时写入 workspace 最外层的
+`<workspace>/crash/rskynet-native-crash-<pid>-<时间戳>/crash/`，不受运行测试时
+当前目录影响。测试成功后自动删除；
+测试失败时保留，便于检查 `.log`、`.dmp` 与 `child.stderr`。
+如需在测试成功后也保留目录，额外设置：
+
+```powershell
+$env:RSKYNET_KEEP_NATIVE_CRASH_TEST_DIR='1'
+```
+
+保留时测试输出会打印临时目录的完整路径；只有变量值严格等于 `1` 才会生效。
 
 它要求命令行提供一份 TOML，并从已经链接进当前二进制的服务中构造注册表。配置
 只能选择启动哪些已链接服务，不能动态加载未成为应用依赖的 Rust crate。仓库内示例：

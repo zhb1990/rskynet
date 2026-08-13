@@ -20,6 +20,8 @@ rskynet-signal = { version = "0.1.0", path = "crates/rskynet-signal" }
 rskynet-timer = { version = "0.1.0", path = "crates/rskynet-timer" }
 
 arc-swap = "1"
+async-trait = "0.1"
+backtrace = "0.3"
 crossbeam-queue = "0.3"
 crash-handler = "0.7"
 ctrlc = "3.5"
@@ -29,7 +31,7 @@ inventory = "0.3"
 libc = "0.2"
 minidump = "=0.25.0"
 minidump-processor = "=0.25.0"
-minidump-unwind = "=0.25.0"
+minidump-unwind = { version = "=0.25.0", features = ["debuginfo-unwind"] }
 minidumper = "0.9"
 mio = { version = "1", features = ["os-poll", "net"] }
 parking_lot = "0.12"
