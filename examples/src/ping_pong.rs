@@ -108,7 +108,7 @@ impl Ping {
             ctx.spawn(async move {
                 let ask = Ask::Delayed {
                     centis,
-                    tag: format!("睡{centis}厘秒"),
+                    tag: format!("睡{centis}毫秒"),
                 };
                 match task_ctx.request(".pong", Payload::of(ask)).await {
                     Ok(reply) => done
