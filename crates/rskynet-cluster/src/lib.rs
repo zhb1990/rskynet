@@ -147,7 +147,7 @@ impl RemoteContext {
         self.ctx.request(dest, payload).await
     }
 
-    /// 节点启动至今的厘秒数。
+    /// 节点启动至今的毫秒数。
     pub fn now(&self) -> u64 {
         self.ctx.now()
     }
@@ -162,7 +162,7 @@ impl RemoteContext {
         self.ctx.start_time()
     }
 
-    /// 挂起指定厘秒数，不阻塞其他 cluster 请求。
+    /// 挂起指定毫秒数，不阻塞其他 cluster 请求。
     pub async fn sleep(&self, ticks: u32) {
         self.ctx.sleep(ticks).await;
     }

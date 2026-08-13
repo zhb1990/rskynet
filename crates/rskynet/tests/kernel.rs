@@ -34,7 +34,7 @@ impl Echo {
     }
 }
 
-/// 先睡一会儿再应答，睡多久由请求负载给定（单位厘秒）。
+/// 先睡一会儿再应答，睡多久由请求负载给定（单位毫秒）。
 #[derive(Default)]
 struct SlowEcho;
 
@@ -254,7 +254,7 @@ fn sleep_is_woken_by_the_timer() {
 /// 主任务被 call 挂起时，服务照常处理其它任务——挂起的是任务不是服务
 #[test]
 fn a_pending_call_does_not_block_the_service() {
-    // 主任务去 call 一个睡 20 厘秒才回话的服务，同时 fork 一个任务去 call 快服务。
+    // 主任务去 call 一个睡 20 毫秒才回话的服务，同时 fork 一个任务去 call 快服务。
     // 若服务是被整个卡住的，快的那个不可能先回来。
     let seen = run_node(&["echo", "slow", "driver"], |ctx, journal| {
         Box::pin(async move {
@@ -278,8 +278,8 @@ fn a_pending_call_does_not_block_the_service() {
 /// 多个请求在对端是并发处理的，不是排队
 #[test]
 fn requests_are_served_concurrently() {
-    // 三个请求分别要睡 20、10、15 厘秒。若对端是串行处理的，总耗时会是 45 厘秒；
-    // 并发处理则接近最慢的 20 厘秒。
+    // 三个请求分别要睡 20、10、15 毫秒。若对端是串行处理的，总耗时会是 45 毫秒；
+    // 并发处理则接近最慢的 20 毫秒。
     let seen = run_node(&["slow", "driver"], |ctx, journal| {
         Box::pin(async move {
             let done: Arc<SvcCell<Vec<String>>> = Arc::new(SvcCell::default());

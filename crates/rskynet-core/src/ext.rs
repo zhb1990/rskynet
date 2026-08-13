@@ -92,7 +92,7 @@ impl NodeRef {
         self.node.is_booted()
     }
 
-    /// 节点启动至今的厘秒数，对照 `skynet.now`。
+    /// 节点启动至今的毫秒数，对照 `skynet.now`。
     pub fn now(&self) -> u64 {
         self.node.timer.now()
     }

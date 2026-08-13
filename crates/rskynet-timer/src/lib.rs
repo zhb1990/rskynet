@@ -60,9 +60,9 @@ pub struct WheelTimer {
     started: Instant,
     /// 启动时刻的 unix 时间，单位秒。
     start_seconds: u64,
-    /// 启动时刻的 unix 时间零头，单位厘秒。
+    /// 启动时刻的 unix 时间零头，单位毫秒。
     start_centis: u64,
-    /// 已经推进过的刻度数（厘秒），对照 C 版 `TI->current`。
+    /// 已经推进过的刻度数（毫秒），对照 C 版 `TI->current`。
     ///
     /// 只有定时器服务会写；`ctx.now()` / `ctx.time()` 每次调用都要读它，所以是原子量。
     elapsed: AtomicU64,
@@ -152,9 +152,9 @@ pub enum Request {
 /// 定时器眼里的当下，[`Request::Timestamp`] 的回包。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timestamp {
-    /// 节点启动至今的厘秒数，对照 `skynet.now`。
+    /// 节点启动至今的毫秒数，对照 `skynet.now`。
     pub now: u64,
-    /// 当前 unix 时间，单位厘秒。
+    /// 当前 unix 时间，单位毫秒。
     pub wall_clock: u64,
     /// 节点启动时刻的 unix 时间，单位秒，对照 `skynet.starttime`。
     pub start_seconds: u64,
@@ -232,7 +232,7 @@ mod tests {
         while fired.is_empty() && Instant::now() < deadline {
             fired = timer.update(&mut wheel);
         }
-        assert_eq!(fired.len(), 1, "一厘秒的表应当在 5 秒内到期");
+        assert_eq!(fired.len(), 1, "一毫秒的表应当在 5 秒内到期");
         assert_eq!(fired[0].handle, 7);
         assert_eq!(fired[0].session, 42);
     }

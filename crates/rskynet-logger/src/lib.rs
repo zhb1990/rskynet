@@ -106,7 +106,7 @@ impl Logger {
     }
 
     fn write(&self, ctx: &Ctx, source: u32, text: &str) {
-        // 时间戳用节点内相对时间（厘秒），免掉一个日期库依赖，排查问题也更直观
+        // 时间戳用节点内相对时间（毫秒），免掉一个日期库依赖，排查问题也更直观
         let centis = ctx.now();
         let line = format!(
             "[{:>6}.{:02}] [:{:08x}] {}",

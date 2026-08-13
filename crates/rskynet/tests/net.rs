@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use rskynet::{Config, ConfigExt, Ctx, MsgType, Registry, Result, SvcCell};
 use rskynet_net::{self as net, RegistryExt, SocketEvent};
 
-/// 慢机器上也够用的上限：`ctx.sleep` 的单位是厘秒，1000 次就是 10 秒。
+/// 慢机器上也够用的上限：`ctx.sleep` 的单位是毫秒，1000 次就是 10 秒。
 const PATIENCE: u32 = 1000;
 
 /// 服务之间传监听地址用的黑板。

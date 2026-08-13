@@ -81,7 +81,7 @@ pub mod __private {
 /// 写日志的便捷宏，等价于 `ctx.log(format!(...))`。
 ///
 /// ```ignore
-/// rskynet::log!(ctx, "第 {} 次往返，耗时 {} 厘秒", round, cost);
+/// rskynet::log!(ctx, "第 {} 次往返，耗时 {} 毫秒", round, cost);
 /// ```
 #[macro_export]
 macro_rules! log {

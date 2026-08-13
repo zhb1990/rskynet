@@ -206,7 +206,7 @@ impl Ctx {
         self.inner.spawn(Box::pin(future));
     }
 
-    /// 挂起 `ticks` 厘秒（10ms 一格），对照 `skynet.sleep`。
+    /// 挂起 `ticks` 毫秒（10ms 一格），对照 `skynet.sleep`。
     ///
     /// 挂表交给注入的 [`crate::Timer`]，到期时它投一条 `RESPONSE` 回来。挂表本身
     /// 从节点建起来那一刻就可用，哪怕推刻度的那条线程还没上线。
@@ -221,7 +221,7 @@ impl Ctx {
         .await;
     }
 
-    /// 按毫秒挂起，内部换算成厘秒（向上取整，至少一格）。
+    /// 按毫秒挂起，内部换算成毫秒（向上取整，至少一格）。
     pub async fn sleep_ms(&self, millis: u64) {
         let ticks = millis.div_ceil(10).min(u32::MAX as u64) as u32;
         self.sleep(ticks).await;
@@ -275,7 +275,7 @@ impl Ctx {
         self.inner.node.retire_all();
     }
 
-    /// 节点启动至今的厘秒数，对照 `skynet.now`。
+    /// 节点启动至今的毫秒数，对照 `skynet.now`。
     pub fn now(&self) -> u64 {
         self.inner.node.timer.now()
     }
