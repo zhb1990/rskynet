@@ -1,5 +1,7 @@
 # rskynet
 
+vibe coding 玩具项目，所有代码，包括当前文档均 ai 生成。
+
 用 Rust 复刻 [skynet](https://github.com/cloudwu/skynet) 的 Actor 内核。**不需要 Lua**——skynet 用协程解决的问题，Rust 的 `async`/`Future` 原样能解，还多了编译期类型检查。
 
 ```rust
@@ -52,7 +54,7 @@ worker 的一轮调度（对照 C 版 `skynet_context_message_dispatch`）：
 
 ### 独占一条线程的服务
 
-服务默认跑在共享的 worker 池上，也可以让它**独占一条线程**——这样的服务每 `launch` 一次就新起一条线程，那条线程只跑这一个服务，空闲时由服务自己决定怎么睡。日志、定时器、将来的网络层都是这一类。
+服务默认跑在共享的 worker 池上，也可以让它**独占一条线程**——这样的服务每 `launch` 一次就新起一条线程，那条线程只跑这一个服务，空闲时由服务自己决定怎么睡。日志、定时器、网络层都是这一类。
 
 C 版 skynet 为定时器与 socket 各写了一条专用线程：它们不是服务，没有邮箱也没有地址，内核得为它们单开一套代码。这里换个思路，把「独占一条线程」做成**服务的一种运行方式**（形态接近 ltask 的 exclusive service），于是那些活都由普通服务承担：
 
