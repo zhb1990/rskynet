@@ -76,7 +76,7 @@ enum Step {
 /// 地址得先解析才办得了的命令。
 enum Deferred {
     Listen,
-    Connect,
+    Connect { timeout_ms: Option<u64> },
     Udp,
     UdpConnect { id: SocketId },
 }
@@ -438,8 +438,9 @@ impl NetService {
             };
             let waiting = socket.pending.take();
             let fallbacks = std::mem::take(&mut socket.connect_fallbacks);
+            let timeout_ms = socket.connect_timeout_ms;
             match failed {
-                Some(err) => Err((waiting, fallbacks, format!("连接失败：{err}"))),
+                Some(err) => Err((waiting, fallbacks, timeout_ms, format!("连接失败：{err}"))),
                 None => {
                     socket.state = State::Connected;
                     match socket.apply(&self.registry) {
@@ -447,6 +448,7 @@ impl NetService {
                         Err(err) => Err((
                             waiting,
                             VecDeque::new(),
+                            None,
                             format!("连接成功，但更新 poll 注册失败：{err}"),
                         )),
                     }
@@ -459,13 +461,14 @@ impl NetService {
                     reply(ctx, waiting, Answer::Id(id));
                 }
             }
-            Err((waiting, fallbacks, reason)) => {
+            Err((waiting, fallbacks, timeout_ms, reason)) => {
                 // 压根没连上过，属主不必收「连接断了」——发起方那句 await 已经知道了
                 self.close(ctx, id, Farewell::Silent);
                 if let Some(waiting) = waiting {
                     if fallbacks.is_empty() {
                         reply(ctx, waiting, Answer::Failed(reason));
-                    } else if let Some(answer) = self.do_connect_candidates(ctx, fallbacks, waiting)
+                    } else if let Some(answer) =
+                        self.do_connect_candidates(ctx, fallbacks, waiting, timeout_ms)
                     {
                         reply(ctx, waiting, answer);
                     }
@@ -530,7 +533,10 @@ impl NetService {
                 }
             };
             match step {
-                Step::Wrote => continue,
+                Step::Wrote => {
+                    self.release_send_waiters(ctx, id);
+                    continue;
+                }
                 Step::Blocked => {
                     // 等下一次可写事件，兴趣里得有 WRITABLE
                     if let Some(socket) = self.sockets.borrow_mut().get_mut(id) {
@@ -579,6 +585,13 @@ impl NetService {
                 _ => reply(ctx, waiting, Answer::Done),
             }
         }
+        let send_reason = match &farewell {
+            Farewell::Failed(reason) => reason.clone(),
+            _ => format!("{id} 已关闭，发送未完成"),
+        };
+        for waiting in socket.send_waiters.drain(..) {
+            reply(ctx, waiting, Answer::Failed(send_reason.clone()));
+        }
         // fd 在这里真正关掉
         drop(socket);
 
@@ -612,8 +625,23 @@ impl NetService {
                 None => return self.defer(ctx, addr, waiting, Deferred::Listen),
             },
             Command::Connect { addr } => match parse(&addr) {
-                Some(addr) => self.do_connect(ctx, addr, waiting),
-                None => return self.defer(ctx, addr, waiting, Deferred::Connect),
+                Some(addr) => self.do_connect(ctx, addr, waiting, None),
+                None => {
+                    return self.defer(ctx, addr, waiting, Deferred::Connect { timeout_ms: None });
+                }
+            },
+            Command::ConnectWithTimeout { addr, timeout_ms } => match parse(&addr) {
+                Some(addr) => self.do_connect(ctx, addr, waiting, Some(timeout_ms)),
+                None => {
+                    return self.defer(
+                        ctx,
+                        addr,
+                        waiting,
+                        Deferred::Connect {
+                            timeout_ms: Some(timeout_ms),
+                        },
+                    );
+                }
             },
             Command::Udp { bind } => {
                 let bind = bind.unwrap_or_else(|| ANY_UDP.to_string());
@@ -629,6 +657,9 @@ impl NetService {
             Command::Start(id) => Some(self.do_start(ctx, id, waiting.source)),
             Command::Pause(id) => Some(self.do_pause(id)),
             Command::Send { id, data, high } => Some(self.do_send(ctx, id, Chunk::tcp(data), high)),
+            Command::SendWait { id, data, high } => {
+                self.do_send_wait(ctx, id, Chunk::tcp(data), high, waiting)
+            }
             Command::UdpSend { id, to, data } => Some(self.do_udp_send(ctx, id, to, data)),
             Command::Close(id) => self.do_close(ctx, id, waiting),
             Command::Shutdown(id) => {
@@ -637,6 +668,10 @@ impl NetService {
             }
             Command::NoDelay { id, on } => Some(self.do_nodelay(id, on)),
             Command::Info(id) => Some(self.do_info(id)),
+            Command::ConnectTimeoutElapsed(id) => {
+                self.connect_timeout_elapsed(ctx, id);
+                None
+            }
         };
         if let Some(answer) = answer {
             reply(ctx, waiting, answer);
@@ -660,8 +695,14 @@ impl NetService {
     }
 
     /// 返回 `None` 表示「等可写事件宣布结果再回话」。
-    fn do_connect(&self, ctx: &Ctx, addr: SocketAddr, waiting: Pending) -> Option<Answer> {
-        self.do_connect_candidates(ctx, VecDeque::from([addr]), waiting)
+    fn do_connect(
+        &self,
+        ctx: &Ctx,
+        addr: SocketAddr,
+        waiting: Pending,
+        timeout_ms: Option<u64>,
+    ) -> Option<Answer> {
+        self.do_connect_candidates(ctx, VecDeque::from([addr]), waiting, timeout_ms)
     }
 
     /// 逐个尝试解析出的地址。非阻塞 connect 已经发出后，余下地址记在槽位里；
@@ -671,6 +712,7 @@ impl NetService {
         ctx: &Ctx,
         mut addrs: VecDeque<SocketAddr>,
         waiting: Pending,
+        timeout_ms: Option<u64>,
     ) -> Option<Answer> {
         let mut last_error = None;
         while let Some(addr) = addrs.pop_front() {
@@ -690,6 +732,7 @@ impl NetService {
                 };
                 socket.pending = Some(waiting);
                 socket.connect_fallbacks = addrs;
+                socket.connect_timeout_ms = timeout_ms;
                 let id = socket.id;
                 socket
                     .apply(&self.registry)
@@ -697,7 +740,20 @@ impl NetService {
                     .map_err(|err| (id, err))
             };
             return match started {
-                Ok(_) => None,
+                Ok(id) => {
+                    if let Some(timeout_ms) = timeout_ms {
+                        let wake = ctx.clone();
+                        ctx.spawn(async move {
+                            wake.sleep_ms(timeout_ms).await;
+                            let _ = wake.send(
+                                NAME,
+                                MsgType::USER,
+                                Payload::of(Command::ConnectTimeoutElapsed(id)),
+                            );
+                        });
+                    }
+                    None
+                }
                 Err((id, err)) => {
                     self.close(ctx, id, Farewell::Silent);
                     Some(Answer::Failed(format!("注册进 poll 失败：{err}")))
@@ -707,6 +763,23 @@ impl NetService {
         Some(Answer::Failed(last_error.unwrap_or_else(|| {
             "解析结果是空的，无法建立连接".to_string()
         })))
+    }
+
+    fn connect_timeout_elapsed(&self, ctx: &Ctx, id: SocketId) {
+        let waiting = {
+            let mut sockets = self.sockets.borrow_mut();
+            let Some(socket) = sockets.get_mut(id) else {
+                return;
+            };
+            if socket.state != State::Connecting {
+                return;
+            }
+            socket.pending.take()
+        };
+        self.close(ctx, id, Farewell::Silent);
+        if let Some(waiting) = waiting {
+            reply(ctx, waiting, Answer::Failed("TCP 连接超时".to_string()));
+        }
     }
 
     fn do_udp(&self, addr: SocketAddr, owner: u32) -> Answer {
@@ -796,6 +869,13 @@ impl NetService {
     }
 
     fn do_send(&self, ctx: &Ctx, id: SocketId, chunk: Chunk, high: bool) -> Answer {
+        if chunk.rest().is_empty() {
+            return if self.sockets.borrow().get(id).is_some() {
+                Answer::Done
+            } else {
+                missing(id)
+            };
+        }
         let warn_size = self.config.borrow().warn_size;
         let queued = {
             let mut sockets = self.sockets.borrow_mut();
@@ -818,6 +898,49 @@ impl NetService {
         // 能立刻写出去的就别等下一次可写事件
         self.flush(ctx, id);
         Answer::Done
+    }
+
+    /// 返回 `None` 表示调用者已进入高水位等待队列。
+    fn do_send_wait(
+        &self,
+        ctx: &Ctx,
+        id: SocketId,
+        chunk: Chunk,
+        high: bool,
+        waiting: Pending,
+    ) -> Option<Answer> {
+        let answer = self.do_send(ctx, id, chunk, high);
+        if !matches!(answer, Answer::Done) {
+            return Some(answer);
+        }
+        let high_water = self.config.borrow().write_high_water;
+        let mut sockets = self.sockets.borrow_mut();
+        let Some(socket) = sockets.get_mut(id) else {
+            return Some(Answer::Failed(format!("{id} 在发送期间关闭")));
+        };
+        if socket.wb.size() < high_water {
+            Some(Answer::Done)
+        } else {
+            socket.send_waiters.push_back(waiting);
+            None
+        }
+    }
+
+    fn release_send_waiters(&self, ctx: &Ctx, id: SocketId) {
+        let low_water = self.config.borrow().write_low_water;
+        let waiters = {
+            let mut sockets = self.sockets.borrow_mut();
+            let Some(socket) = sockets.get_mut(id) else {
+                return;
+            };
+            if socket.wb.size() > low_water || socket.send_waiters.is_empty() {
+                return;
+            }
+            socket.send_waiters.drain(..).collect::<Vec<_>>()
+        };
+        for waiting in waiters {
+            reply(ctx, waiting, Answer::Done);
+        }
     }
 
     fn do_udp_send(
@@ -954,7 +1077,9 @@ impl NetService {
         };
         match then {
             Deferred::Listen => Some(self.do_listen(addr, waiting.source)),
-            Deferred::Connect => self.do_connect_candidates(ctx, addrs.into(), waiting),
+            Deferred::Connect { timeout_ms } => {
+                self.do_connect_candidates(ctx, addrs.into(), waiting, timeout_ms)
+            }
             Deferred::Udp => Some(self.do_udp(addr, waiting.source)),
             Deferred::UdpConnect { id } => Some(self.do_udp_connect(id, addr)),
         }

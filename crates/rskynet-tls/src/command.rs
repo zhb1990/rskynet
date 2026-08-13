@@ -11,6 +11,8 @@ pub struct ClientOptions {
     pub address: String,
     pub server_name: ServerName<'static>,
     pub config: ClientTlsConfig,
+    pub connect_timeout_ms: Option<u64>,
+    pub handshake_timeout_ms: Option<u64>,
 }
 
 impl ClientOptions {
@@ -23,7 +25,23 @@ impl ClientOptions {
             address: address.into(),
             server_name,
             config,
+            connect_timeout_ms: None,
+            handshake_timeout_ms: None,
         }
+    }
+
+    /// 限制底层 TCP 建连等待时间。
+    #[must_use]
+    pub fn with_connect_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.connect_timeout_ms = Some(timeout_ms);
+        self
+    }
+
+    /// 覆盖本次客户端连接的 TLS 握手超时。
+    #[must_use]
+    pub fn with_handshake_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.handshake_timeout_ms = Some(timeout_ms);
+        self
     }
 }
 
@@ -47,7 +65,13 @@ pub enum Command {
     Connect(ClientOptions),
     Listen(ServerOptions),
     Start(TlsId),
+    Pause(TlsId),
     Send {
+        id: TlsId,
+        data: Vec<u8>,
+        high: bool,
+    },
+    SendWait {
         id: TlsId,
         data: Vec<u8>,
         high: bool,
@@ -88,6 +112,11 @@ pub async fn start(ctx: &Ctx, id: TlsId) -> Result<()> {
     ask_done(ctx, Command::Start(id)).await
 }
 
+/// 暂停从 TLS 连接读取明文；用 [`start`] 恢复。
+pub async fn pause(ctx: &Ctx, id: TlsId) -> Result<()> {
+    ask_done(ctx, Command::Pause(id)).await
+}
+
 pub fn send(ctx: &Ctx, id: TlsId, data: Vec<u8>) -> Result<()> {
     tell(
         ctx,
@@ -108,6 +137,31 @@ pub fn send_low(ctx: &Ctx, id: TlsId, data: Vec<u8>) -> Result<()> {
             high: false,
         },
     )
+}
+
+/// 发送明文，并在底层 TCP 写队列拥塞时等待它回落。
+pub async fn send_wait(ctx: &Ctx, id: TlsId, data: Vec<u8>) -> Result<()> {
+    ask_done(
+        ctx,
+        Command::SendWait {
+            id,
+            data,
+            high: true,
+        },
+    )
+    .await
+}
+
+pub async fn send_low_wait(ctx: &Ctx, id: TlsId, data: Vec<u8>) -> Result<()> {
+    ask_done(
+        ctx,
+        Command::SendWait {
+            id,
+            data,
+            high: false,
+        },
+    )
+    .await
 }
 
 pub async fn close(ctx: &Ctx, id: TlsId) -> Result<()> {

@@ -15,6 +15,7 @@ use rskynet_tls::{
 struct Board {
     address: Mutex<Option<SocketAddr>>,
     received: Mutex<Vec<u8>>,
+    paused_was_silent: Mutex<bool>,
 }
 
 struct Echo {
@@ -68,7 +69,12 @@ impl Client {
             ),
         )
         .await?;
+        rskynet_tls::pause(&ctx, id).await?;
         rskynet_tls::send(&ctx, id, b"hello over tls".to_vec())?;
+        ctx.sleep_ms(50).await;
+        *self.board.paused_was_silent.lock().unwrap() =
+            self.board.received.lock().unwrap().is_empty();
+        rskynet_tls::start(&ctx, id).await?;
         for _ in 0..500 {
             if self.board.received.lock().unwrap().as_slice() == b"hello over tls" {
                 break;
@@ -136,4 +142,8 @@ fn client_and_server_exchange_plaintext_over_net() {
         .expect("TLS 测试节点应正常退出");
 
     assert_eq!(board.received.lock().unwrap().as_slice(), b"hello over tls");
+    assert!(
+        *board.paused_was_silent.lock().unwrap(),
+        "TLS pause 期间不应投递解密后的明文"
+    );
 }

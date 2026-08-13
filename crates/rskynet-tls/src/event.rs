@@ -68,6 +68,7 @@ pub struct TlsInfo {
     pub owner: u32,
     pub kind: &'static str,
     pub state: &'static str,
+    pub paused: bool,
     pub local: Option<SocketAddr>,
     pub peer: Option<SocketAddr>,
     pub version: Option<&'static str>,

@@ -25,6 +25,10 @@ main = []
 net = ["dep:rskynet-net"]
 # TLS 协议服务，密文收发依赖底层网络服务
 tls = ["net", "dep:rskynet-tls"]
+# HTTP/1.1 客户端服务与明文嵌入式服务端
+http = ["net", "dep:rskynet-http"]
+# 为 HTTP 层增加 HTTPS 客户端与 TLS 服务端传输
+https = ["http", "tls", "rskynet-http/tls"]
 # 跨节点通信：按需开启，同时带上底层网络服务
 cluster = ["net", "bootstrap", "dep:rskynet-cluster", "dep:toml"]
 
@@ -51,6 +55,7 @@ rskynet-core = { workspace = true }
 rskynet-bootstrap = { workspace = true, optional = true }
 rskynet-cluster = { workspace = true, optional = true }
 rskynet-logger = { workspace = true, optional = true }
+rskynet-http = { workspace = true, optional = true }
 rskynet-macros = { workspace = true, optional = true }
 rskynet-net = { workspace = true, optional = true }
 rskynet-signal = { workspace = true, optional = true }

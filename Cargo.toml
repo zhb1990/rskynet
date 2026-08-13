@@ -15,6 +15,7 @@ rskynet-bootstrap = { version = "0.1.0", path = "crates/rskynet-bootstrap" }
 rskynet-cluster = { version = "0.1.0", path = "crates/rskynet-cluster" }
 rskynet-core = { version = "0.1.0", path = "crates/rskynet-core" }
 rskynet-logger = { version = "0.1.0", path = "crates/rskynet-logger" }
+rskynet-http = { version = "0.1.0", path = "crates/rskynet-http" }
 rskynet-macros = { version = "0.1.0", path = "crates/rskynet-macros" }
 rskynet-net = { version = "0.1.0", path = "crates/rskynet-net" }
 rskynet-signal = { version = "0.1.0", path = "crates/rskynet-signal" }
@@ -53,6 +54,7 @@ slab = "0.4"
 syn = { version = "2", features = ["full"] }
 thiserror = "2"
 toml = "0.9"
+ureq-proto = "0.6"
 
 [profile.release]
 lto = "thin"

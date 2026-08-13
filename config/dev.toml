@@ -56,3 +56,6 @@ max_socket = 65536
 min_read_buffer = 64
 # 单连接写缓冲第一次告警的字节数，之后每翻一倍再告警。
 warn_size = 1048576
+# send_wait 从高水位开始等待，写队列回落到低水位后恢复调用者。
+write_high_water = 1048576
+write_low_water = 524288

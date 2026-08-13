@@ -31,12 +31,20 @@ pub enum Command {
     Listen { addr: String },
     /// 连一个地址，对照 `'O'`。连上（或失败）才回话。
     Connect { addr: String },
+    /// 与 `Connect` 相同，但限制 TCP 建连等待时间。
+    ConnectWithTimeout { addr: String, timeout_ms: u64 },
     /// 把 socket 放进 poll 并把属主改成发命令的人，对照 `'S'` / `'R'`。
     Start(SocketId),
     /// 掐掉读事件，对照 `socket_server_pause`。
     Pause(SocketId),
     /// 发数据，对照 `'D'`（高优先）与 `'P'`（低优先）。
     Send {
+        id: SocketId,
+        data: Vec<u8>,
+        high: bool,
+    },
+    /// 与 `Send` 相同，但写队列触及高水位时等它回落后才应答。
+    SendWait {
         id: SocketId,
         data: Vec<u8>,
         high: bool,
@@ -59,6 +67,8 @@ pub enum Command {
     },
     /// 问一个 socket 的现状，对照 `'Q'`。
     Info(SocketId),
+    #[doc(hidden)]
+    ConnectTimeoutElapsed(SocketId),
 }
 
 boxed_payload!(Command);
@@ -109,6 +119,22 @@ pub async fn connect(ctx: &Ctx, addr: impl Into<String>) -> Result<SocketId> {
     ask_id(ctx, Command::Connect { addr: addr.into() }).await
 }
 
+/// 连一个地址，并在 `timeout_ms` 后仍未连通时失败并回收底层 socket。
+pub async fn connect_timeout(
+    ctx: &Ctx,
+    addr: impl Into<String>,
+    timeout_ms: u64,
+) -> Result<SocketId> {
+    ask_id(
+        ctx,
+        Command::ConnectWithTimeout {
+            addr: addr.into(),
+            timeout_ms,
+        },
+    )
+    .await
+}
+
 /// 开始收数据，并把属主改成自己。
 ///
 /// 三种场合用它，对照 C 版的 `'S'`：
@@ -156,6 +182,32 @@ pub fn send_low(ctx: &Ctx, id: SocketId, data: Vec<u8>) -> Result<()> {
             high: false,
         },
     )
+}
+
+/// 发送数据，并在底层写队列拥塞时等待它回落到低水位。
+pub async fn send_wait(ctx: &Ctx, id: SocketId, data: Vec<u8>) -> Result<()> {
+    ask_done(
+        ctx,
+        Command::SendWait {
+            id,
+            data,
+            high: true,
+        },
+    )
+    .await
+}
+
+/// 低优先级版本的 [`send_wait`]。
+pub async fn send_low_wait(ctx: &Ctx, id: SocketId, data: Vec<u8>) -> Result<()> {
+    ask_done(
+        ctx,
+        Command::SendWait {
+            id,
+            data,
+            high: false,
+        },
+    )
+    .await
 }
 
 /// 把欠的数据写完再关，对照 C 版的 `'K'`。

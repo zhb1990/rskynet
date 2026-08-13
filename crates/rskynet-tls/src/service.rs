@@ -42,6 +42,8 @@ struct TlsConnection {
     peer_close_notify: bool,
     connect_pending: Option<Pending>,
     close_pending: Option<Pending>,
+    paused: bool,
+    handshake_timeout_ms: u64,
 }
 
 impl TlsConnection {
@@ -61,6 +63,7 @@ impl TlsConnection {
             } else {
                 "connected"
             },
+            paused: self.paused,
             local: self.local,
             peer: Some(self.peer),
             version: version_name(self.connection.protocol_version()),
@@ -171,8 +174,18 @@ impl TlsService {
             Command::Connect(options) => self.connect(ctx, options, pending).await,
             Command::Listen(options) => self.listen(ctx, options, pending).await,
             Command::Start(id) => self.start(ctx, id, pending).await,
+            Command::Pause(id) => {
+                let answer = self.pause(ctx, id, pending.source).await;
+                reply(ctx, pending, answer);
+            }
             Command::Send { id, data, high } => {
                 let answer = self.send_plaintext(ctx, id, pending.source, data, high);
+                reply(ctx, pending, answer);
+            }
+            Command::SendWait { id, data, high } => {
+                let answer = self
+                    .send_plaintext_wait(ctx, id, pending.source, data, high)
+                    .await;
                 reply(ctx, pending, answer);
             }
             Command::Close(id) => self.close(ctx, id, pending).await,
@@ -205,7 +218,11 @@ impl TlsService {
                 return;
             }
         };
-        let socket = match net::connect(ctx, options.address).await {
+        let connected = match options.connect_timeout_ms {
+            Some(timeout_ms) => net::connect_timeout(ctx, options.address, timeout_ms).await,
+            None => net::connect(ctx, options.address).await,
+        };
+        let socket = match connected {
             Ok(socket) => socket,
             Err(error) => {
                 reply(
@@ -228,6 +245,9 @@ impl TlsService {
             .unwrap_or_else(|| "0.0.0.0:0".parse().expect("固定地址合法"));
         let local = socket_info.and_then(|info| info.local);
         let buffer_limit = self.config.borrow().buffer_limit;
+        let handshake_timeout_ms = options
+            .handshake_timeout_ms
+            .unwrap_or(self.config.borrow().handshake_timeout_ms);
         let mut connection = Connection::Client(tls);
         connection.set_buffer_limit(Some(buffer_limit));
         let id = {
@@ -249,6 +269,8 @@ impl TlsService {
                     peer_close_notify: false,
                     connect_pending: Some(pending),
                     close_pending: None,
+                    paused: false,
+                    handshake_timeout_ms,
                 },
             );
             state.handshakes += 1;
@@ -301,6 +323,29 @@ impl TlsService {
     }
 
     async fn start(&self, ctx: &Ctx, id: TlsId, pending: Pending) {
+        let connection = {
+            let state = self.state.borrow();
+            state
+                .connections
+                .get(&id)
+                .map(|connection| (connection.socket, connection.owner == pending.source))
+        };
+        if let Some((socket, allowed)) = connection {
+            if !allowed {
+                reply(ctx, pending, denied(id));
+                return;
+            }
+            match net::start(ctx, socket).await {
+                Ok(()) => {
+                    if let Some(connection) = self.state.borrow_mut().connections.get_mut(&id) {
+                        connection.paused = false;
+                    }
+                    reply(ctx, pending, Answer::Done);
+                }
+                Err(error) => reply(ctx, pending, Answer::Failed(error.to_string())),
+            }
+            return;
+        }
         let socket = {
             let state = self.state.borrow();
             let Some(listener) = state.listeners.get(&id) else {
@@ -434,6 +479,7 @@ impl TlsService {
                 } else {
                     "prelisten"
                 },
+                paused: false,
                 local: listener.local,
                 peer: None,
                 version: None,
@@ -478,6 +524,61 @@ impl TlsService {
                 self.fail(ctx, id, reason.clone());
                 Answer::Failed(reason)
             }
+        }
+    }
+
+    async fn send_plaintext_wait(
+        &self,
+        ctx: &Ctx,
+        id: TlsId,
+        source: u32,
+        data: Vec<u8>,
+        high: bool,
+    ) -> Answer {
+        let write = {
+            let mut state = self.state.borrow_mut();
+            let Some(connection) = state.connections.get_mut(&id) else {
+                return missing(id);
+            };
+            if connection.owner != source {
+                return denied(id);
+            }
+            if !connection.announced || connection.closing {
+                return Answer::Failed(format!("{id} 当前不能发送明文"));
+            }
+            connection.connection.writer().write_all(&data)
+        };
+        if let Err(error) = write {
+            return Answer::Failed(format!("TLS 写入失败：{error}"));
+        }
+        match self.flush_tls_wait(ctx, id, high).await {
+            Ok(()) => Answer::Done,
+            Err(reason) => {
+                self.fail(ctx, id, reason.clone());
+                Answer::Failed(reason)
+            }
+        }
+    }
+
+    async fn pause(&self, ctx: &Ctx, id: TlsId, source: u32) -> Answer {
+        let socket = {
+            let state = self.state.borrow();
+            let Some(connection) = state.connections.get(&id) else {
+                return missing(id);
+            };
+            if connection.owner != source {
+                return denied(id);
+            }
+            connection.socket
+        };
+        match net::pause(ctx, socket).await {
+            Ok(()) => {
+                if let Some(connection) = self.state.borrow_mut().connections.get_mut(&id) {
+                    connection.paused = true;
+                }
+                Answer::Done
+            }
+            Err(error) => Answer::Failed(error.to_string()),
         }
     }
 
@@ -564,6 +665,8 @@ impl TlsService {
                     peer_close_notify: false,
                     connect_pending: None,
                     close_pending: None,
+                    paused: false,
+                    handshake_timeout_ms: self.config.borrow().handshake_timeout_ms,
                 },
             );
             state.handshakes += 1;
@@ -749,6 +852,38 @@ impl TlsService {
         result.map_err(|error| format!("发送 TLS 密文失败：{error}"))
     }
 
+    async fn flush_tls_wait(
+        &self,
+        ctx: &Ctx,
+        id: TlsId,
+        high: bool,
+    ) -> std::result::Result<(), String> {
+        let (socket, encrypted) = {
+            let mut state = self.state.borrow_mut();
+            let connection = state
+                .connections
+                .get_mut(&id)
+                .ok_or_else(|| format!("{id} 已不存在"))?;
+            let mut encrypted = Vec::new();
+            while connection.connection.wants_write() {
+                connection
+                    .connection
+                    .write_tls(&mut encrypted)
+                    .map_err(|error| format!("生成 TLS 密文失败：{error}"))?;
+            }
+            (connection.socket, encrypted)
+        };
+        if encrypted.is_empty() {
+            return Ok(());
+        }
+        let result = if high {
+            net::send_wait(ctx, socket, encrypted).await
+        } else {
+            net::send_low_wait(ctx, socket, encrypted).await
+        };
+        result.map_err(|error| format!("发送 TLS 密文失败：{error}"))
+    }
+
     fn socket_closed(&self, ctx: &Ctx, socket: SocketId, error: Option<String>) {
         if let Some(listener) = self.state.borrow().listener_sockets.get(&socket).copied() {
             self.remove_listener(listener);
@@ -824,7 +959,14 @@ impl TlsService {
     }
 
     fn arm_timeout(&self, ctx: &Ctx, id: TlsId) {
-        let timeout = self.config.borrow().handshake_timeout_ms;
+        let timeout = self
+            .state
+            .borrow()
+            .connections
+            .get(&id)
+            .map_or(self.config.borrow().handshake_timeout_ms, |connection| {
+                connection.handshake_timeout_ms
+            });
         let wake = ctx.clone();
         ctx.spawn(async move {
             wake.sleep_ms(timeout).await;

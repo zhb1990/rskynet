@@ -12,8 +12,8 @@ mod service;
 use rskynet_core::Registry;
 
 pub use command::{
-    Answer, ClientOptions, Command, ServerOptions, close, connect, info, listen, send, send_low,
-    shutdown, start,
+    Answer, ClientOptions, Command, ServerOptions, close, connect, info, listen, pause, send,
+    send_low, send_low_wait, send_wait, shutdown, start,
 };
 pub use config::TlsConfig;
 pub use event::{TlsEvent, TlsId, TlsInfo};

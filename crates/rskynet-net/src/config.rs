@@ -15,6 +15,8 @@ const DEFAULT_MAX_SOCKET: usize = 65536;
 const DEFAULT_MIN_READ_BUFFER: usize = 64;
 /// 写缓冲堆到这么多字节就给属主报一次警，对照 C 版 `WARNING_SIZE`。
 const DEFAULT_WARN_SIZE: usize = 1024 * 1024;
+const DEFAULT_WRITE_HIGH_WATER: usize = 1024 * 1024;
+const DEFAULT_WRITE_LOW_WATER: usize = 512 * 1024;
 
 /// 网络层那一段配置。
 ///
@@ -24,6 +26,8 @@ const DEFAULT_WARN_SIZE: usize = 1024 * 1024;
 /// max_socket = 65536
 /// min_read_buffer = 64
 /// warn_size = 1048576
+/// write_high_water = 1048576
+/// write_low_water = 524288
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -38,6 +42,10 @@ pub struct NetConfig {
     /// 写缓冲堆到这么多字节就投一条 [`crate::SocketEvent::Warning`]，之后每翻倍
     /// 再报一次。属主据此决定是限流还是踢人。
     pub warn_size: usize,
+    /// `send_wait` 从这个水位开始等待写队列回落。
+    pub write_high_water: usize,
+    /// 写队列回落到这个水位时唤醒所有 `send_wait` 调用者。
+    pub write_low_water: usize,
 }
 
 impl Default for NetConfig {
@@ -47,6 +55,8 @@ impl Default for NetConfig {
             max_socket: DEFAULT_MAX_SOCKET,
             min_read_buffer: DEFAULT_MIN_READ_BUFFER,
             warn_size: DEFAULT_WARN_SIZE,
+            write_high_water: DEFAULT_WRITE_HIGH_WATER,
+            write_low_water: DEFAULT_WRITE_LOW_WATER,
         }
     }
 }
@@ -61,6 +71,11 @@ impl NetConfig {
         }
         if self.min_read_buffer == 0 {
             return Err(Error::Config("[net] min_read_buffer 必须大于 0".into()));
+        }
+        if self.write_low_water == 0 || self.write_low_water >= self.write_high_water {
+            return Err(Error::Config(
+                "[net] 必须满足 0 < write_low_water < write_high_water".into(),
+            ));
         }
         Ok(())
     }

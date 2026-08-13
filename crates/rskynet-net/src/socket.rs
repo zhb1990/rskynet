@@ -140,8 +140,12 @@ pub(crate) struct Socket {
     pub(crate) udp_peer: Option<SocketAddr>,
     /// 还在等回话的那次命令。
     pub(crate) pending: Option<Pending>,
+    /// 等写队列降到低水位的 `send_wait` 调用者。
+    pub(crate) send_waiters: VecDeque<Pending>,
     /// 域名解析出的其余地址。当前连接失败时按顺序继续尝试。
     pub(crate) connect_fallbacks: VecDeque<SocketAddr>,
+    /// 建连超时；切换到解析出的后备地址时继续沿用。
+    pub(crate) connect_timeout_ms: Option<u64>,
     pub(crate) stat: Stat,
 }
 
@@ -159,7 +163,9 @@ impl Socket {
             read: ReadSizer::new(floor),
             udp_peer: None,
             pending: None,
+            send_waiters: VecDeque::new(),
             connect_fallbacks: VecDeque::new(),
+            connect_timeout_ms: None,
             stat: Stat::default(),
         }
     }

@@ -92,8 +92,8 @@ mod socket;
 use rskynet_core::Registry;
 
 pub use command::{
-    Answer, Command, close, connect, info, listen, pause, send, send_low, set_nodelay, shutdown,
-    start, udp, udp_connect, udp_send,
+    Answer, Command, close, connect, connect_timeout, info, listen, pause, send, send_low,
+    send_low_wait, send_wait, set_nodelay, shutdown, start, udp, udp_connect, udp_send,
 };
 pub use config::NetConfig;
 pub use event::{SocketEvent, SocketId, SocketInfo};

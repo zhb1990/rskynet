@@ -1,0 +1,26 @@
+[package]
+name = "rskynet-http"
+description = "rskynet 的 HTTP/1.1 客户端服务与可嵌入服务端"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+tls = ["dep:rskynet-tls"]
+
+[dependencies]
+rskynet-core = { workspace = true }
+rskynet-net = { workspace = true }
+rskynet-tls = { workspace = true, optional = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+ureq-proto = { workspace = true }
+
+[dev-dependencies]
+rskynet-bootstrap = { workspace = true }
+rskynet-macros = { workspace = true }
+rskynet-timer = { workspace = true }
+rcgen = "0.14"
