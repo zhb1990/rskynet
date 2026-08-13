@@ -1,8 +1,9 @@
 //! 节点启动与线程模型，对照 `skynet-src/skynet_start.c`。
 //!
-//! 线程构成与 C 版一样多，只是归属变了（少了 monitor 线程，见 README 的取舍说明）：
+//! 线程构成与 C 版一样多，只是专用 IO 线程的归属变了：
 //!
 //! - N 个 worker 线程：从运行队列取服务、跑消息与任务
+//! - 1 个 monitor 线程：每 5 秒检查一次 worker 是否卡在同一次 Future poll
 //! - 每个独占服务一条线程：定时器与日志各一条，网络层也是一条。
 //!   C 版那是内核里的专用线程，这里它们是普通服务，见 [`crate::Exclusive`]
 //!
@@ -17,8 +18,9 @@
 //! 引导之前，于是引导期间刻度就在走，那时挂的表、打的日志时间戳都是准的。
 
 use std::any::Any;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::thread;
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -26,6 +28,7 @@ use serde::de::DeserializeOwned;
 use crate::clock::Timer;
 use crate::error::{Error, Result};
 use crate::module::Registry;
+use crate::monitor::Monitor;
 use crate::server::Node;
 use crate::service;
 
@@ -255,15 +258,26 @@ fn run(config: Config, registry: Registry, timer: Arc<dyn Timer>) -> Result<()> 
     // 见 [`crate::NodeRef::is_booted`]
     node.mark_booted();
 
+    let monitors: Vec<_> = (0..config.thread)
+        .map(|_| Arc::new(Monitor::new()))
+        .collect();
+
     // 各 worker 共享同一个不可变引用，&Node 是 Copy 的，每个闭包各拿一份
     let shared: &Node = &node;
     let panic = thread::scope(|scope| {
+        let (stop_monitor, stopped) = mpsc::channel();
+        let observed = &monitors;
+        let monitor_thread = thread::Builder::new()
+            .name("rskynet-monitor".to_string())
+            .spawn_scoped(scope, move || monitor_loop(shared, observed, stopped))
+            .expect("monitor 线程创建失败");
+
         let mut workers = Vec::with_capacity(config.thread);
-        for id in 0..config.thread {
+        for (id, monitor) in monitors.iter().cloned().enumerate() {
             workers.push(
                 thread::Builder::new()
                     .name(format!("rskynet-worker-{id}"))
-                    .spawn_scoped(scope, move || worker_loop(shared, id))
+                    .spawn_scoped(scope, move || worker_loop(shared, id, monitor))
                     .expect("worker 线程创建失败"),
             );
         }
@@ -274,6 +288,11 @@ fn run(config: Config, registry: Registry, timer: Arc<dyn Timer>) -> Result<()> 
             if let Err(payload) = worker.join() {
                 panic = panic.or(Some(payload));
             }
+        }
+        // recv_timeout 会被这条消息立刻打断，正常关停不必等完 5 秒检查周期。
+        let _ = stop_monitor.send(());
+        if let Err(payload) = monitor_thread.join() {
+            panic = panic.or(Some(payload));
         }
         panic
     });
@@ -351,7 +370,8 @@ fn shutdown(node: &Arc<Node>) -> Option<Box<dyn Any + Send + 'static>> {
 }
 
 /// worker 主循环，对照 C 版 `thread_worker`。
-fn worker_loop(node: &Node, id: usize) {
+fn worker_loop(node: &Node, id: usize, monitor: Arc<Monitor>) {
+    let _monitor = crate::monitor::Binding::install(monitor);
     // 绑定本线程的运行队列：从此本线程的投递与取活优先走它，取空了才去偷别人的
     let _worker = node.sched.register_worker(id);
     let mut hold = None;
@@ -373,6 +393,23 @@ fn worker_loop(node: &Node, id: usize) {
     node.sched.flush_local();
 }
 
+/// 对照 C 版 `thread_monitor`：每 5 秒扫描一遍，但每秒都给关停信号一次立即打断的机会。
+fn monitor_loop(node: &Node, monitors: &[Arc<Monitor>], stop: mpsc::Receiver<()>) {
+    loop {
+        for monitor in monitors {
+            if let Some((source, destination, version)) = monitor.check() {
+                node.report_endless(source, destination, version);
+            }
+        }
+        for _ in 0..5 {
+            match stop.recv_timeout(Duration::from_secs(1)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+    }
+}
+
 /// 在当前线程上把运行队列里剩下的活干完，用于启动失败或退出时的清理。
 ///
 /// 主线程没有本地队列，只取 injector——此时 worker 都已收工并把本地队列倒进去了。
@@ -391,6 +428,23 @@ fn drain(node: &Node) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monitor_stop_interrupts_the_wait_immediately() {
+        let node = crate::server::tests::test_node();
+        let monitors = vec![Arc::new(Monitor::new())];
+        let started = std::time::Instant::now();
+        thread::scope(|scope| {
+            let (stop, stopped) = mpsc::channel();
+            let handle = scope.spawn(|| monitor_loop(&node, &monitors, stopped));
+            stop.send(()).unwrap();
+            handle.join().unwrap();
+        });
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "关停不应等待 5 秒检查周期"
+        );
+    }
 
     /// 配置能从 TOML 解析，未写的字段走默认值
     #[test]

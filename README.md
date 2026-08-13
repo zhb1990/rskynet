@@ -52,6 +52,12 @@ worker 的一轮调度（对照 C 版 `skynet_context_message_dispatch`）：
 
 「就绪任务优先于新消息」不是随便定的：它对应 skynet 里被 resume 的协程会一路跑到下一次 yield，之后才轮到下一条消息。
 
+### monitor 死循环检测
+
+每个共享 worker 各有一份 monitor 进度，另有一条 `rskynet-monitor` 线程每 5 秒扫描一次。worker 在每次 poll Future 的前后推进版本；同一次 poll 连续跨过两个检查点仍未返回，就会记录包含消息来源和目标 handle 的疑似死循环日志。
+
+检测只告警，不强杀线程或节点。服务可用 `ctx.take_endless()` 读取并清除这个一次性标记，对应 `skynet.stat("endless")`。监测边界是共享 worker 上的单次 Future poll；独占服务线程和启动阶段的同步初始化不在其中。
+
 ### 独占一条线程的服务
 
 服务默认跑在共享的 worker 池上，也可以让它**独占一条线程**——这样的服务每 `launch` 一次就新起一条线程，那条线程只跑这一个服务，空闲时由服务自己决定怎么睡。日志、定时器、网络层都是这一类。
@@ -220,7 +226,7 @@ cargo run -p rskynet-examples -- config/examples/ping_pong.toml
 | `skynet.abort()` | `ctx.abort()` |
 | `skynet.now()` / `skynet.time()` | `ctx.now()` / `ctx.time()` |
 | `skynet.error(...)` | `ctx.log(...)` / `rskynet::log!(ctx, "...")` |
-| `skynet.stat("mqlen"/"message"/"cpu")` | `ctx.mailbox_len()` / `ctx.message_count()` / `ctx.cpu_cost()` |
+| `skynet.stat("mqlen"/"message"/"cpu"/"endless")` | `ctx.mailbox_len()` / `ctx.message_count()` / `ctx.cpu_cost()` / `ctx.take_endless()` |
 | `socket.listen(addr, port)` / `socket.start(id)` | `net::listen(&ctx, addr).await` / `net::start(&ctx, id).await` |
 | `socket.open(addr, port)` | `net::connect(&ctx, addr).await` |
 | `socket.write(id, data)` / `socket.lwrite(id, data)` | `net::send(&ctx, id, data)` / `net::send_low(&ctx, id, data)` |
@@ -317,6 +323,7 @@ async fn pong(
 | `server.rs` | `skynet_server.c` | `ServiceContext`、`Node`、消息分发主循环、服务生命周期 |
 | `clock.rs` | 无对应 | `Timer` 抽象：内核只认它，实现由启动方注入 |
 | `module.rs` | `skynet_module.c` | 服务类型注册表（静态注册取代 `dlopen`） |
+| `monitor.rs` | `skynet_monitor.c` | 每 worker 的 Future poll 进度与死循环检测 |
 | `start.rs` | `skynet_start.c` | 配置、线程池、引导、退出 |
 | `context.rs` | `lualib/skynet.lua` | 用户侧 API：`call` / `send` / `fork` / `sleep` |
 | `session.rs` | `lualib/skynet.lua` | `session_id_coroutine` 的对应物 |
@@ -364,10 +371,10 @@ struct Counter { hits: SvcCell<u64> }
 
 ## 现状与边界
 
-已实现：服务生命周期（launch / exit / kill / abort）、消息与自定义协议号、session RPC、服务内并发、本地名字表、分层时间轮、独占线程的服务、引导服务、TCP / UDP、信号回调与默认优雅关停、独立进程 minidump/堆栈报告、过程宏、TOML 配置、基于争用的批量让渡调度与工作窃取、过载检测、退出时给在途请求回错误。
+已实现：服务生命周期（launch / exit / kill / abort）、消息与自定义协议号、session RPC、服务内并发、本地名字表、分层时间轮、独占线程的服务、引导服务、TCP / UDP、信号回调与默认优雅关停、独立进程 minidump/堆栈报告、过程宏、TOML 配置、基于争用的批量让渡调度与工作窃取、过载检测、monitor 死循环检测、退出时给在途请求回错误。
 
 可选的 `cluster` feature 提供 rskynet 节点间的 Protobuf 通信；本地 actor 依然直接传对象。
-尚未实现：gate / agent、monitor 死循环检测、debug_console。
+尚未实现：gate / agent、debug_console。
 
 因为内核不碰 epoll/kqueue，目前是**跨平台**的，Windows 上可以直接 `cargo run`。
 

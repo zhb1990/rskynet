@@ -47,6 +47,7 @@ mod exclusive;
 mod handle;
 mod message;
 mod module;
+mod monitor;
 mod mq;
 mod payload;
 mod server;

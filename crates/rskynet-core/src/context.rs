@@ -305,6 +305,13 @@ impl Ctx {
         self.inner.message_count()
     }
 
+    /// monitor 是否发现过本服务疑似死循环，对照 `skynet.stat("endless")`。
+    ///
+    /// 这是一次性状态：返回 `true` 的同时会清除标记。
+    pub fn take_endless(&self) -> bool {
+        self.inner.take_endless()
+    }
+
     /// 服务内当前活着的任务数（含正在等应答的），用于观察并发情况。
     pub fn task_count(&self) -> usize {
         self.inner.task_count()

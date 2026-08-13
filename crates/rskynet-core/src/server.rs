@@ -70,6 +70,8 @@ pub(crate) struct ServiceContext {
     reserved: AtomicBool,
     /// 销毁记账是否已完成，保证 `total` 只减一次。
     destroyed: AtomicBool,
+    /// monitor 发现过疑似死循环；读取即清除。
+    endless: AtomicBool,
     message_count: AtomicU64,
     /// 累计占用 worker 的时间，单位微秒；仅在 `profile` 打开时统计。
     cpu_cost: AtomicU64,
@@ -202,7 +204,7 @@ impl ServiceContext {
     /// 正执行本服务就直接插入，否则把 future 当成一件活塞进邮箱，由持有者插入。
     pub(crate) fn spawn(self: &Arc<Self>, future: BoxFuture<'static, ()>) {
         if self.owns_current_thread() {
-            self.install_task(future, None);
+            self.install_task(future, None, 0);
         } else {
             let queued = self.mailbox.push_ready(Ready::Spawn(future));
             self.wake(queued);
@@ -214,8 +216,9 @@ impl ServiceContext {
         self: &Arc<Self>,
         future: BoxFuture<'static, ()>,
         request: Option<(u32, i32)>,
+        source: u32,
     ) -> usize {
-        let task = self.tasks.insert(&self.me, future, request);
+        let task = self.tasks.insert(&self.me, future, request, source);
         self.wake_task(task);
         task
     }
@@ -226,6 +229,14 @@ impl ServiceContext {
 
     pub(crate) fn message_count(&self) -> u64 {
         self.message_count.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn take_endless(&self) -> bool {
+        self.endless.swap(false, Ordering::AcqRel)
+    }
+
+    fn mark_endless(&self) {
+        self.endless.store(true, Ordering::Release);
     }
 
     /// 累计占用 worker 的时长，对照 `skynet.stat("cpu")`。
@@ -249,7 +260,7 @@ impl ServiceContext {
         let (source, session) = (msg.source, msg.session);
         let request = (session != 0 && source != 0).then_some((source, session));
         let ctx = Ctx::new(self.clone());
-        self.install_task(self.service.clone().dispatch(ctx, msg), request);
+        self.install_task(self.service.clone().dispatch(ctx, msg), request, source);
     }
 
     /// poll 一个就绪任务。
@@ -257,13 +268,14 @@ impl ServiceContext {
     /// Future 在 poll 期间被移出槽位，这样任务在 poll 中再 `spawn` 新任务也不会
     /// 撞上嵌套借用。
     fn poll_task(&self, task: usize) {
-        let Some((mut future, waker)) = self.tasks.take(task) else {
+        let Some((mut future, waker, source)) = self.tasks.take(task) else {
             // 任务已完成，唤醒迟到了；Future 契约允许这种无害的多余唤醒
             return;
         };
         // 用户代码就在下面这次 poll 里跑，`Ctx::spawn`、`Ctx::exit` 都靠这个标记
         // 认出「调用者正是本服务的持有者」，从而敢直接动服务内部那些不加锁的容器
         let _running = Running::enter(self);
+        let _monitored = crate::monitor::Running::enter(source, self.handle);
         let mut cx = std::task::Context::from_waker(&waker);
         let started = self.node.profile().then(std::time::Instant::now);
         let result = future.as_mut().poll(&mut cx);
@@ -291,7 +303,7 @@ impl ServiceContext {
             Ready::Task(task) => self.poll_task(task),
             // 别的线程托我们插的任务：插进去就会排到就绪队列尾部，随后被 poll
             Ready::Spawn(future) => {
-                self.install_task(future, None);
+                self.install_task(future, None, 0);
             }
         }
     }
@@ -448,6 +460,19 @@ impl Node {
         self.logger.store(handle, Ordering::Release);
     }
 
+    /// 记下 monitor 的一次告警。服务可能在检查前已退出，那时只写日志。
+    pub(crate) fn report_endless(&self, source: u32, destination: u32, version: u64) {
+        if let Some(ctx) = self.handles.grab(destination) {
+            ctx.mark_endless();
+        }
+        self.log(
+            0,
+            format!(
+                "error: 从 [ :{source:08x} ] 到 [ :{destination:08x} ] 的任务可能陷入死循环 (version = {version})"
+            ),
+        );
+    }
+
     /// 把服务标成保留服务，对照 `skynet_context_reserve`：
     /// 不计入退出条件（否则节点永远等不到服务数归零），并且留到最后才释放。
     pub(crate) fn reserve(&self, handle: u32) {
@@ -515,6 +540,7 @@ impl Node {
                 dead: AtomicBool::new(false),
                 reserved: AtomicBool::new(false),
                 destroyed: AtomicBool::new(false),
+                endless: AtomicBool::new(false),
                 message_count: AtomicU64::new(0),
                 cpu_cost: AtomicU64::new(0),
                 me: me.clone(),
@@ -541,6 +567,7 @@ impl Node {
                     }
                 }),
                 None,
+                0,
             );
         }
         ctx.drain_ready();
@@ -907,6 +934,7 @@ pub(crate) mod tests {
             dead: AtomicBool::new(false),
             reserved: AtomicBool::new(false),
             destroyed: AtomicBool::new(false),
+            endless: AtomicBool::new(false),
             message_count: AtomicU64::new(0),
             cpu_cost: AtomicU64::new(0),
             me: me.clone(),
@@ -1091,5 +1119,16 @@ pub(crate) mod tests {
             .send_raw(0, 0xdead, MsgType::USER, 0, Payload::None)
             .expect_err("应失败");
         assert!(matches!(err, Error::NoService(0xdead)));
+    }
+
+    /// endless 标记是给服务自己读的一次性状态。
+    #[test]
+    fn endless_flag_is_consumed_once() {
+        let node = test_node();
+        let handle = node.new_service("null", "").expect("应创建成功");
+        node.report_endless(0x12, handle, 7);
+        let ctx = Ctx::new(node.handles.grab(handle).expect("服务应当仍存活"));
+        assert!(ctx.take_endless());
+        assert!(!ctx.take_endless(), "读取后应自动清除");
     }
 }

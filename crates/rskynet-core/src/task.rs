@@ -101,6 +101,8 @@ struct TaskSlot {
     /// 对照 `lualib/skynet.lua` 里 `skynet.exit` 遍历 `session_coroutine_id` 的那段。
     /// 记在任务槽里而不是另开一张表，是因为它的生命周期与任务严丝合缝。
     request: Option<(u32, i32)>,
+    /// 最初开出这个任务的消息来源，给 worker monitor 报告死循环用。
+    source: u32,
 }
 
 /// 任务 waker：被唤醒时把任务 id 塞回服务的就绪队列，并让服务重新进入全局队列。
@@ -146,6 +148,7 @@ impl TaskSet {
         owner: &Weak<ServiceContext>,
         future: BoxFuture<'static, ()>,
         request: Option<(u32, i32)>,
+        source: u32,
     ) -> usize {
         let mut slots = self.slots.borrow_mut();
         let entry = slots.vacant_entry();
@@ -158,17 +161,18 @@ impl TaskSet {
             future: Some(future),
             waker,
             request,
+            source,
         });
         self.count.store(slots.len(), Ordering::Relaxed);
         task
     }
 
     /// 取出任务准备 poll。任务已完成或正被 poll 时返回 `None`。
-    pub(crate) fn take(&self, task: usize) -> Option<(BoxFuture<'static, ()>, Waker)> {
+    pub(crate) fn take(&self, task: usize) -> Option<(BoxFuture<'static, ()>, Waker, u32)> {
         let mut slots = self.slots.borrow_mut();
         let slot = slots.get_mut(task)?;
         let future = slot.future.take()?;
-        Some((future, slot.waker.clone()))
+        Some((future, slot.waker.clone(), slot.source))
     }
 
     /// poll 返回 `Pending`，把 Future 放回原槽位。
@@ -242,5 +246,14 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>(_: &T) {}
         let cell = Arc::new(SvcCell::new(String::from("x")));
         assert_send_sync(&cell);
+    }
+
+    #[test]
+    fn task_keeps_the_source_that_created_it() {
+        let tasks = TaskSet::new();
+        let owner = Weak::<ServiceContext>::new();
+        let task = tasks.insert(&owner, Box::pin(async {}), None, 0x1234);
+        let (_, _, source) = tasks.take(task).expect("任务应当存在");
+        assert_eq!(source, 0x1234);
     }
 }
