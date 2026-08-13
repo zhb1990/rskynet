@@ -848,6 +848,7 @@ dependencies = [
  "rskynet-core",
  "rskynet-macros",
  "serde",
+ "toml",
 ]
 
 [[package]]

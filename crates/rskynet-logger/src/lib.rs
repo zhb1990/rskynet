@@ -16,6 +16,8 @@
 //! name = "logger"
 //! # 日志文件路径，留空则只写标准输出
 //! path = "run/rskynet.log"
+//! # 最多保留多少条待写日志；超过后丢弃较旧日志，0 表示不限制
+//! max_queue = 10000
 //! ```
 
 use std::fs::{File, OpenOptions};
@@ -26,12 +28,61 @@ use rskynet_core::service::LOGGER;
 use rskynet_core::{Ctx, Message, MsgType, Registry, Result, SvcCell};
 use serde::Deserialize;
 
+const DEFAULT_MAX_QUEUE: usize = 10_000;
+
 /// `[logger]` 段。`name` 归内核解析，这里只关心写到哪。
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(default)]
 struct LoggerConfig {
     /// 日志文件路径，留空表示只写标准输出。
     path: String,
+    /// 最多保留多少条待写日志，0 表示不限制。
+    max_queue: usize,
+}
+
+impl Default for LoggerConfig {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            max_queue: DEFAULT_MAX_QUEUE,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Backpressure {
+    max_queue: usize,
+    dropped: usize,
+}
+
+impl Default for Backpressure {
+    fn default() -> Self {
+        Self {
+            max_queue: DEFAULT_MAX_QUEUE,
+            dropped: 0,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum LogDecision {
+    Drop,
+    Write { dropped: usize },
+}
+
+impl Backpressure {
+    /// `queued` 不含当前这条已经出队的消息，因此 `queued >= max_queue`
+    /// 正好表示出队前的总量超过限制。
+    fn decide(&mut self, queued: usize) -> LogDecision {
+        if self.max_queue != 0 && queued >= self.max_queue {
+            self.dropped = self.dropped.saturating_add(1);
+            return LogDecision::Drop;
+        }
+
+        LogDecision::Write {
+            dropped: std::mem::take(&mut self.dropped),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -39,6 +90,7 @@ pub struct Logger {
     /// 日志文件路径，空表示只写标准输出。
     path: SvcCell<String>,
     file: SvcCell<Option<File>>,
+    backpressure: SvcCell<Backpressure>,
 }
 
 impl Logger {
@@ -74,6 +126,7 @@ impl Logger {
 impl Logger {
     async fn init(&self, ctx: Ctx) -> Result<()> {
         let config: LoggerConfig = ctx.node().section(LOGGER)?.unwrap_or_default();
+        self.backpressure.borrow_mut().max_queue = config.max_queue;
         let path = config.path.trim().to_string();
         if !path.is_empty() {
             self.open(&path)?;
@@ -85,6 +138,17 @@ impl Logger {
     async fn dispatch(&self, ctx: Ctx, msg: Message) {
         match msg.mtype {
             MsgType::TEXT => {
+                let decision = self.backpressure.borrow_mut().decide(ctx.mailbox_len());
+                let LogDecision::Write { dropped } = decision else {
+                    return;
+                };
+                if dropped != 0 {
+                    self.write(
+                        &ctx,
+                        ctx.handle(),
+                        &format!("日志队列积压，已丢弃 {dropped} 条较旧日志"),
+                    );
+                }
                 self.write(
                     &ctx,
                     msg.source,
@@ -116,5 +180,60 @@ pub trait RegistryExt {
 impl RegistryExt for Registry {
     fn with_logger(self) -> Self {
         self.with_exclusive(LOGGER, Logger::default)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_uses_the_default_limit() {
+        let config: LoggerConfig = toml::from_str("").unwrap();
+        assert_eq!(config.max_queue, DEFAULT_MAX_QUEUE);
+
+        let config: LoggerConfig = toml::from_str("max_queue = 0").unwrap();
+        assert_eq!(config.max_queue, 0);
+
+        let config: LoggerConfig = toml::from_str("max_queue = 42").unwrap();
+        assert_eq!(config.max_queue, 42);
+    }
+
+    #[test]
+    fn overload_drops_old_logs_and_reports_once_after_recovery() {
+        let mut state = Backpressure {
+            max_queue: 3,
+            dropped: 0,
+        };
+
+        assert_eq!(state.decide(5), LogDecision::Drop);
+        assert_eq!(state.decide(4), LogDecision::Drop);
+        assert_eq!(state.decide(3), LogDecision::Drop);
+        assert_eq!(state.decide(2), LogDecision::Write { dropped: 3 });
+        assert_eq!(state.decide(1), LogDecision::Write { dropped: 0 });
+
+        assert_eq!(state.decide(3), LogDecision::Drop);
+        assert_eq!(state.decide(2), LogDecision::Write { dropped: 1 });
+    }
+
+    #[test]
+    fn zero_limit_disables_dropping() {
+        let mut state = Backpressure {
+            max_queue: 0,
+            dropped: 0,
+        };
+
+        assert_eq!(state.decide(usize::MAX), LogDecision::Write { dropped: 0 });
+    }
+
+    #[test]
+    fn dropped_counter_saturates() {
+        let mut state = Backpressure {
+            max_queue: 1,
+            dropped: usize::MAX,
+        };
+
+        assert_eq!(state.decide(1), LogDecision::Drop);
+        assert_eq!(state.dropped, usize::MAX);
     }
 }

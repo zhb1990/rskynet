@@ -23,6 +23,8 @@ profile = true
 name = "logger"
 # 日志文件路径。留空则只写标准输出。
 path = ""
+# 最多保留多少条待写日志；超过后丢弃较旧日志，恢复时输出丢弃汇总。0 表示不限制。
+max_queue = 10000
 
 # 进程信号。整段不写就会启动内置信号服务：Unix 的 SIGINT/SIGTERM 与 Windows
 # 的 Ctrl+C 默认优雅关停；用 #[rskynet::signal(...)] 注册后覆盖对应默认行为。

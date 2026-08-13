@@ -12,3 +12,6 @@ rskynet-core = { workspace = true }
 rskynet-macros = { workspace = true }
 
 serde = { workspace = true }
+
+[dev-dependencies]
+toml = { workspace = true }

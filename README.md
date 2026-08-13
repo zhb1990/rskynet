@@ -454,10 +454,15 @@ pub trait Timer: Send + Sync + 'static {
 
 ```toml
 [logger]
-name = "my-logger"   # 换掉实现
+name = "logger"      # 换成自己的实现时改这里
+path = "run/rskynet.log"
+max_queue = 10000     # 积压超过此数时丢弃较旧日志；0 表示不限制
 [timer]
 name = ""            # 不起定时器服务，自己注入 Timer 实现
 ```
+
+内置 logger 的邮箱超过 `max_queue` 后会跳过较旧的文本日志，优先追上最新状态；
+积压回落后会先写一条汇总，说明本轮共丢弃了多少条。控制消息不会被丢弃。
 
 ### 网络层为什么在内核之外
 
