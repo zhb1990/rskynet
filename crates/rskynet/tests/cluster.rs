@@ -51,10 +51,14 @@ struct Stopper {
 #[rskynet::service]
 impl Stopper {
     async fn init(&self, ctx: Ctx) -> Result<()> {
-        while !self.done.load(SeqCst) {
-            ctx.sleep_ms(10).await;
-        }
-        ctx.abort();
+        let done = self.done.clone();
+        let task_ctx = ctx.clone();
+        ctx.spawn(async move {
+            while !done.load(SeqCst) {
+                task_ctx.sleep_ms(10).await;
+            }
+            task_ctx.abort();
+        });
         Ok(())
     }
 }
@@ -70,20 +74,25 @@ struct ManualDriver {
 #[rskynet::service]
 impl ManualDriver {
     async fn init(&self, ctx: Ctx) -> Result<()> {
-        let target = ClusterAddr::new(NodeId::new(12).unwrap(), "echo");
-        let deadline = ctx.now() + 500;
-        loop {
-            if matches!(
-                cluster::request::<Ping, Pong>(&ctx, target.clone(), Ping { value: 1 }).await,
-                Ok(Pong { value: 101 })
-            ) {
-                break;
+        let done = self.done.clone();
+        let task_ctx = ctx.clone();
+        ctx.spawn(async move {
+            let target = ClusterAddr::new(NodeId::new(12).unwrap(), "echo");
+            let deadline = task_ctx.now() + 500;
+            loop {
+                if matches!(
+                    cluster::request::<Ping, Pong>(&task_ctx, target.clone(), Ping { value: 1 })
+                        .await,
+                    Ok(Pong { value: 101 })
+                ) {
+                    break;
+                }
+                assert!(task_ctx.now() < deadline, "显式 cluster handler 未生效");
+                task_ctx.sleep_ms(25).await;
             }
-            assert!(ctx.now() < deadline, "显式 cluster handler 未生效");
-            ctx.sleep_ms(25).await;
-        }
-        self.done.store(true, SeqCst);
-        ctx.abort();
+            done.store(true, SeqCst);
+            task_ctx.abort();
+        });
         Ok(())
     }
 }
@@ -91,39 +100,47 @@ impl ManualDriver {
 #[rskynet::service]
 impl Driver {
     async fn init(&self, ctx: Ctx) -> Result<()> {
-        let node2 = ClusterAddr::new(NodeId::new(2).unwrap(), "echo");
-        let node3 = ClusterAddr::new(NodeId::new(3).unwrap(), 42u32);
-        let deadline = ctx.now() + 500;
-        loop {
-            let first =
-                cluster::request::<Ping, Pong>(&ctx, node2.clone(), Ping { value: 20 }).await;
-            let second =
-                cluster::request::<Ping, Pong>(&ctx, node3.clone(), Ping { value: 21 }).await;
-            if matches!(first, Ok(Pong { value: 21 })) && matches!(second, Ok(Pong { value: 42 })) {
-                break;
+        let done = self.done.clone();
+        let task_ctx = ctx.clone();
+        ctx.spawn(async move {
+            let node2 = ClusterAddr::new(NodeId::new(2).unwrap(), "echo");
+            let node3 = ClusterAddr::new(NodeId::new(3).unwrap(), 42u32);
+            let deadline = task_ctx.now() + 500;
+            loop {
+                let first =
+                    cluster::request::<Ping, Pong>(&task_ctx, node2.clone(), Ping { value: 20 })
+                        .await;
+                let second =
+                    cluster::request::<Ping, Pong>(&task_ctx, node3.clone(), Ping { value: 21 })
+                        .await;
+                if matches!(first, Ok(Pong { value: 21 }))
+                    && matches!(second, Ok(Pong { value: 42 }))
+                {
+                    break;
+                }
+                assert!(
+                    task_ctx.now() < deadline,
+                    "cluster 节点未在 5 秒内建连并完成请求"
+                );
+                task_ctx.sleep_ms(25).await;
             }
             assert!(
-                ctx.now() < deadline,
-                "cluster 节点未在 5 秒内建连并完成请求"
+                cluster::request::<Ping, WrongResponse>(&task_ctx, node2, Ping { value: 1 })
+                    .await
+                    .is_err()
             );
-            ctx.sleep_ms(25).await;
-        }
-        assert!(
-            cluster::request::<Ping, WrongResponse>(&ctx, node2, Ping { value: 1 })
+            assert!(
+                cluster::request::<Ping, Pong>(
+                    &task_ctx,
+                    ClusterAddr::new(NodeId::new(99).unwrap(), "echo"),
+                    Ping { value: 1 }
+                )
                 .await
                 .is_err()
-        );
-        assert!(
-            cluster::request::<Ping, Pong>(
-                &ctx,
-                ClusterAddr::new(NodeId::new(99).unwrap(), "echo"),
-                Ping { value: 1 }
-            )
-            .await
-            .is_err()
-        );
-        self.done.store(true, SeqCst);
-        ctx.abort();
+            );
+            done.store(true, SeqCst);
+            task_ctx.abort();
+        });
         Ok(())
     }
 }

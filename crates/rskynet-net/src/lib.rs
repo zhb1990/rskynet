@@ -21,15 +21,18 @@
 //!
 //! # 用起来是这样
 //!
-//! 网络层不是系统服务，内核不会自动拉起它，得在引导清单里点名：
+//! 使用 `rskynet` 门面时，配置段存在就会在业务引导前自动拉起：
 //!
 //! ```toml
 //! [net]
 //! max_socket = 65536
 //!
 //! [bootstrap]
-//! services = [{ name = "net" }, { name = "echo" }]
+//! services = [{ name = "echo" }]
 //! ```
+//!
+//! 直接使用 `rskynet-core::Builder` 时，则用 `startup_service("net", "")` 明确加入
+//! timer 与 bootstrap 之间的启动项。
 //!
 //! 然后一个回声服务器长这样：
 //!

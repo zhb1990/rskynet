@@ -180,7 +180,11 @@ impl Probe {
             .await?;
         self.note(format!("ping={}", Pong::from_payload(reply)?.0));
 
-        ctx.abort();
+        let task_ctx = ctx.clone();
+        ctx.spawn(async move {
+            task_ctx.yield_now().await;
+            task_ctx.abort();
+        });
         Ok(())
     }
 

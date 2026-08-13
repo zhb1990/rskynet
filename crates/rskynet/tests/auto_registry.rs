@@ -29,17 +29,17 @@ fn named_macros_populate_the_auto_registry() -> Result<()> {
         .map(|service| (service.name, service.exclusive))
         .collect();
     kinds.sort_unstable();
-    assert_eq!(
-        kinds,
-        vec![
-            ("auto-dedicated", true),
-            ("auto-shared", false),
-            ("bootstrap", false),
-            ("logger", true),
-            ("net", true),
-            ("signal", true),
-        ]
-    );
+    let mut expected = vec![
+        ("auto-dedicated", true),
+        ("auto-shared", false),
+        ("bootstrap", false),
+        ("logger", true),
+        ("signal", true),
+    ];
+    #[cfg(feature = "net")]
+    expected.push(("net", true));
+    expected.sort_unstable();
+    assert_eq!(kinds, expected);
     let signals: Vec<_> = rskynet::__private::inventory::iter::<rskynet::signal::AutoSignal>
         .into_iter()
         .map(|registration| (registration.signal, registration.source))

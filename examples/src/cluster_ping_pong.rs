@@ -158,54 +158,68 @@ struct ClusterPing;
 #[rskynet::service(name = "cluster-ping")]
 impl ClusterPing {
     async fn init(&self, ctx: Ctx, args: String) -> Result<()> {
-        let mut args = args.split_whitespace();
-        let pong_node = args.next().and_then(|v| v.parse().ok()).unwrap_or(2);
-        let rounds = args.next().and_then(|v| v.parse().ok()).unwrap_or(10u64);
-        let pong_node = NodeId::new(pong_node).map_err(|err| Error::service(err.to_string()))?;
-        let target = ClusterAddr::new(pong_node, PONG_SERVICE);
+        let task_ctx = ctx.clone();
+        ctx.spawn(async move {
+            let result: Result<()> = async {
+                let ctx = task_ctx.clone();
+                let mut args = args.split_whitespace();
+                let pong_node = args.next().and_then(|v| v.parse().ok()).unwrap_or(2);
+                let rounds = args.next().and_then(|v| v.parse().ok()).unwrap_or(10u64);
+                let pong_node =
+                    NodeId::new(pong_node).map_err(|err| Error::service(err.to_string()))?;
+                let target = ClusterAddr::new(pong_node, PONG_SERVICE);
 
-        let started = Instant::now();
-        for round in 1..=rounds {
-            let deadline = ctx.now() + 500;
-            let pong = loop {
-                match cluster::request::<PingRequest, PongResponse>(
+                let started = Instant::now();
+                for round in 1..=rounds {
+                    let deadline = ctx.now() + 500;
+                    let pong = loop {
+                        match cluster::request::<PingRequest, PongResponse>(
+                            &ctx,
+                            target.clone(),
+                            PingRequest { round },
+                        )
+                        .await
+                        {
+                            Ok(pong) => break pong,
+                            Err(err) if ctx.now() < deadline => {
+                                rskynet::log!(ctx, "等待 pong 节点就绪：{err}");
+                                ctx.sleep_ms(100).await;
+                            }
+                            Err(err) => {
+                                return Err(Error::service(format!("跨节点 ping 失败：{err}")));
+                            }
+                        }
+                    };
+                    if pong.round != round || pong.node_id != pong_node.get() {
+                        return Err(Error::service("pong 应答与 ping 不匹配"));
+                    }
+                    rskynet::log!(
+                        ctx,
+                        "ping #{round} -> node {} -> pong #{}, 成功",
+                        pong.node_id,
+                        pong.round
+                    );
+                }
+                rskynet::log!(
+                    ctx,
+                    "{rounds} 次跨节点 ping/pong 耗时 {:?}",
+                    started.elapsed()
+                );
+                cluster::request::<ShutdownRequest, ShutdownResponse>(
                     &ctx,
-                    target.clone(),
-                    PingRequest { round },
+                    ClusterAddr::new(pong_node, PONG_CONTROL),
+                    ShutdownRequest {},
                 )
                 .await
-                {
-                    Ok(pong) => break pong,
-                    Err(err) if ctx.now() < deadline => {
-                        rskynet::log!(ctx, "等待 pong 节点就绪：{err}");
-                        ctx.sleep_ms(100).await;
-                    }
-                    Err(err) => return Err(Error::service(format!("跨节点 ping 失败：{err}"))),
-                }
-            };
-            if pong.round != round || pong.node_id != pong_node.get() {
-                return Err(Error::service("pong 应答与 ping 不匹配"));
+                .map_err(|err| Error::service(format!("关闭 pong 节点失败：{err}")))?;
+                Ok(())
             }
-            rskynet::log!(
-                ctx,
-                "ping #{round} -> node {} -> pong #{}, 成功",
-                pong.node_id,
-                pong.round
-            );
-        }
-        rskynet::log!(
-            ctx,
-            "{rounds} 次跨节点 ping/pong 耗时 {:?}",
-            started.elapsed()
-        );
-        cluster::request::<ShutdownRequest, ShutdownResponse>(
-            &ctx,
-            ClusterAddr::new(pong_node, PONG_CONTROL),
-            ShutdownRequest {},
-        )
-        .await
-        .map_err(|err| Error::service(format!("关闭 pong 节点失败：{err}")))?;
-        ctx.abort();
+            .await;
+            if let Err(err) = result {
+                rskynet::log!(task_ctx, "cluster ping 流程失败：{err}");
+            }
+            task_ctx.abort();
+        });
         Ok(())
     }
 }

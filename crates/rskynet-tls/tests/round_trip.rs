@@ -54,35 +54,45 @@ struct Client {
 #[rskynet_macros::service(crate = ::rskynet_core)]
 impl Client {
     async fn init(&self, ctx: Ctx) -> Result<()> {
-        let address = loop {
-            if let Some(address) = *self.board.address.lock().unwrap() {
-                break address;
+        let board = self.board.clone();
+        let config = self.config.clone();
+        let task_ctx = ctx.clone();
+        ctx.spawn(async move {
+            let result: Result<()> = async {
+                let address = loop {
+                    if let Some(address) = *board.address.lock().unwrap() {
+                        break address;
+                    }
+                    task_ctx.sleep_ms(10).await;
+                };
+                let id = rskynet_tls::connect(
+                    &task_ctx,
+                    ClientOptions::new(
+                        address.to_string(),
+                        ServerName::try_from("localhost").unwrap().to_owned(),
+                        config,
+                    ),
+                )
+                .await?;
+                rskynet_tls::pause(&task_ctx, id).await?;
+                rskynet_tls::send(&task_ctx, id, b"hello over tls".to_vec())?;
+                task_ctx.sleep_ms(50).await;
+                *board.paused_was_silent.lock().unwrap() =
+                    board.received.lock().unwrap().is_empty();
+                rskynet_tls::start(&task_ctx, id).await?;
+                for _ in 0..500 {
+                    if board.received.lock().unwrap().as_slice() == b"hello over tls" {
+                        break;
+                    }
+                    task_ctx.sleep_ms(10).await;
+                }
+                let _ = rskynet_tls::close(&task_ctx, id).await;
+                Ok(())
             }
-            ctx.sleep_ms(10).await;
-        };
-        let id = rskynet_tls::connect(
-            &ctx,
-            ClientOptions::new(
-                address.to_string(),
-                ServerName::try_from("localhost").unwrap().to_owned(),
-                self.config.clone(),
-            ),
-        )
-        .await?;
-        rskynet_tls::pause(&ctx, id).await?;
-        rskynet_tls::send(&ctx, id, b"hello over tls".to_vec())?;
-        ctx.sleep_ms(50).await;
-        *self.board.paused_was_silent.lock().unwrap() =
-            self.board.received.lock().unwrap().is_empty();
-        rskynet_tls::start(&ctx, id).await?;
-        for _ in 0..500 {
-            if self.board.received.lock().unwrap().as_slice() == b"hello over tls" {
-                break;
-            }
-            ctx.sleep_ms(10).await;
-        }
-        let _ = rskynet_tls::close(&ctx, id).await;
-        ctx.abort();
+            .await;
+            assert!(result.is_ok(), "TLS 客户端流程失败: {result:?}");
+            task_ctx.abort();
+        });
         Ok(())
     }
 
@@ -127,7 +137,7 @@ fn client_and_server_exchange_plaintext_over_net() {
             board: client_board.clone(),
             config: client.clone(),
         });
-    let mut config = Config::default().with_bootstrap(["net", "tls", "echo", "client"]);
+    let mut config = Config::default().with_bootstrap(["echo", "client"]);
     config
         .section_mut("logger")
         .insert("name".into(), "".into());
@@ -138,6 +148,8 @@ fn client_and_server_exchange_plaintext_over_net() {
         .registry(registry)
         .with_wheel_timer()
         .service("bootstrap", || rskynet_bootstrap::Bootstrap)
+        .startup_service(rskynet_net::NAME, "")
+        .startup_service(rskynet_tls::NAME, "")
         .run()
         .expect("TLS 测试节点应正常退出");
 

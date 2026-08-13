@@ -228,8 +228,8 @@ impl BuilderExt for Builder {
             use rskynet_timer::BuilderExt as _;
             builder = builder.with_wheel_timer();
         }
-        // 网络层只注册类型，不拉起：它不是系统服务，什么时候起由 `[bootstrap]`
-        // 的清单说了算
+        // 可选内置服务这里只注册类型；`start` 会根据配置段和依赖关系把实际启动项
+        // 交给 Builder，放在 timer 与 bootstrap 之间依次等待完整初始化。
         #[cfg(feature = "net")]
         {
             builder = builder.exclusive_service(rskynet_net::NAME, rskynet_net::NetService::new);
@@ -251,149 +251,169 @@ impl BuilderExt for Builder {
 /// 与 [`rskynet_core::start`] 的区别是这里会先挂上内置服务、注入时间来源，
 /// 所以使用方只管注册自己的服务类型。要自己拼这些，走 [`Builder`]。
 pub fn start(config: Config, registry: Registry) -> Result<()> {
-    #[cfg(feature = "cluster")]
-    let (config, registry) = {
-        let mut config = config;
-        let mut registry = registry;
-        prepare_cluster(&mut config, &mut registry)?;
-        (config, registry)
-    };
-    Builder::new(config)
-        .registry(registry)
-        .with_builtins()
-        .run()
+    let mut registry = registry;
+    let startup = prepare_startup(&config, &mut registry)?;
+    let mut builder = Builder::new(config).registry(registry).with_builtins();
+    for kind in startup {
+        builder = builder.startup_service(kind, "");
+    }
+    builder.run()
 }
 
-#[cfg(feature = "cluster")]
-fn prepare_cluster(config: &mut Config, registry: &mut Registry) -> Result<()> {
-    use rskynet_cluster::{ClusterConfig, ClusterService, HandlerRegistry};
+fn prepare_startup(config: &Config, registry: &mut Registry) -> Result<Vec<&'static str>> {
+    const NET: &str = "net";
+    const TLS: &str = "tls";
+    const HTTP: &str = "http-client";
+    const CLUSTER: &str = "cluster";
 
-    if config
-        .section::<ClusterConfig>(rskynet_cluster::NAME)?
-        .is_none()
-    {
-        return Ok(());
+    let has_net = config.has_section(NET);
+    let has_tls = config.has_section(TLS);
+    let has_http = config.has_section(HTTP);
+    let has_cluster = config.has_section(CLUSTER);
+    #[cfg(not(feature = "cluster"))]
+    let _ = registry;
+
+    #[cfg(not(feature = "net"))]
+    if has_net {
+        return Err(Error::Config("[net] 需要启用 `net` feature".into()));
     }
-
-    let bootstrap = config.section_mut(rskynet_core::service::BOOTSTRAP);
-    let bootstrap_kind = bootstrap
-        .get("name")
-        .and_then(toml::Value::as_str)
-        .unwrap_or(rskynet_core::service::BOOTSTRAP);
-    if bootstrap_kind != rskynet_core::service::BOOTSTRAP {
+    #[cfg(not(feature = "tls"))]
+    if has_tls {
         return Err(Error::Config(
-            "[cluster] 自动启动要求使用默认 bootstrap；定制启动请使用 Builder".into(),
+            "[tls] 需要启用 `tls` 或 `https` feature".into(),
         ));
     }
+    #[cfg(not(feature = "http"))]
+    if has_http {
+        return Err(Error::Config(
+            "[http-client] 需要启用 `http` 或 `https` feature".into(),
+        ));
+    }
+    #[cfg(not(feature = "cluster"))]
+    if has_cluster {
+        return Err(Error::Config("[cluster] 需要启用 `cluster` feature".into()));
+    }
 
-    let services = match bootstrap.remove("services") {
-        Some(value) => value.try_into::<Vec<ServiceSpec>>()?,
-        None => Vec::new(),
-    };
-    let mut net = None;
-    let mut cluster = None;
-    let mut business = Vec::new();
-    for service in services {
-        match service.name.as_str() {
-            rskynet_net::NAME if net.is_none() => net = Some(service),
-            rskynet_cluster::NAME if cluster.is_none() => cluster = Some(service),
-            rskynet_net::NAME | rskynet_cluster::NAME => {}
-            _ => business.push(service),
+    #[cfg(feature = "bootstrap")]
+    if let Some(bootstrap) =
+        config.section::<rskynet_bootstrap::BootstrapConfig>(rskynet_core::service::BOOTSTRAP)?
+    {
+        if let Some(service) = bootstrap
+            .services
+            .iter()
+            .find(|service| matches!(service.name.as_str(), NET | TLS | HTTP | CLUSTER))
+        {
+            return Err(Error::Config(format!(
+                "[bootstrap].services 不应手工启动 `{}`；请改用对应配置段",
+                service.name
+            )));
         }
     }
-    let mut services = vec![
-        net.unwrap_or_else(|| ServiceSpec::new(rskynet_net::NAME)),
-        cluster.unwrap_or_else(|| ServiceSpec::new(rskynet_cluster::NAME)),
-    ];
-    services.extend(business);
-    bootstrap.insert(
-        "services".into(),
-        toml::Value::try_from(services).expect("启动项一定能编成 TOML"),
-    );
 
-    if !registry.contains(rskynet_cluster::NAME) {
+    #[cfg(feature = "cluster")]
+    if has_cluster && !registry.contains(rskynet_cluster::NAME) {
+        use rskynet_cluster::{ClusterService, HandlerRegistry};
         let handlers =
             HandlerRegistry::from_auto().map_err(|error| Error::Config(error.to_string()))?;
         registry.register(rskynet_cluster::NAME, move || {
             ClusterService::new(handlers.clone())
         });
     }
-    Ok(())
+
+    let need_http = has_http;
+    let need_cluster = has_cluster;
+    let need_tls = has_tls || (need_http && cfg!(feature = "https"));
+    let need_net = has_net || need_tls || need_http || need_cluster;
+    let mut startup = Vec::new();
+    if need_net {
+        startup.push(NET);
+    }
+    if need_tls {
+        startup.push(TLS);
+    }
+    if need_http {
+        startup.push(HTTP);
+    }
+    if need_cluster {
+        startup.push(CLUSTER);
+    }
+    Ok(startup)
 }
 
-#[cfg(all(test, feature = "cluster"))]
-mod cluster_start_tests {
+#[cfg(test)]
+mod startup_tests {
     use super::*;
-    use rskynet_cluster::{HandlerRegistry, RegistryExt as _};
-    use serde::Deserialize;
 
-    #[derive(Deserialize)]
-    struct BootstrapSection {
-        services: Vec<ServiceSpec>,
-    }
-
-    fn clustered(services: impl IntoIterator<Item = impl Into<ServiceSpec>>) -> Config {
-        let mut config = Config::default().with_bootstrap(services);
-        config
-            .section_mut(rskynet_cluster::NAME)
-            .insert("node_id".into(), 1.into());
+    fn with_empty_section(mut config: Config, name: &str) -> Config {
+        config.section_mut(name);
         config
     }
 
+    #[cfg(feature = "bootstrap")]
     #[test]
-    fn cluster_section_prepends_and_deduplicates_infrastructure() {
-        let mut config = clustered([
-            ("cluster", "first"),
-            ("net", "net-args"),
-            ("cluster", "ignored"),
-            ("business", "business-args"),
-            ("net", "ignored"),
-        ]);
-        let mut registry = Registry::new();
-        prepare_cluster(&mut config, &mut registry).unwrap();
-        let section: BootstrapSection = config.section("bootstrap").unwrap().unwrap();
-        let actual: Vec<(&str, &str)> = section
-            .services
-            .iter()
-            .map(|service| (service.name.as_str(), service.args.as_str()))
-            .collect();
+    fn bootstrap_must_not_repeat_automatic_services() {
+        let config = Config::default().with_bootstrap(["net"]);
+        let err = prepare_startup(&config, &mut Registry::new()).unwrap_err();
+        assert!(err.to_string().contains("不应手工启动 `net`"));
+    }
+
+    #[cfg(not(feature = "net"))]
+    #[test]
+    fn configured_but_uncompiled_service_is_an_error() {
+        let config = with_empty_section(Config::default(), "net");
+        let err = prepare_startup(&config, &mut Registry::new()).unwrap_err();
+        assert!(err.to_string().contains("`net` feature"));
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn empty_net_section_enables_net() {
+        let config = with_empty_section(Config::default(), "net");
         assert_eq!(
-            actual,
-            [
-                ("net", "net-args"),
-                ("cluster", "first"),
-                ("business", "business-args")
-            ]
+            prepare_startup(&config, &mut Registry::new()).unwrap(),
+            ["net"]
         );
-        assert!(registry.contains(rskynet_cluster::NAME));
     }
 
+    #[cfg(feature = "tls")]
     #[test]
-    fn missing_cluster_section_changes_nothing() {
-        let mut config = Config::default().with_bootstrap(["business"]);
+    fn tls_adds_default_net_dependency() {
+        let config = with_empty_section(Config::default(), "tls");
+        assert_eq!(
+            prepare_startup(&config, &mut Registry::new()).unwrap(),
+            ["net", "tls"]
+        );
+    }
+
+    #[cfg(all(feature = "http", not(feature = "https")))]
+    #[test]
+    fn plain_http_client_adds_only_net() {
+        let config = with_empty_section(Config::default(), "http-client");
+        assert_eq!(
+            prepare_startup(&config, &mut Registry::new()).unwrap(),
+            ["net", "http-client"]
+        );
+    }
+
+    #[cfg(feature = "https")]
+    #[test]
+    fn https_client_adds_net_and_tls_in_order() {
+        let config = with_empty_section(Config::default(), "http-client");
+        assert_eq!(
+            prepare_startup(&config, &mut Registry::new()).unwrap(),
+            ["net", "tls", "http-client"]
+        );
+    }
+
+    #[cfg(feature = "cluster")]
+    #[test]
+    fn cluster_adds_net_and_builds_handler_registry() {
+        let config = with_empty_section(Config::default(), "cluster");
         let mut registry = Registry::new();
-        prepare_cluster(&mut config, &mut registry).unwrap();
-        let section: BootstrapSection = config.section("bootstrap").unwrap().unwrap();
-        assert_eq!(section.services.len(), 1);
-        assert_eq!(section.services[0].name, "business");
-        assert!(!registry.contains(rskynet_cluster::NAME));
-    }
-
-    #[test]
-    fn custom_bootstrap_is_rejected() {
-        let mut config = clustered(std::iter::empty::<&str>());
-        config
-            .section_mut("bootstrap")
-            .insert("name".into(), "custom".into());
-        let error = prepare_cluster(&mut config, &mut Registry::new()).unwrap_err();
-        assert!(error.to_string().contains("默认 bootstrap"));
-    }
-
-    #[test]
-    fn explicit_cluster_registration_is_preserved() {
-        let mut config = clustered(std::iter::empty::<&str>());
-        let mut registry = Registry::new().with_cluster(HandlerRegistry::new());
-        prepare_cluster(&mut config, &mut registry).unwrap();
-        assert!(registry.contains(rskynet_cluster::NAME));
+        assert_eq!(
+            prepare_startup(&config, &mut registry).unwrap(),
+            ["net", "cluster"]
+        );
+        assert!(registry.contains("cluster"));
     }
 }

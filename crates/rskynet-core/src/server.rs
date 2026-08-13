@@ -14,14 +14,18 @@
 
 use std::any::Any;
 use std::cell::Cell;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
+use std::task::{Context, Poll};
 use std::thread::{self, JoinHandle, Thread};
 
 use arc_swap::ArcSwapOption;
 use futures_util::future::BoxFuture;
-use parking_lot::Mutex;
+use futures_util::task::AtomicWaker;
+use parking_lot::{Condvar, Mutex};
 
 use crate::clock::Timer;
 use crate::context::{Ctx, Service};
@@ -47,6 +51,101 @@ use crate::task::TaskSet;
 /// 以及它开出来的那个任务随后那次 poll。
 const YIELD_INTERVAL: usize = 64;
 
+mod lifecycle {
+    pub(super) const INITIALIZING: u8 = 0;
+    pub(super) const RUNNING: u8 = 1;
+    pub(super) const FAILED: u8 = 2;
+}
+
+struct InitShared {
+    result: Mutex<Option<std::result::Result<(), String>>>,
+    ready: Condvar,
+    waker: AtomicWaker,
+}
+
+impl InitShared {
+    fn complete(&self, result: std::result::Result<(), String>) {
+        let mut slot = self.result.lock();
+        if slot.is_some() {
+            return;
+        }
+        *slot = Some(result);
+        drop(slot);
+        self.ready.notify_all();
+        self.waker.wake();
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct InitTicket {
+    kind: String,
+    shared: Arc<InitShared>,
+}
+
+impl InitTicket {
+    fn new(kind: &str) -> Self {
+        Self {
+            kind: kind.to_string(),
+            shared: Arc::new(InitShared {
+                result: Mutex::new(None),
+                ready: Condvar::new(),
+                waker: AtomicWaker::new(),
+            }),
+        }
+    }
+
+    fn result(&self) -> Option<Result<()>> {
+        self.shared.result.lock().clone().map(|result| {
+            result.map_err(|reason| Error::Init {
+                kind: self.kind.clone(),
+                reason,
+            })
+        })
+    }
+
+    pub(crate) fn wait(&self) -> Result<()> {
+        let mut result = self.shared.result.lock();
+        while result.is_none() {
+            self.shared.ready.wait(&mut result);
+        }
+        result
+            .clone()
+            .expect("初始化结果已经就绪")
+            .map_err(|reason| Error::Init {
+                kind: self.kind.clone(),
+                reason,
+            })
+    }
+}
+
+impl Future for InitTicket {
+    type Output = Result<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if let Some(result) = self.result() {
+            return Poll::Ready(result);
+        }
+        self.shared.waker.register(cx.waker());
+        match self.result() {
+            Some(result) => Poll::Ready(result),
+            None => Poll::Pending,
+        }
+    }
+}
+
+pub(crate) struct NewService {
+    pub(crate) handle: u32,
+    pub(crate) init: InitTicket,
+}
+
+impl std::fmt::Debug for NewService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewService")
+            .field("handle", &self.handle)
+            .finish_non_exhaustive()
+    }
+}
+
 /// 一个服务的运行时上下文。
 pub(crate) struct ServiceContext {
     pub(crate) handle: u32,
@@ -62,6 +161,11 @@ pub(crate) struct ServiceContext {
     /// 独占线程的句柄，投递方靠它把那条线程从 park 里叫醒。
     thread: ArcSwapOption<Thread>,
     tasks: TaskSet,
+    lifecycle: AtomicU8,
+    init: InitTicket,
+    init_self_exit: AtomicBool,
+    /// 只在初始化期存在。成功后由执行者按 FIFO 排空并 `take`，立即释放容量。
+    pending_messages: crate::task::SvcCell<Option<VecDeque<Message>>>,
     /// 已被摘出 handle 表，等待某个 worker 领走做销毁。
     dead: AtomicBool,
     /// 保留服务：不计入退出条件，且要留到最后才释放。
@@ -89,8 +193,7 @@ thread_local! {
 
 /// 标记「本线程正在执行某个服务」，析构时还原成先前那个。
 ///
-/// 需要还原而不是清零，是因为会嵌套：服务 A 的任务里调 `launch` 起服务 B 时，
-/// B 的 init 会就地在 A 的线程上跑到第一次挂起。
+/// 需要还原而不是清零，是因为持有者可能在内部辅助路径中临时重入所有权作用域。
 struct Running(usize);
 
 impl Running {
@@ -128,6 +231,45 @@ impl ServiceContext {
 
     pub(crate) fn is_reserved(&self) -> bool {
         self.reserved.load(Ordering::Acquire)
+    }
+
+    fn is_running(&self) -> bool {
+        self.lifecycle.load(Ordering::Acquire) == lifecycle::RUNNING
+    }
+
+    fn finish_init(&self, result: std::result::Result<(), String>) {
+        let result =
+            if result.is_ok() && self.is_dead() && !self.init_self_exit.load(Ordering::Acquire) {
+                Err("服务在初始化完成前被终止".into())
+            } else {
+                result
+            };
+        let state = if result.is_ok() {
+            lifecycle::RUNNING
+        } else {
+            lifecycle::FAILED
+        };
+        self.lifecycle.store(state, Ordering::Release);
+        self.init.shared.complete(result);
+    }
+
+    pub(crate) fn request_exit(&self) {
+        let initializing_here = self.lifecycle.load(Ordering::Acquire) == lifecycle::INITIALIZING
+            && self.owns_current_thread();
+        if self.node.retire(self.handle) && initializing_here {
+            self.init_self_exit.store(true, Ordering::Release);
+        }
+    }
+
+    fn take_pending(&self) -> Option<Message> {
+        let mut pending = self.pending_messages.borrow_mut();
+        let queue = pending.as_mut()?;
+        let message = queue.pop_front();
+        if message.is_none() {
+            // Running 之后不会再有消息进入这里，释放 VecDeque 保留的容量。
+            pending.take();
+        }
+        message
     }
 
     fn mark_dead(&self) {
@@ -247,8 +389,8 @@ impl ServiceContext {
     /// 处理一条消息，对照 C 版 `dispatch_message` 与 skynet.lua 的
     /// `raw_dispatch_message`：应答消息唤醒挂起的 session，其余消息开一个新任务。
     fn handle_message(self: &Arc<Self>, mut msg: Message) {
-        self.message_count.fetch_add(1, Ordering::Relaxed);
         if msg.mtype.is_reply() && msg.session != 0 {
+            self.message_count.fetch_add(1, Ordering::Relaxed);
             let result = if msg.mtype == MsgType::ERROR {
                 Err(Error::CallFailed(msg.source))
             } else {
@@ -257,6 +399,15 @@ impl ServiceContext {
             self.sessions.complete(msg.session, result);
             return;
         }
+        if !self.is_running() {
+            self.pending_messages
+                .borrow_mut()
+                .as_mut()
+                .expect("非 Running 服务应当仍持有 pending 队列")
+                .push_back(msg);
+            return;
+        }
+        self.message_count.fetch_add(1, Ordering::Relaxed);
         let (source, session) = (msg.source, msg.session);
         let request = (session != 0 && source != 0).then_some((source, session));
         let ctx = Ctx::new(self.clone());
@@ -287,13 +438,6 @@ impl ServiceContext {
             // 任务正常跑完，它手上那个请求也就算办完了，不必再回错误
             std::task::Poll::Ready(()) => self.tasks.remove(task),
             std::task::Poll::Pending => self.tasks.restore(task, future),
-        }
-    }
-
-    /// 只把就绪队列推进到全部挂起，不碰邮箱。服务初始化阶段用它。
-    fn drain_ready(self: &Arc<Self>) {
-        while let Some(ready) = self.mailbox.take_ready() {
-            self.run_ready(ready);
         }
     }
 
@@ -355,6 +499,22 @@ impl ServiceContext {
                         Payload::None,
                     );
                 }
+            }
+            if let Some(pending) = self.pending_messages.borrow_mut().take() {
+                for msg in pending {
+                    if msg.needs_reply() && msg.source != 0 && !msg.mtype.is_reply() {
+                        let _ = self.node.send_raw(
+                            self.handle,
+                            msg.source,
+                            MsgType::ERROR,
+                            msg.session,
+                            Payload::None,
+                        );
+                    }
+                }
+            }
+            if self.lifecycle.load(Ordering::Acquire) == lifecycle::INITIALIZING {
+                self.finish_init(Err("服务在初始化完成前退出".into()));
             }
             if self.mailbox.release() {
                 return;
@@ -442,6 +602,9 @@ impl Node {
     /// 系统服务都拉起来了，见 [`Node::is_booted`]。
     pub(crate) fn mark_booted(&self) {
         self.booted.store(true, Ordering::Release);
+        if self.total() == 0 {
+            self.quit();
+        }
     }
 
     pub(crate) fn is_booted(&self) -> bool {
@@ -510,12 +673,9 @@ impl Node {
 
     /// 创建服务，对照 `skynet_context_new`。
     ///
-    /// 初始化被当成服务的第一个任务，并在调用者线程上就地推进到它第一次挂起
-    /// ——此时 `in_global` 自创建起就是置位的，没有任何 worker 能同时碰到这个
-    /// 服务，所以就地 poll 不会破坏「一服务一线程」的不变量。
-    /// 这也复刻了 skynet 的行为：`skynet.start` 注册的初始化协程会先跑到第一次
-    /// yield，`launch` 才返回。
-    pub(crate) fn new_service(self: &Arc<Self>, kind: &str, args: &str) -> Result<u32> {
+    /// 初始化被当成服务自己的第一个任务：共享服务交给 worker，独占服务交给专属
+    /// 线程。调用者只拿到等待票据，绝不在自己的线程上 poll 用户的 `init`。
+    pub(crate) fn new_service(self: &Arc<Self>, kind: &str, args: &str) -> Result<NewService> {
         let factory = self
             .modules
             .get(kind)
@@ -524,6 +684,8 @@ impl Node {
         let service = instance.service.clone();
         let exclusive = instance.exclusive.clone();
 
+        let init = InitTicket::new(kind);
+        let init_for_ctx = init.clone();
         let node = self.clone();
         let kind_name = kind.to_string();
         let ctx = self.handles.register_with(move |handle| {
@@ -537,6 +699,10 @@ impl Node {
                 exclusive: instance.exclusive,
                 thread: ArcSwapOption::empty(),
                 tasks: TaskSet::new(),
+                lifecycle: AtomicU8::new(lifecycle::INITIALIZING),
+                init: init_for_ctx,
+                init_self_exit: AtomicBool::new(false),
+                pending_messages: crate::task::SvcCell::new(Some(VecDeque::new())),
                 dead: AtomicBool::new(false),
                 reserved: AtomicBool::new(false),
                 destroyed: AtomicBool::new(false),
@@ -549,43 +715,27 @@ impl Node {
         let handle = ctx.handle;
         self.total.fetch_add(1, Ordering::AcqRel);
 
-        // 初始化失败的原因要能同步带回给 launch 的调用方
-        let failure: Arc<Mutex<Option<Error>>> = Arc::new(Mutex::new(None));
-        {
-            let slot = failure.clone();
-            let cx = Ctx::new(ctx.clone());
-            let args = args.to_string();
-            // 这个服务还没进过运行队列，本线程独占它，可以直接插任务
+        let cx = Ctx::new(ctx.clone());
+        let args = args.to_string();
+        let init_args = args.clone();
+        let owner = ctx.clone();
+        // 构造线程此刻仍独占这个尚未调度的服务；只安装 init 任务，不 poll 用户代码。
+        ctx.with_ownership(|| {
             ctx.install_task(
                 Box::pin(async move {
-                    if let Err(err) = service.init(cx.clone(), args).await {
-                        cx.log(format!("error: 初始化失败：{err}"));
-                        *slot.lock() = Some(err);
-                        // 初始化失败的服务不该留在世上；同步阶段失败时
-                        // new_service 会看到 dead 标志并接手善后
-                        cx.exit();
+                    match service.init(cx.clone(), init_args).await {
+                        Ok(()) => owner.finish_init(Ok(())),
+                        Err(err) => {
+                            cx.log(format!("error: 初始化失败：{err}"));
+                            owner.finish_init(Err(err.to_string()));
+                            cx.exit();
+                        }
                     }
                 }),
                 None,
                 0,
             );
-        }
-        ctx.drain_ready();
-
-        // 注意：init 里主动 `exit` 是合法的（bootstrap 就是干完活立刻退场），
-        // 所以只有拿到明确的错误才算启动失败
-        if let Some(err) = failure.lock().take() {
-            self.handles.retire(handle);
-            ctx.mark_dead();
-            // 这个服务从创建起就没进过运行队列，一直被本线程独占；把状态挪到
-            // RUNNING 是为了让销毁流程的「放生」一步与正常路径走同一套 CAS
-            ctx.mailbox.mark_running();
-            self.destroy(&ctx);
-            return Err(Error::Init {
-                kind: kind.to_string(),
-                reason: err.to_string(),
-            });
-        }
+        });
 
         self.log(handle, format!("LAUNCH {kind} {args}"));
         match exclusive {
@@ -594,7 +744,7 @@ impl Node {
             // 独占服务的执行者是它自己那条线程，起来就接管
             Some(service) => self.spawn_exclusive(ctx, service),
         }
-        Ok(handle)
+        Ok(NewService { handle, init })
     }
 
     /// 给一个独占服务起专属线程，见 [`crate::exclusive`]。
@@ -724,7 +874,7 @@ impl Node {
         if ctx.is_reserved() {
             return;
         }
-        if self.total.fetch_sub(1, Ordering::AcqRel) <= 1 {
+        if self.total.fetch_sub(1, Ordering::AcqRel) <= 1 && self.is_booted() {
             // 最后一个服务也走了，通知所有线程收工
             self.quit();
         }
@@ -781,6 +931,16 @@ impl Node {
         }
         let mut done = 0usize;
         loop {
+            if ctx.is_running() {
+                if let Some(msg) = ctx.take_pending() {
+                    ctx.handle_message(msg);
+                    done += 1;
+                    if preemptible && done >= YIELD_INTERVAL && self.sched.should_yield() {
+                        return Ran::Yielded;
+                    }
+                    continue;
+                }
+            }
             match ctx.mailbox.take_work() {
                 // 邮箱和就绪队列都空了，状态已落回 IDLE，服务就此放生
                 None => return Ran::Idle,
@@ -921,6 +1081,8 @@ pub(crate) mod tests {
 
     /// 同上，但挂在指定节点下，好让一批上下文共用一个调度器。
     pub(crate) fn dummy_context_on(node: Arc<Node>, handle: u32) -> Arc<ServiceContext> {
+        let init = InitTicket::new("null");
+        init.shared.complete(Ok(()));
         Arc::new_cyclic(|me| ServiceContext {
             handle,
             kind: "null".to_string(),
@@ -931,6 +1093,10 @@ pub(crate) mod tests {
             exclusive: None,
             thread: ArcSwapOption::empty(),
             tasks: TaskSet::new(),
+            lifecycle: AtomicU8::new(lifecycle::RUNNING),
+            init,
+            init_self_exit: AtomicBool::new(false),
+            pending_messages: crate::task::SvcCell::new(None),
             dead: AtomicBool::new(false),
             reserved: AtomicBool::new(false),
             destroyed: AtomicBool::new(false),
@@ -945,7 +1111,7 @@ pub(crate) mod tests {
     #[test]
     fn new_service_is_addressable() {
         let node = test_node();
-        let handle = node.new_service("null", "").expect("应创建成功");
+        let handle = node.new_service("null", "").expect("应创建成功").handle;
         assert_eq!(node.total(), 1);
         assert!(node.handles.grab(handle).is_some());
         assert_eq!(node.resolve(&Addr::Handle(handle)).unwrap(), handle);
@@ -964,7 +1130,8 @@ pub(crate) mod tests {
     #[test]
     fn retired_service_becomes_unreachable() {
         let node = test_node();
-        let handle = node.new_service("null", "").unwrap();
+        let handle = node.new_service("null", "").unwrap().handle;
+        node.mark_booted();
         assert!(node.retire(handle));
         assert!(!node.retire(handle), "重复摘除应返回 false");
         assert!(node.handles.grab(handle).is_none());
@@ -982,7 +1149,7 @@ pub(crate) mod tests {
     #[test]
     fn a_service_killed_while_held_is_still_destroyed() {
         let node = test_node();
-        let handle = node.new_service("null", "").unwrap();
+        let handle = node.new_service("null", "").unwrap().handle;
         // 扮成 worker 把它领走，此刻它的状态是 RUNNING
         let ctx = node.sched.pop().expect("新服务应当排在运行队列里");
         assert_eq!(ctx.handle, handle);
@@ -1075,7 +1242,8 @@ pub(crate) mod tests {
     #[test]
     fn an_exclusive_service_brings_its_own_thread() {
         let node = test_node();
-        let handle = node.new_service("solo", "").expect("应创建成功");
+        let handle = node.new_service("solo", "").expect("应创建成功").handle;
+        node.mark_booted();
         let ctx = node.handles.grab(handle).expect("应当能按地址找回来");
         assert!(ctx.is_exclusive());
         assert_eq!(node.sched.len(), 0, "独占服务不该进运行队列");
@@ -1092,7 +1260,7 @@ pub(crate) mod tests {
     #[test]
     fn a_message_wakes_the_exclusive_thread() {
         let node = test_node();
-        let handle = node.new_service("solo", "").expect("应创建成功");
+        let handle = node.new_service("solo", "").expect("应创建成功").handle;
         let ctx = node.handles.grab(handle).unwrap();
 
         // 等它睡下：状态落回 IDLE 就说明邮箱已经取空、线程正阻塞在 park 上
@@ -1125,7 +1293,7 @@ pub(crate) mod tests {
     #[test]
     fn endless_flag_is_consumed_once() {
         let node = test_node();
-        let handle = node.new_service("null", "").expect("应创建成功");
+        let handle = node.new_service("null", "").expect("应创建成功").handle;
         node.report_endless(0x12, handle, 7);
         let ctx = Ctx::new(node.handles.grab(handle).expect("服务应当仍存活"));
         assert!(ctx.take_endless());

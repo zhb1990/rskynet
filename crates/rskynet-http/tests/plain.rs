@@ -91,111 +91,117 @@ struct Client {
 #[rskynet_macros::service(crate = ::rskynet_core)]
 impl Client {
     async fn init(&self, ctx: Ctx) -> Result<()> {
-        let address = loop {
-            if let Some(value) = *self.board.address.lock().unwrap() {
-                break value;
+        let board = self.board.clone();
+        let task_ctx = ctx.clone();
+        ctx.spawn(async move {
+            let result: Result<()> = async {
+                let ctx = task_ctx.clone();
+                let address = loop {
+                    if let Some(value) = *board.address.lock().unwrap() {
+                        break value;
+                    }
+                    ctx.sleep_ms(10).await;
+                };
+                for body in [b"first".to_vec(), b"second".to_vec()] {
+                    let request = Request::post(format!("http://{address}/echo"))
+                        .body(BodySpec::Fixed(body.len() as u64))
+                        .unwrap();
+                    let mut exchange = rskynet_http::client::start(&ctx, request)
+                        .await
+                        .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
+                    exchange
+                        .write_chunk(&ctx, body)
+                        .await
+                        .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
+                    exchange
+                        .finish_request(&ctx)
+                        .await
+                        .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
+                    let response = exchange
+                        .response(&ctx)
+                        .await
+                        .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
+                    let bytes = response
+                        .into_body()
+                        .collect(&ctx, 1024)
+                        .await
+                        .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
+                    board.responses.lock().unwrap().push(bytes);
+                }
+                let request = Request::get(format!("http://{address}/large"))
+                    .body(Vec::new())
+                    .unwrap();
+                let response = rskynet_http::client::request(&ctx, request)
+                    .await
+                    .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
+                let large = response
+                    .into_body()
+                    .collect(&ctx, 1024)
+                    .await
+                    .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
+                board.responses.lock().unwrap().push(large);
+
+                let continued = b"continued".to_vec();
+                let request = Request::post(format!("http://{address}/continue"))
+                    .header("expect", "100-continue")
+                    .body(BodySpec::Fixed(continued.len() as u64))
+                    .unwrap();
+                let mut exchange = rskynet_http::client::start(&ctx, request)
+                    .await
+                    .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
+                exchange
+                    .write_chunk(&ctx, continued)
+                    .await
+                    .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
+                exchange
+                    .finish_request(&ctx)
+                    .await
+                    .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
+                let accepted = exchange
+                    .response(&ctx)
+                    .await
+                    .map_err(|e| rskynet_core::Error::Service(e.to_string()))?
+                    .into_body()
+                    .collect(&ctx, 1024)
+                    .await
+                    .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
+                board.responses.lock().unwrap().push(accepted);
+
+                let request = Request::post(format!("http://{address}/reject"))
+                    .header("expect", "100-continue")
+                    .body(BodySpec::Fixed(8))
+                    .unwrap();
+                let mut exchange = rskynet_http::client::start(&ctx, request)
+                    .await
+                    .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
+                let rejected = exchange.write_chunk(&ctx, b"rejected".to_vec()).await;
+                if !matches!(rejected, Err(rskynet_http::HttpError::RequestBodyRejected)) {
+                    return Err(rskynet_core::Error::Service(format!(
+                        "预期请求体被最终响应拒绝，实际为 {rejected:?}"
+                    )));
+                }
+                let response = exchange
+                    .response(&ctx)
+                    .await
+                    .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
+                if response.status().as_u16() != 417 {
+                    return Err(rskynet_core::Error::Service(format!(
+                        "预期 417，实际为 {}",
+                        response.status()
+                    )));
+                }
+                response
+                    .into_body()
+                    .discard(&ctx)
+                    .await
+                    .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
+                board.responses.lock().unwrap().push(b"rejected".to_vec());
+                Ok(())
             }
-            ctx.sleep_ms(10).await;
-        };
-        for body in [b"first".to_vec(), b"second".to_vec()] {
-            let request = Request::post(format!("http://{address}/echo"))
-                .body(BodySpec::Fixed(body.len() as u64))
-                .unwrap();
-            let mut exchange = rskynet_http::client::start(&ctx, request)
-                .await
-                .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
-            exchange
-                .write_chunk(&ctx, body)
-                .await
-                .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
-            exchange
-                .finish_request(&ctx)
-                .await
-                .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
-            let response = exchange
-                .response(&ctx)
-                .await
-                .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
-            let bytes = response
-                .into_body()
-                .collect(&ctx, 1024)
-                .await
-                .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
-            self.board.responses.lock().unwrap().push(bytes);
-        }
-        let request = Request::get(format!("http://{address}/large"))
-            .body(Vec::new())
-            .unwrap();
-        let response = rskynet_http::client::request(&ctx, request)
-            .await
-            .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
-        let large = response
-            .into_body()
-            .collect(&ctx, 1024)
-            .await
-            .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
-        self.board.responses.lock().unwrap().push(large);
-
-        let continued = b"continued".to_vec();
-        let request = Request::post(format!("http://{address}/continue"))
-            .header("expect", "100-continue")
-            .body(BodySpec::Fixed(continued.len() as u64))
-            .unwrap();
-        let mut exchange = rskynet_http::client::start(&ctx, request)
-            .await
-            .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
-        exchange
-            .write_chunk(&ctx, continued)
-            .await
-            .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
-        exchange
-            .finish_request(&ctx)
-            .await
-            .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
-        let accepted = exchange
-            .response(&ctx)
-            .await
-            .map_err(|e| rskynet_core::Error::Service(e.to_string()))?
-            .into_body()
-            .collect(&ctx, 1024)
-            .await
-            .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
-        self.board.responses.lock().unwrap().push(accepted);
-
-        let request = Request::post(format!("http://{address}/reject"))
-            .header("expect", "100-continue")
-            .body(BodySpec::Fixed(8))
-            .unwrap();
-        let mut exchange = rskynet_http::client::start(&ctx, request)
-            .await
-            .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
-        let rejected = exchange.write_chunk(&ctx, b"rejected".to_vec()).await;
-        if !matches!(rejected, Err(rskynet_http::HttpError::RequestBodyRejected)) {
-            return Err(rskynet_core::Error::Service(format!(
-                "预期请求体被最终响应拒绝，实际为 {rejected:?}"
-            )));
-        }
-        let response = exchange
-            .response(&ctx)
-            .await
-            .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
-        if response.status().as_u16() != 417 {
-            return Err(rskynet_core::Error::Service(format!(
-                "预期 417，实际为 {}",
-                response.status()
-            )));
-        }
-        response
-            .into_body()
-            .discard(&ctx)
-            .await
-            .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
-        self.board
-            .responses
-            .lock()
-            .unwrap()
-            .push(b"rejected".to_vec());
-        ctx.abort();
+            .await;
+            assert!(result.is_ok(), "HTTP 客户端流程失败: {result:?}");
+            task_ctx.abort();
+        });
         Ok(())
     }
 }
@@ -215,7 +221,7 @@ fn streams_requests_responses_and_reuses_plain_connection() {
         .with("client", move || Client {
             board: client_board.clone(),
         });
-    let mut config = Config::default().with_bootstrap(["net", "http-client", "api", "client"]);
+    let mut config = Config::default().with_bootstrap(["api", "client"]);
     config
         .section_mut("logger")
         .insert("name".into(), "".into());
@@ -235,6 +241,8 @@ fn streams_requests_responses_and_reuses_plain_connection() {
         .registry(registry)
         .with_wheel_timer()
         .service("bootstrap", || rskynet_bootstrap::Bootstrap)
+        .startup_service(rskynet_net::NAME, "")
+        .startup_service(rskynet_http::NAME, "")
         .run()
         .unwrap();
     assert_eq!(

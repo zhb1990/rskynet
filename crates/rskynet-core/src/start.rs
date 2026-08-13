@@ -14,8 +14,9 @@
 //!
 //! 日志、信号、定时器、引导这些服务的实现都不在内核里（各是一个独立 crate），内核
 //! 只做两件事：按配置里那一段的 `name` 把它们拉起来，以及定下先后顺序。顺序是
-//! 日志 → 定时器 → 引导：日志最先，好让后面每一步出的岔子都有人记；定时器排在
-//! 引导之前，于是引导期间刻度就在走，那时挂的表、打的日志时间戳都是准的。
+//! 日志 → 信号 → 定时器 → 可选基础设施 → 引导：每一步都等完整 `init`；日志最先，
+//! 好让后面每一步出的岔子都有人记，定时器排在业务引导之前，于是那时挂的表、打的
+//! 日志时间戳都是准的。
 
 use std::any::Any;
 use std::sync::{Arc, mpsc};
@@ -104,6 +105,11 @@ impl Config {
         }
     }
 
+    /// 配置中是否显式存在某个段。空段同样返回 true。
+    pub fn has_section(&self, name: &str) -> bool {
+        self.sections.contains_key(name)
+    }
+
     /// 塞一个配置段，给「不从 TOML 来」的场景（测试、代码里搭配置）用。
     #[must_use]
     pub fn with_section(mut self, name: impl Into<String>, section: toml::Table) -> Self {
@@ -179,6 +185,7 @@ pub struct Builder {
     config: Config,
     registry: Registry,
     timer: Option<Arc<dyn Timer>>,
+    startup_services: Vec<(String, String)>,
 }
 
 impl Builder {
@@ -187,6 +194,7 @@ impl Builder {
             config,
             registry: Registry::new(),
             timer: None,
+            startup_services: Vec::new(),
         }
     }
 
@@ -227,36 +235,37 @@ impl Builder {
         self
     }
 
+    /// 在 timer 完整初始化之后、bootstrap 之前启动并等待一个基础设施服务。
+    #[must_use]
+    pub fn startup_service(mut self, kind: impl Into<String>, args: impl Into<String>) -> Self {
+        self.startup_services.push((kind.into(), args.into()));
+        self
+    }
+
     /// 启动节点并阻塞到所有服务退出。
     pub fn run(self) -> Result<()> {
         self.config.validate()?;
         let timer = self.timer.ok_or(Error::MissingTimer)?;
-        run(self.config, self.registry, timer)
+        run(self.config, self.registry, timer, self.startup_services)
     }
 }
 
 /// 启动节点并阻塞到所有服务退出。
 ///
-/// 流程与 C 版 `skynet_start` 一致：先起 logger 并占用 `.logger` 这个名字，
-/// 再起定时器与引导服务，最后拉起 worker 线程池。任何一个服务调用 `Ctx::abort`，
-/// 或者最后一个服务退出，都会让本函数返回。
+/// worker 与 monitor 先进入运行状态，随后主线程依次等待 logger、signal、timer、
+/// 可选基础设施与默认 bootstrap 完整初始化。任何一个服务调用 `Ctx::abort`，或者
+/// 启动完成后最后一个服务退出，都会让本函数返回。
 pub fn start(config: Config, registry: Registry, timer: Arc<dyn Timer>) -> Result<()> {
     Builder::new(config).registry(registry).timer(timer).run()
 }
 
-fn run(config: Config, registry: Registry, timer: Arc<dyn Timer>) -> Result<()> {
+fn run(
+    config: Config,
+    registry: Registry,
+    timer: Arc<dyn Timer>,
+    startup_services: Vec<(String, String)>,
+) -> Result<()> {
     let node = Node::new(&config, registry, timer);
-
-    // 引导失败也要走一遍收尾：logger 可能已经起来了，它邮箱里的日志得刷出去，
-    // 那条独占线程也得收工。对照 C 版的 skynet_context_dispatchall
-    if let Err(err) = boot(&node, &config) {
-        // 万一独占线程也 panic 了，让位给信息量更大的那个启动错误
-        let _ = shutdown(&node);
-        return Err(err);
-    }
-    // 从这一刻起，「服务数为 0」才真的意味着节点该收工了。定时器盯着这个信号，
-    // 见 [`crate::NodeRef::is_booted`]
-    node.mark_booted();
 
     let monitors: Vec<_> = (0..config.thread)
         .map(|_| Arc::new(Monitor::new()))
@@ -264,7 +273,7 @@ fn run(config: Config, registry: Registry, timer: Arc<dyn Timer>) -> Result<()> 
 
     // 各 worker 共享同一个不可变引用，&Node 是 Copy 的，每个闭包各拿一份
     let shared: &Node = &node;
-    let panic = thread::scope(|scope| {
+    let (boot_result, panic) = thread::scope(|scope| {
         let (stop_monitor, stopped) = mpsc::channel();
         let observed = &monitors;
         let monitor_thread = thread::Builder::new()
@@ -281,6 +290,13 @@ fn run(config: Config, registry: Registry, timer: Arc<dyn Timer>) -> Result<()> 
                     .expect("worker 线程创建失败"),
             );
         }
+        // worker 已经在跑，下面同步等待 init 时，服务仍能处理 RPC、timer 与 IO 回包。
+        let boot_result = boot(&node, &config, &startup_services);
+        if boot_result.is_ok() {
+            node.mark_booted();
+        } else {
+            node.quit();
+        }
         // 显式 join 是为了把 worker 里的 panic 接住（隐式 join 会当场抛出去）。
         // 重抛留到收尾之后：独占线程还等着「自己被摘除」这个通知，先抛就没人给了
         let mut panic = None;
@@ -294,7 +310,7 @@ fn run(config: Config, registry: Registry, timer: Arc<dyn Timer>) -> Result<()> 
         if let Err(payload) = monitor_thread.join() {
             panic = panic.or(Some(payload));
         }
-        panic
+        (boot_result, panic)
     });
 
     // worker 收工了，在主线程上把尾收完
@@ -302,20 +318,21 @@ fn run(config: Config, registry: Registry, timer: Arc<dyn Timer>) -> Result<()> 
     if let Some(payload) = panic {
         std::panic::resume_unwind(payload);
     }
-    Ok(())
+    boot_result
 }
 
-/// 按配置拉起四个系统服务，对照 C 版 `skynet_start` 里 worker 之前那一段。
-fn boot(node: &Arc<Node>, config: &Config) -> Result<()> {
+/// 按配置依次拉起基础服务、可选启动项与 bootstrap。
+fn boot(node: &Arc<Node>, config: &Config, startup_services: &[(String, String)]) -> Result<()> {
     // 日志最先：从这里开始，后面每一步的动静都有人记
     let kind = config.system_kind(service::LOGGER, service::LOGGER)?;
     if !kind.trim().is_empty() {
         let logger = node.new_service(&kind, "")?;
-        node.set_logger(logger);
-        node.handles.register_name(logger, service::LOGGER);
+        logger.init.wait()?;
+        node.set_logger(logger.handle);
+        node.handles.register_name(logger.handle, service::LOGGER);
         // logger 不计入「服务数归零就退出」的判断，并且留到最后才送走，
         // 这样关停过程中产生的日志仍然写得出来
-        node.reserve(logger);
+        node.reserve(logger.handle);
     }
 
     // 信号服务也必须留到普通服务全部退出之后；否则关停途中再来的信号会落回
@@ -323,8 +340,9 @@ fn boot(node: &Arc<Node>, config: &Config) -> Result<()> {
     let kind = config.system_kind(service::SIGNAL, service::SIGNAL)?;
     if !kind.trim().is_empty() {
         let signal = node.new_service(&kind, "")?;
-        node.handles.register_name(signal, service::SIGNAL);
-        node.reserve(signal);
+        signal.init.wait()?;
+        node.handles.register_name(signal.handle, service::SIGNAL);
+        node.reserve(signal.handle);
     }
 
     // 定时器排在引导之前，于是引导期间刻度就在走：那会儿挂的表立刻开始计时，
@@ -333,14 +351,22 @@ fn boot(node: &Arc<Node>, config: &Config) -> Result<()> {
     let kind = config.system_kind(service::TIMER, service::TIMER)?;
     if !kind.trim().is_empty() {
         let timer = node.new_service(&kind, "")?;
-        node.handles.register_name(timer, service::TIMER);
-        node.reserve(timer);
+        timer.init.wait()?;
+        node.handles.register_name(timer.handle, service::TIMER);
+        node.reserve(timer.handle);
+    }
+
+    for (kind, args) in startup_services {
+        node.new_service(kind, args)?.init.wait()?;
     }
 
     // 引导服务自己去读 `[bootstrap]` 段里的清单，内核不掺和
     let kind = config.system_kind(service::BOOTSTRAP, service::BOOTSTRAP)?;
     if !kind.trim().is_empty() {
-        node.new_service(&kind, "")?;
+        let bootstrap = node.new_service(&kind, "")?;
+        if kind == service::BOOTSTRAP {
+            bootstrap.init.wait()?;
+        }
     }
     Ok(())
 }

@@ -11,6 +11,73 @@ use rskynet::{
     BoxFuture, Builder, BuilderExt, Config, ConfigExt, Ctx, Error, Registry, Result, Timer,
 };
 
+struct OrderedService {
+    label: &'static str,
+    order: Arc<Mutex<Vec<String>>>,
+    exit: bool,
+}
+
+#[rskynet::service]
+impl OrderedService {
+    async fn init(&self, ctx: Ctx) -> Result<()> {
+        self.order
+            .lock()
+            .unwrap()
+            .push(format!("{}:start", self.label));
+        std::thread::yield_now();
+        self.order
+            .lock()
+            .unwrap()
+            .push(format!("{}:end", self.label));
+        if self.exit {
+            ctx.exit();
+        }
+        Ok(())
+    }
+}
+
+struct SharedThreadProbe {
+    thread: Arc<Mutex<Option<String>>>,
+}
+
+#[rskynet::service]
+impl SharedThreadProbe {
+    async fn init(&self, ctx: Ctx) -> Result<()> {
+        *self.thread.lock().unwrap() = std::thread::current().name().map(str::to_string);
+        ctx.exit();
+        Ok(())
+    }
+}
+
+struct ExclusiveThreadProbe {
+    thread: Arc<Mutex<Option<String>>>,
+}
+
+#[rskynet::exclusive]
+impl ExclusiveThreadProbe {
+    async fn init(&self, ctx: Ctx) -> Result<()> {
+        *self.thread.lock().unwrap() = std::thread::current().name().map(str::to_string);
+        ctx.exit();
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct PendingBootstrap;
+
+#[rskynet::service]
+impl PendingBootstrap {
+    async fn init(&self, ctx: Ctx) -> Result<()> {
+        let task_ctx = ctx.clone();
+        ctx.spawn(async move {
+            task_ctx.sleep(1).await;
+            task_ctx.abort();
+        });
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+}
+
 /// 用例里那个「跑一段逻辑然后关停节点」的驱动服务。
 struct Driver<F> {
     scenario: Mutex<Option<F>>,
@@ -35,9 +102,23 @@ where
     async fn init(&self, ctx: Ctx) -> Result<()> {
         let scenario = self.scenario.lock().unwrap().take();
         if let Some(scenario) = scenario {
-            scenario(ctx.clone()).await;
+            let task_ctx = ctx.clone();
+            ctx.spawn(async move {
+                scenario(task_ctx.clone()).await;
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(20));
+                    task_ctx.abort();
+                });
+            });
+        } else {
+            let task_ctx = ctx.clone();
+            ctx.spawn(async move {
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(20));
+                    task_ctx.abort();
+                });
+            });
         }
-        ctx.abort();
         Ok(())
     }
 }
@@ -75,6 +156,83 @@ fn builtins_start_without_any_configuration() {
         ],
         "系统服务都该按约定名字注册好"
     );
+}
+
+#[test]
+fn startup_services_are_complete_ordering_barriers() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = Registry::new();
+    for (kind, label, exit) in [
+        ("optional", "optional", true),
+        ("business-a", "business-a", true),
+        ("business-b", "business-b", true),
+    ] {
+        let order = order.clone();
+        registry.register(kind, move || OrderedService {
+            label,
+            order: order.clone(),
+            exit,
+        });
+    }
+    let config = Config::default().with_bootstrap(["business-a", "business-b"]);
+    Builder::new(config)
+        .registry(registry)
+        .with_builtins()
+        .startup_service("optional", "")
+        .run()
+        .unwrap();
+
+    let expected: Vec<String> = [
+        "optional:start",
+        "optional:end",
+        "business-a:start",
+        "business-a:end",
+        "business-b:start",
+        "business-b:end",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    assert_eq!(*order.lock().unwrap(), expected);
+}
+
+#[test]
+fn init_runs_on_the_assigned_executor() {
+    let shared = Arc::new(Mutex::new(None));
+    let exclusive = Arc::new(Mutex::new(None));
+    let shared_factory = shared.clone();
+    let exclusive_factory = exclusive.clone();
+    let registry = Registry::new()
+        .with("shared-probe", move || SharedThreadProbe {
+            thread: shared_factory.clone(),
+        })
+        .with_exclusive("exclusive-probe", move || ExclusiveThreadProbe {
+            thread: exclusive_factory.clone(),
+        });
+    let config = Config::default().with_bootstrap(["shared-probe", "exclusive-probe"]);
+    rskynet::start(config, registry).unwrap();
+
+    assert!(
+        shared
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|name| name.starts_with("rskynet-worker-"))
+    );
+    assert!(
+        exclusive
+            .lock()
+            .unwrap()
+            .as_deref()
+            .is_some_and(|name| name.starts_with("rskynet-exclusive-probe-"))
+    );
+}
+
+#[test]
+fn a_custom_bootstrap_is_scheduled_without_a_sync_init_wait() {
+    let config = Config::default().with_bootstrap_service("pending-bootstrap");
+    let registry = Registry::new().with("pending-bootstrap", PendingBootstrap::default);
+    rskynet::start(config, registry).expect("自定义 bootstrap 的未完成 init 不应让启动阶段报错");
 }
 
 /// 定时器排在引导之前：引导期间挂的表能醒，刻度也已经在走

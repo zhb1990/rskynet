@@ -156,55 +156,65 @@ impl Poller {
 struct Probe {
     journal: Journal,
     trace: Arc<Trace>,
-    poked: SvcCell<bool>,
+    poked: Arc<AtomicBool>,
 }
 
 #[rskynet::service]
 impl Probe {
     async fn init(&self, ctx: Ctx) -> Result<()> {
-        // 邮箱：独占线程正阻塞在自己的事件源上，这一次 call 全靠 interrupt
-        // 把它叫回来。真要是没叫醒，下面这句会等满 5 秒的超时
-        let reply = ctx.request(".poller", Payload::text("hello")).await?;
-        note(&self.journal, reply.as_str().unwrap_or("<非字节负载>"));
+        let journal = self.journal.clone();
+        let trace = self.trace.clone();
+        let poked = self.poked.clone();
+        let task_ctx = ctx.clone();
+        ctx.spawn(async move {
+            let ctx = task_ctx;
+            let result: Result<()> = async {
+                // 邮箱：独占线程正阻塞在自己的事件源上，这一次 call 全靠 interrupt
+                // 把它叫回来。真要是没叫醒，下面这句会等满 5 秒的超时
+                let reply = ctx.request(".poller", Payload::text("hello")).await?;
+                note(&journal, reply.as_str().unwrap_or("<非字节负载>"));
 
-        // 回执单被丢弃（外部线程半路撂挑子）时要拿到错误，而不是永久挂着
-        let dropped = ctx.call_external(drop).await;
-        note(
-            &self.journal,
-            format!("撂挑子={}", matches!(dropped, Err(Error::CallFailed(_)))),
-        );
+                // 回执单被丢弃（外部线程半路撂挑子）时要拿到错误，而不是永久挂着
+                let dropped = ctx.call_external(drop).await;
+                note(
+                    &journal,
+                    format!("撂挑子={}", matches!(dropped, Err(Error::CallFailed(_)))),
+                );
 
-        // 独占线程把外部事件投成消息：请它敲自己一下，然后等那一下到
-        ctx.send(".poller", POKE_REQUEST, Payload::of(ctx.handle()))?;
-        while !self.poked.get() {
-            ctx.sleep(1).await;
-        }
-        note(&self.journal, "收到敲门");
+                // 独占线程把外部事件投成消息：请它敲自己一下，然后等那一下到
+                ctx.send(".poller", POKE_REQUEST, Payload::of(ctx.handle()))?;
+                while !poked.load(SeqCst) {
+                    ctx.sleep(1).await;
+                }
+                note(&journal, "收到敲门");
 
-        // 运行期起一个独占服务再杀掉：它那条线程必须自己收工
-        let before = self.trace.dropped.load(SeqCst);
-        let handle = ctx.launch("poller", "anonymous").await?;
-        assert!(ctx.kill(handle));
-        let mut rounds = 0;
-        while self.trace.dropped.load(SeqCst) == before && rounds < 500 {
-            ctx.sleep(1).await;
-            rounds += 1;
-        }
-        note(
-            &self.journal,
-            format!(
-                "杀掉后线程收工={}",
-                self.trace.dropped.load(SeqCst) > before
-            ),
-        );
-
-        ctx.abort();
+                // 运行期起一个独占服务再杀掉：它那条线程必须自己收工
+                let before = trace.dropped.load(SeqCst);
+                let handle = ctx.launch("poller", "anonymous").await?;
+                assert!(ctx.kill(handle));
+                let mut rounds = 0;
+                while trace.dropped.load(SeqCst) == before && rounds < 500 {
+                    ctx.sleep(1).await;
+                    rounds += 1;
+                }
+                note(
+                    &journal,
+                    format!("杀掉后线程收工={}", trace.dropped.load(SeqCst) > before),
+                );
+                Ok(())
+            }
+            .await;
+            if let Err(err) = result {
+                note(&journal, format!("出错={err}"));
+            }
+            ctx.abort();
+        });
         Ok(())
     }
 
     async fn dispatch(&self, _ctx: Ctx, msg: Message) {
         if msg.mtype == POKE {
-            self.poked.set(true);
+            self.poked.store(true, SeqCst);
         }
     }
 }
@@ -223,7 +233,7 @@ fn an_exclusive_service_owns_its_thread() {
         .with("probe", move || Probe {
             journal: shared.clone(),
             trace: probe_trace.clone(),
-            poked: SvcCell::new(false),
+            poked: Arc::new(AtomicBool::new(false)),
         });
 
     let config = Config::from_toml_str(
@@ -304,7 +314,11 @@ impl Flooder {
         for index in 0..self.total {
             ctx.post(".sink", Payload::text(index.to_string()))?;
         }
-        ctx.abort();
+        let abort = ctx.clone();
+        ctx.spawn(async move {
+            abort.sleep(1).await;
+            abort.abort();
+        });
         Ok(())
     }
 }

@@ -257,25 +257,34 @@ impl Calculator {
 }
 ```
 
-网络层用 `net` feature 打开。它只注册服务类型，不会自动拉起；在 `[bootstrap]`
-清单中先启动 `net`，业务服务再调用 `listen` / `connect` / `start` / `send`，并用
+网络层用 `net` feature 打开。配置中出现 `[net]`（空段也算）就会在业务 bootstrap
+之前自动启动；业务服务可直接调用 `listen` / `connect` / `start` / `send`，并用
 `#[msg(MsgType::SOCKET)]` 接收 `SocketEvent`。可直接运行
 `cargo run -p rskynet-examples -- config/examples/echo_server.toml`，再用
 `telnet 127.0.0.1 8888` 验证回声。
 
-TLS 层用 `tls` feature 打开（会同时打开 `net`）。在 `[bootstrap]` 中按
-`net → tls → 业务服务` 的顺序启动；`rskynet-tls` 不接管 socket，而是在网络层之上
+TLS 层用 `tls` feature 打开（会同时打开 `net`）。出现 `[tls]` 时会按
+`net → tls → 业务服务` 自动启动；缺少的 `[net]` 使用默认配置。`rskynet-tls` 不接管 socket，而是在网络层之上
 把 rustls 驱动成一个普通 actor 服务。客户端和服务端证书配置分别通过
 `ClientOptions` / `ServerOptions` 传入，支持系统根、Mozilla 根、自定义根、无密码
 私钥和带密码的 PKCS#8 私钥。
 
 HTTP/1.1 用 `http` feature 打开，HTTPS 用 `https`（会同时启用 `http` 与 `tls`）。
-`HttpClientService` 是共享连接池的客户端 actor，应按 `net → tls（HTTPS 时）→
-http-client → 业务服务` 启动；`client::start` 返回流式 exchange，`client::request`
+`HttpClientService` 是共享连接池的客户端 actor；出现 `[http-client]` 时会自动按
+`net → tls（HTTPS 时）→ http-client → 业务服务` 启动，缺少的依赖段使用默认配置。`client::start` 返回流式 exchange，`client::request`
 是整包请求的便利入口。服务端没有全局 actor：业务服务持有 `HttpServer`，把自己的
 `SocketEvent` / `TlsEvent` 交给它解析，再处理返回的 `ServerRequest`。两侧都基于
 `ureq-proto` 的 Sans-IO HTTP/1.1 状态机，支持 keep-alive、chunked、
 `100-continue`、流式 body、超时和高低水位背压。
+
+`[cluster]` 同样会自动补上 `net`。这些自动服务统一去重，不能再手工列入
+`[bootstrap].services`；配置了对应段却没有编译相应 feature 时，启动会明确报错。
+
+`ctx.launch(...).await` 现在以目标服务的 `init` Future 完整返回 `Ok(())` 为成功，
+返回的 handle 已经可以 dispatch。bootstrap 因而严格逐项等待：常驻循环、持续重试和
+长期握手应放进 `ctx.spawn`，`init` 只完成注册与有限的就绪工作，也不要等待清单中尚未
+启动的后续服务。初始化期间 RPC、timer 和 IO 回包仍可推进，普通业务消息会按 FIFO
+暂存到初始化成功之后。
 
 `cluster` feature 用 Protobuf 在 rskynet 节点间通信。消息的 TYPE_ID 和入站
 handler 都由宏提交到链接期自动注册表：
@@ -557,7 +566,11 @@ pub trait Timer: Send + Sync + 'static {
 
 `ctx.sleep()` 是往它记一笔账，`ctx.now()` 是问它要个数——都是同步的本地调用，不走消息（日志每写一行都要读时间，走一趟邮箱不划算）。`rskynet-timer` 提供的实现分成配合的两半：**记账**的那一半（`WheelTimer`，注入给内核的就是它）和**推刻度**的那一半（`TimerService`，一个独占线程的服务）。分家的好处是记账那一半在节点建起来之前就存在，于是引导期间挂的表一条都不会丢，哪怕那时推刻度的线程还没上线。
 
-四个系统服务的启动顺序是**日志 → 信号 → 定时器 → 引导**。日志最先，好让后面每一步的岔子都有人记；信号服务在业务服务之前就绪；定时器排在引导之前，于是引导期间刻度就在走——引导拉起的服务在 `init` 里 `sleep` 立刻开始计时，日志时间戳也不再是一片 0。代价是定时器不能光看「服务数归零」就宣布收工（它出场时服务数本来就是 0），得先问一句 `node.is_booted()`。
+启动顺序是**日志 → 信号 → 定时器 → 可选内置服务 → 引导**，每一步都等待完整
+`init`。可选服务按依赖稳定排序为 `net → tls → http-client → cluster`。日志最先，
+好让后面每一步的岔子都有人记；信号服务在业务服务之前就绪；定时器排在引导之前，
+于是引导期间刻度就在走。启动阶段服务数短暂归零不会提前关停；引导完成标记 booted
+时会重新检查，所以空业务清单仍会正常退出。
 
 内核为此保留四个约定名字（`logger` / `signal` / `timer` / `bootstrap`）与拉起顺序。类型名可以在配置里换成自己的实现，写成空串就是不拉起：
 

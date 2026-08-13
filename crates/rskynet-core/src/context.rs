@@ -38,8 +38,8 @@ use crate::server::ServiceContext;
 /// }
 /// ```
 pub trait Service: Send + Sync + 'static {
-    /// 服务启动时调用一次。允许 `await`（比如去 `call` 别的服务），
-    /// 挂起后 `launch` 就会返回，剩下的初始化在后台继续。
+    /// 服务启动时调用一次。允许 `await`（比如去 `call` 别的服务），公开的
+    /// [`Ctx::launch`] 会等待本 Future 完整返回。
     /// 返回 `Err` 表示启动失败，服务会被立即销毁。
     fn init(self: Arc<Self>, ctx: Ctx, args: String) -> BoxFuture<'static, Result<()>> {
         let _ = (ctx, args);
@@ -234,9 +234,12 @@ impl Ctx {
 
     /// 启动一个新服务，对照 `skynet.newservice`。
     ///
-    /// 新服务的 `init` 会在当前线程上先跑到第一次挂起，之后本调用返回。
+    /// 新服务会被调度到它自己的执行者；共享服务由 worker 初始化，独占服务由
+    /// 专属线程初始化。本调用等待 `init` 完整成功后才返回 handle。
     pub async fn launch(&self, kind: &str, args: impl AsRef<str>) -> Result<u32> {
-        self.inner.node.new_service(kind, args.as_ref())
+        let service = self.inner.node.new_service(kind, args.as_ref())?;
+        service.init.await?;
+        Ok(service.handle)
     }
 
     /// 给自己注册一个本地名字，对照 `skynet.register`。名字已被占用时返回 false。
@@ -259,7 +262,7 @@ impl Ctx {
     ///
     /// 返回后当前任务仍会继续跑到下一次挂起点，真正的资源释放发生在那之后。
     pub fn exit(&self) {
-        self.inner.node.retire(self.handle());
+        self.inner.request_exit();
     }
 
     /// 干掉别的服务，对照 `skynet.kill`。

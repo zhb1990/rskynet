@@ -18,6 +18,9 @@
 //! 清单不经内核的手：内核只按 `name` 把这个服务拉起来，段里的 `services` 由它
 //! 自己读。C 版把类型名和参数挤在一个字符串里靠 `sscanf` 按首个空格拆，这里各占
 //! 一个字段，于是参数里带空格、带分号都不再是问题。
+//!
+//! 每一项都会等待目标服务的 `init` 完整成功后再启动下一项。常驻循环与持续重试应
+//! 由服务在 `init` 中用 `ctx.spawn` 放到后台，不能在 `init` 里等待清单中靠后的服务。
 
 use rskynet_core::service::BOOTSTRAP;
 use rskynet_core::{Config, Ctx, Error, Registry, Result, log};
@@ -69,8 +72,8 @@ impl<N: Into<String>, A: Into<String>> From<(N, A)> for ServiceSpec {
 /// `[bootstrap]` 段。`name` 归内核解析，这里只关心清单。
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
-struct BootstrapConfig {
-    services: Vec<ServiceSpec>,
+pub struct BootstrapConfig {
+    pub services: Vec<ServiceSpec>,
 }
 
 #[derive(Default)]

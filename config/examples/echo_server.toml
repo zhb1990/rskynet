@@ -12,7 +12,6 @@ tick_micros = 2500
 [bootstrap]
 name = "bootstrap"
 services = [
-    { name = "net" },
     { name = "echo" },
 ]
 

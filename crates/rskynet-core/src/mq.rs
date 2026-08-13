@@ -90,6 +90,11 @@ pub(crate) struct Mailbox {
 }
 
 impl Mailbox {
+    #[cfg(test)]
+    pub(crate) fn take_ready(&self) -> Option<Ready> {
+        self.ready.pop()
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             queue: SegQueue::new(),
@@ -193,11 +198,6 @@ impl Mailbox {
         }
         self.overload.store(length, Ordering::Relaxed);
         self.overload_threshold.store(threshold, Ordering::Relaxed);
-    }
-
-    /// 只取就绪队列，不碰状态。服务初始化阶段用它把 init 推进到第一次挂起。
-    pub(crate) fn take_ready(&self) -> Option<Ready> {
-        self.ready.pop()
     }
 
     /// 状态置为「已排进运行队列」。**必须在真正入队之前调用**：反过来的话，

@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rskynet::{Config, ConfigExt, Ctx, MsgType, Registry, Result, SvcCell};
+use rskynet::{Builder, BuilderExt, Config, ConfigExt, Ctx, MsgType, Registry, Result, SvcCell};
 use rskynet_net::{self as net, RegistryExt, SocketEvent};
 
 /// 慢机器上也够用的上限：`ctx.sleep` 的单位是毫秒，1000 次就是 10 秒。
@@ -32,8 +32,8 @@ const PATIENCE: u32 = 1000;
 
 /// 服务之间传监听地址用的黑板。
 ///
-/// 端口写的是 0，得等系统挑完才知道是哪个；而 `launch` 只等到被拉起的服务第一次
-/// 挂起为止，回声服务那时还卡在 `net::listen` 上，所以读的一方得自己等。
+/// 端口写的是 0，得等系统挑完才知道是哪个。黑板用于把实际地址从回声服务传给
+/// 客户端，避免测试把动态端口写死。
 type Blackboard = Arc<Mutex<Option<SocketAddr>>>;
 
 /// 用例观察到的现象，节点退出后统一断言。
@@ -142,13 +142,23 @@ fn run_against_echo(
             board: board.clone(),
             accepted: SvcCell::new(0),
         });
-    let config = config.with_bootstrap(["net", "echo", kind]);
-    rskynet::start(config, registry).expect("节点应当正常启动并退出");
+    let config = config.with_bootstrap(["echo", kind]);
+    run_node(config, registry);
     tape.notes()
+}
+
+fn run_node(config: Config, registry: Registry) {
+    Builder::new(config)
+        .registry(registry)
+        .with_builtins()
+        .startup_service(net::NAME, "")
+        .run()
+        .expect("节点应当正常启动并退出");
 }
 
 // ------------------------------------------------------------ TCP 全程
 
+#[derive(Clone)]
 struct Client {
     board: Blackboard,
     tape: Arc<Tape>,
@@ -157,11 +167,14 @@ struct Client {
 #[rskynet::service]
 impl Client {
     async fn init(&self, ctx: Ctx) -> Result<()> {
-        // 出了岔子也得把节点关掉，否则这个用例会一直挂着
-        if let Err(err) = self.run(&ctx).await {
-            self.tape.note(format!("出错={err}"));
-        }
-        ctx.abort();
+        let this = self.clone();
+        let task_ctx = ctx.clone();
+        ctx.spawn(async move {
+            if let Err(err) = this.run(&task_ctx).await {
+                this.tape.note(format!("出错={err}"));
+            }
+            task_ctx.abort();
+        });
         Ok(())
     }
 
@@ -277,6 +290,7 @@ fn pattern(index: usize) -> u8 {
     (index % 251) as u8
 }
 
+#[derive(Clone)]
 struct Flooder {
     board: Blackboard,
     tape: Arc<Tape>,
@@ -285,10 +299,14 @@ struct Flooder {
 #[rskynet::service]
 impl Flooder {
     async fn init(&self, ctx: Ctx) -> Result<()> {
-        if let Err(err) = self.run(&ctx).await {
-            self.tape.note(format!("出错={err}"));
-        }
-        ctx.abort();
+        let this = self.clone();
+        let task_ctx = ctx.clone();
+        ctx.spawn(async move {
+            if let Err(err) = this.run(&task_ctx).await {
+                this.tape.note(format!("出错={err}"));
+            }
+            task_ctx.abort();
+        });
         Ok(())
     }
 
@@ -378,6 +396,7 @@ fn a_flood_warns_but_keeps_every_byte() {
 
 type DatagramLog = Arc<Mutex<Vec<(SocketAddr, Vec<u8>)>>>;
 
+#[derive(Clone)]
 struct UdpProbe {
     tape: Arc<Tape>,
     got: DatagramLog,
@@ -386,10 +405,14 @@ struct UdpProbe {
 #[rskynet::service]
 impl UdpProbe {
     async fn init(&self, ctx: Ctx) -> Result<()> {
-        if let Err(err) = self.run(&ctx).await {
-            self.tape.note(format!("出错={err}"));
-        }
-        ctx.abort();
+        let this = self.clone();
+        let task_ctx = ctx.clone();
+        ctx.spawn(async move {
+            if let Err(err) = this.run(&task_ctx).await {
+                this.tape.note(format!("出错={err}"));
+            }
+            task_ctx.abort();
+        });
         Ok(())
     }
 
@@ -444,8 +467,8 @@ fn udp_packets_carry_their_sender() {
             got: probe_got.clone(),
         });
 
-    let config = Config::default().with_bootstrap(["net", "udp-probe"]);
-    rskynet::start(config, registry).expect("节点应当正常启动并退出");
+    let config = Config::default().with_bootstrap(["udp-probe"]);
+    run_node(config, registry);
 
     assert_eq!(
         tape.notes(),
@@ -459,6 +482,7 @@ fn udp_packets_carry_their_sender() {
 
 // ------------------------------------------------------------ DNS 多地址回退
 
+#[derive(Clone)]
 struct HostProbe {
     host: String,
     tape: Arc<Tape>,
@@ -467,11 +491,15 @@ struct HostProbe {
 #[rskynet::service]
 impl HostProbe {
     async fn init(&self, ctx: Ctx) -> Result<()> {
-        self.tape.check(
-            "回退地址连通",
-            net::connect(&ctx, self.host.clone()).await.is_ok(),
-        );
-        ctx.abort();
+        let this = self.clone();
+        let task_ctx = ctx.clone();
+        ctx.spawn(async move {
+            this.tape.check(
+                "回退地址连通",
+                net::connect(&task_ctx, this.host.clone()).await.is_ok(),
+            );
+            task_ctx.abort();
+        });
         Ok(())
     }
 }
@@ -534,8 +562,8 @@ fn connect_tries_later_resolved_addresses() {
             host: host.clone(),
             tape: probe_tape.clone(),
         });
-    let config = Config::default().with_bootstrap(["net", "host-probe"]);
-    rskynet::start(config, registry).expect("节点应当正常启动并退出");
+    let config = Config::default().with_bootstrap(["host-probe"]);
+    run_node(config, registry);
 
     assert_eq!(tape.notes(), vec!["回退地址连通=true"]);
     assert!(accepted.join().expect("监听线程不应 panic"));

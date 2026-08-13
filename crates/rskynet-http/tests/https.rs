@@ -72,24 +72,33 @@ struct Client {
 #[rskynet_macros::service(crate = ::rskynet_core)]
 impl Client {
     async fn init(&self, ctx: Ctx) -> Result<()> {
-        let address = loop {
-            if let Some(value) = *self.board.address.lock().unwrap() {
-                break value;
+        let board = self.board.clone();
+        let task_ctx = ctx.clone();
+        ctx.spawn(async move {
+            let result: Result<()> = async {
+                let address = loop {
+                    if let Some(value) = *board.address.lock().unwrap() {
+                        break value;
+                    }
+                    task_ctx.sleep_ms(10).await;
+                };
+                let request = Request::post(format!("https://localhost:{}/", address.port()))
+                    .body(b"secure".to_vec())
+                    .unwrap();
+                let response = rskynet_http::client::request(&task_ctx, request)
+                    .await
+                    .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
+                *board.result.lock().unwrap() = response
+                    .into_body()
+                    .collect(&task_ctx, 1024)
+                    .await
+                    .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
+                Ok(())
             }
-            ctx.sleep_ms(10).await;
-        };
-        let request = Request::post(format!("https://localhost:{}/", address.port()))
-            .body(b"secure".to_vec())
-            .unwrap();
-        let response = rskynet_http::client::request(&ctx, request)
-            .await
-            .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
-        *self.board.result.lock().unwrap() = response
-            .into_body()
-            .collect(&ctx, 1024)
-            .await
-            .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
-        ctx.abort();
+            .await;
+            assert!(result.is_ok(), "HTTPS 客户端流程失败: {result:?}");
+            task_ctx.abort();
+        });
         Ok(())
     }
 }
@@ -130,8 +139,7 @@ fn streams_over_tls() {
         .with("client", move || Client {
             board: client_board.clone(),
         });
-    let mut config =
-        Config::default().with_bootstrap(["net", "tls", "http-client", "api", "client"]);
+    let mut config = Config::default().with_bootstrap(["api", "client"]);
     config
         .section_mut("logger")
         .insert("name".into(), "".into());
@@ -142,6 +150,9 @@ fn streams_over_tls() {
         .registry(registry)
         .with_wheel_timer()
         .service("bootstrap", || rskynet_bootstrap::Bootstrap)
+        .startup_service(rskynet_net::NAME, "")
+        .startup_service(rskynet_tls::NAME, "")
+        .startup_service(rskynet_http::NAME, "")
         .run()
         .unwrap();
     assert_eq!(*board.result.lock().unwrap(), b"secure");

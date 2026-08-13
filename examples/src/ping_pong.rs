@@ -46,34 +46,47 @@ impl Pong {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Ping {
-    beats: SvcCell<u64>,
+    beats: Arc<SvcCell<u64>>,
 }
 
 #[rskynet::service(name = "ping")]
 impl Ping {
     async fn init(&self, ctx: Ctx, args: String) -> Result<()> {
-        let rounds: u64 = args.trim().parse().unwrap_or(100);
-        let beat_ctx = ctx.clone();
-        let beats = self.clone();
+        let this = self.clone();
+        let task_ctx = ctx.clone();
         ctx.spawn(async move {
-            loop {
-                beat_ctx.sleep(20).await;
-                *beats.beats.borrow_mut() += 1;
+            let result: Result<()> = async {
+                let ctx = task_ctx.clone();
+                let rounds: u64 = args.trim().parse().unwrap_or(100);
+                let beat_ctx = ctx.clone();
+                let beats = this.clone();
+                ctx.spawn(async move {
+                    loop {
+                        beat_ctx.sleep(20).await;
+                        *beats.beats.borrow_mut() += 1;
+                    }
+                });
+
+                this.round_trips(&ctx, rounds).await?;
+                this.concurrent_asks(&ctx).await?;
+                rskynet::log!(ctx, "心跳共跳了 {} 次", this.beats.borrow());
+                rskynet::log!(
+                    ctx,
+                    "ping 处理过 {} 条消息，通知 pong 后退出",
+                    ctx.message_count()
+                );
+                ctx.post(".pong", Payload::of(Ask::Shutdown))?;
+                ctx.exit();
+                Ok(())
+            }
+            .await;
+            if let Err(err) = result {
+                rskynet::log!(task_ctx, "ping 流程失败：{err}");
+                task_ctx.abort();
             }
         });
-
-        self.round_trips(&ctx, rounds).await?;
-        self.concurrent_asks(&ctx).await?;
-        rskynet::log!(ctx, "心跳共跳了 {} 次", self.beats.borrow());
-        rskynet::log!(
-            ctx,
-            "ping 处理过 {} 条消息，通知 pong 后退出",
-            ctx.message_count()
-        );
-        ctx.post(".pong", Payload::of(Ask::Shutdown))?;
-        ctx.exit();
         Ok(())
     }
 

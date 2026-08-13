@@ -194,7 +194,11 @@ impl Probe {
         let reply = ctx.call(".ticker", PING, Payload::None).await?;
         self.note(reply.as_str().unwrap_or("<非字节负载>").to_string());
 
-        ctx.abort();
+        let abort = ctx.clone();
+        ctx.spawn(async move {
+            abort.sleep(1).await;
+            abort.abort();
+        });
         Ok(())
     }
 

@@ -46,7 +46,7 @@ services = [
     { name = "ping", args = "100" },
 ]
 
-# 网络层。它不是系统服务，只有同时在 bootstrap 清单中写 `{ name = "net" }` 才会启动。
+# 网络层。配置段存在即自动启动；作为 tls/http-client/cluster 依赖时，段缺失则走默认配置。
 [net]
 # 一轮 poll 最多预留多少个事件。
 events = 1024

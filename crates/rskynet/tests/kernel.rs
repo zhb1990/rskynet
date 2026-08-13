@@ -106,6 +106,63 @@ impl Stillborn {
     }
 }
 
+#[derive(Default)]
+struct SlowInit;
+
+#[rskynet::service]
+impl SlowInit {
+    async fn init(&self, ctx: Ctx) -> rskynet::Result<()> {
+        ctx.sleep(5).await;
+        ctx.register_name("slow-init");
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct LateStillborn;
+
+#[rskynet::service]
+impl LateStillborn {
+    async fn init(&self, ctx: Ctx) -> rskynet::Result<()> {
+        ctx.sleep(5).await;
+        Err(Error::service("晚一点失败"))
+    }
+}
+
+#[derive(Default)]
+struct KillableInit;
+
+#[rskynet::service]
+impl KillableInit {
+    async fn init(&self, ctx: Ctx) -> rskynet::Result<()> {
+        ctx.register_name("killable-init");
+        ctx.sleep(100).await;
+        Ok(())
+    }
+}
+
+struct InitializingInbox {
+    journal: Journal,
+}
+
+#[rskynet::service]
+impl InitializingInbox {
+    async fn init(&self, ctx: Ctx) -> rskynet::Result<()> {
+        ctx.register_name("initializing-inbox");
+        note(&self.journal, "init:start");
+        ctx.sleep(5).await;
+        note(&self.journal, "init:end");
+        Ok(())
+    }
+
+    async fn dispatch(&self, _ctx: Ctx, mut msg: Message) {
+        note(
+            &self.journal,
+            format!("msg:{}", msg.take_payload().as_str().unwrap()),
+        );
+    }
+}
+
 /// 告诉中转站它在环上的下家是谁。
 const SETUP: MsgType = MsgType(50);
 /// 一个正在环上转圈的令牌，负载是还剩几跳。
@@ -156,8 +213,14 @@ struct Driver {
 #[rskynet::service]
 impl Driver {
     async fn init(&self, ctx: Ctx) -> rskynet::Result<()> {
-        (self.scenario)(ctx.clone(), self.journal.clone()).await;
-        ctx.abort();
+        let scenario = self.scenario.clone();
+        let journal = self.journal.clone();
+        let task_ctx = ctx.clone();
+        ctx.spawn(async move {
+            scenario(task_ctx.clone(), journal).await;
+            task_ctx.sleep(1).await;
+            task_ctx.abort();
+        });
         Ok(())
     }
 }
@@ -172,6 +235,7 @@ where
     let journal: Journal = Arc::new(Mutex::new(Vec::new()));
     let scenario: Scenario = Arc::new(scenario);
     let shared = journal.clone();
+    let inbox_journal = journal.clone();
 
     let registry = Registry::new()
         .with("echo", Echo::default)
@@ -179,6 +243,12 @@ where
         .with("quitter", Quitter::default)
         .with("counter", Counter::default)
         .with("stillborn", Stillborn::default)
+        .with("slow-init", SlowInit::default)
+        .with("late-stillborn", LateStillborn::default)
+        .with("killable-init", KillableInit::default)
+        .with("initializing-inbox", move || InitializingInbox {
+            journal: inbox_journal.clone(),
+        })
         .with("driver", move || Driver {
             scenario: scenario.clone(),
             journal: shared.clone(),
@@ -378,6 +448,90 @@ fn services_can_be_launched_at_runtime() {
         })
     });
     assert_eq!(seen, vec!["true", "新起的!", "true", "true"]);
+}
+
+#[test]
+fn launch_waits_for_the_complete_init_and_late_error() {
+    let seen = run_node(&["driver"], |ctx, journal| {
+        Box::pin(async move {
+            let started = ctx.now();
+            let handle = ctx.launch("slow-init", "").await.unwrap();
+            note(&journal, format!("{}", ctx.now() - started >= 5));
+            note(
+                &journal,
+                format!("{}", ctx.query_name("slow-init") == Some(handle)),
+            );
+
+            let started = ctx.now();
+            let err = ctx.launch("late-stillborn", "").await.unwrap_err();
+            note(&journal, format!("{}", ctx.now() - started >= 5));
+            note(&journal, format!("{}", matches!(err, Error::Init { .. })));
+        })
+    });
+    assert_eq!(seen, ["true", "true", "true", "true"]);
+}
+
+#[test]
+fn killing_an_initializing_service_fails_its_launch() {
+    let seen = run_node(&["driver"], |ctx, journal| {
+        Box::pin(async move {
+            let outcome: Arc<SvcCell<Option<bool>>> = Arc::new(SvcCell::new(None));
+            let launched = outcome.clone();
+            let launch_ctx = ctx.clone();
+            ctx.spawn(async move {
+                let result = launch_ctx.launch("killable-init", "").await;
+                launched.set(Some(matches!(result, Err(Error::Init { .. }))));
+            });
+            let handle = loop {
+                if let Some(handle) = ctx.query_name("killable-init") {
+                    break handle;
+                }
+                ctx.sleep(1).await;
+            };
+            let call_failed: Arc<SvcCell<Option<bool>>> = Arc::new(SvcCell::new(None));
+            let called = call_failed.clone();
+            let call_ctx = ctx.clone();
+            ctx.spawn(async move {
+                let result = call_ctx.request(handle, Payload::None).await;
+                called.set(Some(matches!(result, Err(Error::CallFailed(_)))));
+            });
+            ctx.yield_now().await;
+            assert!(ctx.kill(handle));
+            while outcome.get().is_none() || call_failed.get().is_none() {
+                ctx.sleep(1).await;
+            }
+            note(&journal, outcome.get().unwrap().to_string());
+            note(&journal, call_failed.get().unwrap().to_string());
+        })
+    });
+    assert_eq!(seen, ["true", "true"]);
+}
+
+#[test]
+fn ordinary_messages_wait_for_init_and_keep_fifo_order() {
+    let seen = run_node(&["driver"], |ctx, journal| {
+        Box::pin(async move {
+            let launched: Arc<SvcCell<bool>> = Arc::new(SvcCell::new(false));
+            let done = launched.clone();
+            let launch_ctx = ctx.clone();
+            ctx.spawn(async move {
+                launch_ctx.launch("initializing-inbox", "").await.unwrap();
+                done.set(true);
+            });
+            let handle = loop {
+                if let Some(handle) = ctx.query_name("initializing-inbox") {
+                    break handle;
+                }
+                ctx.sleep(1).await;
+            };
+            ctx.post(handle, Payload::text("one")).unwrap();
+            ctx.post(handle, Payload::text("two")).unwrap();
+            while !launched.get() || journal.lock().unwrap().len() < 4 {
+                ctx.sleep(1).await;
+            }
+        })
+    });
+    assert_eq!(seen, ["init:start", "init:end", "msg:one", "msg:two"]);
 }
 
 /// init 失败的服务不能留在节点里占着服务计数
