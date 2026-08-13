@@ -55,6 +55,7 @@
 //! | `rskynet-signal` | 进程信号、优雅关停与独立崩溃报告 | `signal`（默认开） |
 //! | 标准命令行入口 | 读取 TOML 并启动自动注册服务 | `main`（默认开） |
 //! | `rskynet-net` | socket 层，一个[独占线程的服务][Exclusive] | `net` |
+//! | `rskynet-tls` | 基于 rustls、复用 net 的双向 TLS 协议服务 | `tls` |
 //! | `rskynet-cluster` | Protobuf 节点间通信 | `cluster` |
 //!
 //! 内核里一个服务都没有，连时间都不在里面：分层时间轮住在 `rskynet-timer`，内核
@@ -77,6 +78,10 @@ pub use rskynet_macros::{exclusive, msg, service, signal};
 /// 网络层：socket / gate / agent。
 #[cfg(feature = "net")]
 pub use rskynet_net as net;
+
+/// TLS 协议服务：底层复用 [`net`]，向业务投递明文事件。
+#[cfg(feature = "tls")]
+pub use rskynet_tls as tls;
 
 /// 可选的 Protobuf 跨节点通信层。
 #[cfg(feature = "cluster")]
@@ -223,6 +228,10 @@ impl BuilderExt for Builder {
         #[cfg(feature = "net")]
         {
             builder = builder.exclusive_service(rskynet_net::NAME, rskynet_net::NetService::new);
+        }
+        #[cfg(feature = "tls")]
+        {
+            builder = builder.service(rskynet_tls::NAME, rskynet_tls::TlsService::new);
         }
         builder
     }

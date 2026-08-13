@@ -19,6 +19,7 @@ rskynet-macros = { version = "0.1.0", path = "crates/rskynet-macros" }
 rskynet-net = { version = "0.1.0", path = "crates/rskynet-net" }
 rskynet-signal = { version = "0.1.0", path = "crates/rskynet-signal" }
 rskynet-timer = { version = "0.1.0", path = "crates/rskynet-timer" }
+rskynet-tls = { version = "0.1.0", path = "crates/rskynet-tls" }
 
 arc-swap = "1"
 async-trait = "0.1"
@@ -37,10 +38,16 @@ minidumper = "0.9"
 mio = { version = "1", features = ["os-poll", "net"] }
 parking_lot = "0.12"
 prost = "0.14"
+pkcs8 = { version = "0.11", features = ["encryption", "getrandom", "pem"] }
 proc-macro2 = "1"
 quote = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rustls = "0.23"
+rustls-pemfile = "2"
+rustls-platform-verifier = "0.7"
+webpki-roots = "1"
+zeroize = { version = "1", features = ["alloc"] }
 signal-hook = "0.4"
 slab = "0.4"
 syn = { version = "2", features = ["full"] }

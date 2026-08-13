@@ -26,6 +26,8 @@ impl MsgType {
     pub const ERROR: MsgType = MsgType(6);
     /// 业务消息的默认协议号。
     pub const USER: MsgType = MsgType(7);
+    /// TLS 服务投递的握手、明文与关闭事件。
+    pub const TLS: MsgType = MsgType(8);
 
     pub const fn raw(self) -> u8 {
         self.0
@@ -47,6 +49,7 @@ impl MsgType {
             Self::SOCKET => "SOCKET",
             Self::ERROR => "ERROR",
             Self::USER => "USER",
+            Self::TLS => "TLS",
             _ => return None,
         })
     }
@@ -265,10 +268,11 @@ mod tests {
                 MsgType::SYSTEM,
                 MsgType::SOCKET,
                 MsgType::ERROR,
-                MsgType::USER
+                MsgType::USER,
+                MsgType::TLS
             ]
             .map(MsgType::raw),
-            [0, 1, 2, 3, 4, 5, 6, 7]
+            [0, 1, 2, 3, 4, 5, 6, 7, 8]
         );
         assert!(MsgType::RESPONSE.is_reply() && MsgType::ERROR.is_reply());
         assert!(!MsgType::USER.is_reply());

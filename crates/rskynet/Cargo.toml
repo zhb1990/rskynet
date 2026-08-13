@@ -23,6 +23,8 @@ signal = ["dep:rskynet-signal"]
 main = []
 # 网络层。要用 socket / gate 时打开
 net = ["dep:rskynet-net"]
+# TLS 协议服务，密文收发依赖底层网络服务
+tls = ["net", "dep:rskynet-tls"]
 # 跨节点通信：按需开启，同时带上底层网络服务
 cluster = ["net", "bootstrap", "dep:rskynet-cluster", "dep:toml"]
 
@@ -53,4 +55,5 @@ rskynet-macros = { workspace = true, optional = true }
 rskynet-net = { workspace = true, optional = true }
 rskynet-signal = { workspace = true, optional = true }
 rskynet-timer = { workspace = true, optional = true }
+rskynet-tls = { workspace = true, optional = true }
 toml = { workspace = true, optional = true }

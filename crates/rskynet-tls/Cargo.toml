@@ -1,0 +1,26 @@
+[package]
+name = "rskynet-tls"
+description = "rskynet 的 TLS 协议服务：基于 rustls，在 rskynet-net 之上提供加密连接"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+pkcs8 = { workspace = true }
+rskynet-core = { workspace = true }
+rskynet-net = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rustls-platform-verifier = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+webpki-roots = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+rcgen = "0.14"
+rskynet-bootstrap = { workspace = true }
+rskynet-macros = { workspace = true }
+rskynet-timer = { workspace = true }

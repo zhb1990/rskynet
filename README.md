@@ -263,6 +263,12 @@ impl Calculator {
 `cargo run -p rskynet-examples -- config/examples/echo_server.toml`，再用
 `telnet 127.0.0.1 8888` 验证回声。
 
+TLS 层用 `tls` feature 打开（会同时打开 `net`）。在 `[bootstrap]` 中按
+`net → tls → 业务服务` 的顺序启动；`rskynet-tls` 不接管 socket，而是在网络层之上
+把 rustls 驱动成一个普通 actor 服务。客户端和服务端证书配置分别通过
+`ClientOptions` / `ServerOptions` 传入，支持系统根、Mozilla 根、自定义根、无密码
+私钥和带密码的 PKCS#8 私钥。
+
 `cluster` feature 用 Protobuf 在 rskynet 节点间通信。消息的 TYPE_ID 和入站
 handler 都由宏提交到链接期自动注册表：
 
@@ -340,6 +346,7 @@ async fn pong(
 | `rskynet-bootstrap` | `bootstrap.lua` | 引导服务 |
 | `rskynet-signal` | OS signal / exception | 普通信号回调、优雅关停与独立崩溃报告进程 |
 | `rskynet-net` | `socket_server.c` | TCP / UDP 网络层、槽位状态机、背压与域名解析 |
+| `rskynet-tls` | 无对应 | 基于 rustls、复用网络层的双向 TLS 协议服务 |
 | `rskynet-macros` | `lualib/skynet.lua` 的协议分发样板 | `service` / `exclusive` / `msg` 过程宏 |
 
 ## 为什么服务状态可以不加锁
@@ -371,7 +378,7 @@ struct Counter { hits: SvcCell<u64> }
 
 ## 现状与边界
 
-已实现：服务生命周期（launch / exit / kill / abort）、消息与自定义协议号、session RPC、服务内并发、本地名字表、分层时间轮、独占线程的服务、引导服务、TCP / UDP、信号回调与默认优雅关停、独立进程 minidump/堆栈报告、过程宏、TOML 配置、基于争用的批量让渡调度与工作窃取、过载检测、monitor 死循环检测、退出时给在途请求回错误。
+已实现：服务生命周期（launch / exit / kill / abort）、消息与自定义协议号、session RPC、服务内并发、本地名字表、分层时间轮、独占线程的服务、引导服务、TCP / UDP、双向 TLS、信号回调与默认优雅关停、独立进程 minidump/堆栈报告、过程宏、TOML 配置、基于争用的批量让渡调度与工作窃取、过载检测、monitor 死循环检测、退出时给在途请求回错误。
 
 可选的 `cluster` feature 提供 rskynet 节点间的 Protobuf 通信；本地 actor 依然直接传对象。
 尚未实现：gate / agent、debug_console。
@@ -418,6 +425,7 @@ crates/rskynet-bootstrap/  引导服务
 crates/rskynet-macros/     service / exclusive / msg / signal 过程宏
 crates/rskynet-signal/     进程信号、优雅关停与独立崩溃报告
 crates/rskynet-net/        TCP + UDP 网络层，一个独占线程的服务
+crates/rskynet-tls/        基于 rustls、复用 net 的双向 TLS 协议服务
 crates/rskynet-cluster/    可选的 Protobuf 跨节点通信层
 examples/                  本地与跨节点 Ping / Pong / Echo 示例
 ```
@@ -426,6 +434,7 @@ examples/                  本地与跨节点 Ping / Pong / Echo 示例
 
 ```toml
 rskynet = { version = "0.1", features = ["net"] }   # macros / logger / timer / bootstrap / signal / main 默认已开
+rskynet = { version = "0.1", features = ["tls"] }   # TLS 会隐含启用 net
 ```
 
 业务代码不需要放进本仓：`rskynet` 是 lib crate，对外提供 `Service` trait 与 `rskynet::start(config, registry)`，使用方在自己的 app crate 里写 `main` 并注册服务——对应 skynet 里「内核是宿主、服务是外挂模块」的形态。
