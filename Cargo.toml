@@ -12,6 +12,7 @@ repository = "https://github.com/zhuhb/rskynet"
 # 统一管理依赖版本，后续新增 rskynet-cluster 等成员时直接复用
 [workspace.dependencies]
 rskynet-bootstrap = { version = "0.1.0", path = "crates/rskynet-bootstrap" }
+rskynet-cluster = { version = "0.1.0", path = "crates/rskynet-cluster" }
 rskynet-core = { version = "0.1.0", path = "crates/rskynet-core" }
 rskynet-logger = { version = "0.1.0", path = "crates/rskynet-logger" }
 rskynet-macros = { version = "0.1.0", path = "crates/rskynet-macros" }
@@ -35,6 +36,7 @@ minidump-unwind = { version = "=0.25.0", features = ["debuginfo-unwind"] }
 minidumper = "0.9"
 mio = { version = "1", features = ["os-poll", "net"] }
 parking_lot = "0.12"
+prost = "0.14"
 proc-macro2 = "1"
 quote = "1"
 serde = { version = "1", features = ["derive"] }

@@ -257,16 +257,63 @@ impl Calculator {
 `cargo run -p rskynet-examples -- config/examples/echo_server.toml`，再用
 `telnet 127.0.0.1 8888` 验证回声。
 
+`cluster` feature 用 Protobuf 在 rskynet 节点间通信。消息的 TYPE_ID 和入站
+handler 都由宏提交到链接期自动注册表：
+
+```rust
+#[derive(Clone, PartialEq, prost::Message, rskynet::cluster::ClusterMessage)]
+#[cluster(type_id = 1001)]
+struct PingRequest {
+    #[prost(uint64, tag = "1")]
+    round: u64,
+}
+
+#[derive(Clone, PartialEq, prost::Message, rskynet::cluster::ClusterMessage)]
+#[cluster(type_id = 1002)]
+struct PongResponse {
+    #[prost(uint64, tag = "1")]
+    round: u64,
+}
+
+#[rskynet::cluster::handler("pong")]
+async fn pong(
+    remote: rskynet::cluster::RemoteContext,
+    ping: PingRequest,
+) -> Result<PongResponse, String> {
+    remote.log(format!("转交本地服务处理第 {} 轮 ping", ping.round));
+    let reply = remote
+        .request("pong-worker", rskynet::Payload::of(ping))
+        .await
+        .map_err(|error| error.to_string())?;
+    reply
+        .downcast::<PongResponse>()
+        .map(|response| *response)
+        .map_err(|_| "pong-worker 返回了错误的负载类型".to_owned())
+}
+```
+
+`RemoteContext` 提供自动附带路由、消息 `TYPE_ID`、来源节点和请求 ID 的日志，
+也可通过 `post` / `request` 把工作交给本地 actor。它还提供 `now`、`time`、
+`start_time`、`sleep`、`sleep_ms` 和 `yield_now` 等基础能力，但不会暴露内部
+`cluster` 服务的 handle 或关停能力。上例中的 `pong-worker` 是通过
+`Ctx::register_name` 注册的本地 actor；跨节点边界使用 Protobuf，本地转交仍使用
+`Payload::Boxed`，不会重复序列化。
+
+配置中出现 `[cluster]` 时，标准 `rskynet::start` / `rskynet::main::run`
+会自动注册 handler，并在业务服务之前启动 `net` 与 `cluster`；
+`[bootstrap].services` 不必再列这两项。需要运行时组合时仍可显式使用
+`HandlerRegistry` 和 `with_cluster`，显式注册优先。
+
 ## 源码对照
 
 模块名刻意与 `skynet-src` 的文件名对齐，方便逐一比对：
 
 | rskynet | skynet | 内容 |
 | --- | --- | --- |
-| `message.rs` | `skynet_mq.h` | `Message` / `MsgType`（数值与 `PTYPE_*` 一致）/ `Payload` |
+| `message.rs` | `skynet_mq.h` | `Message` / `MsgType` / `Payload` |
 | `mq.rs` | `skynet_mq.c` | 每服务邮箱与四态状态机、运行队列（每 worker 一条 + injector）、唤醒与窃取、过载检测 |
 | `bwos.rs` | 无对应 | BWoS 块式工作窃取队列，移植自 stdexec 的 `bwos_lifo_queue.hpp` |
-| `handle.rs` | `skynet_handle.c` | handle 分配（harbor 占高 8 位）、槽位倍增、本地名字表 |
+| `handle.rs` | `skynet_handle.c` | 本地 `u32` handle 分配、槽位倍增、本地名字表 |
 | `server.rs` | `skynet_server.c` | `ServiceContext`、`Node`、消息分发主循环、服务生命周期 |
 | `clock.rs` | 无对应 | `Timer` 抽象：内核只认它，实现由启动方注入 |
 | `module.rs` | `skynet_module.c` | 服务类型注册表（静态注册取代 `dlopen`） |
@@ -319,7 +366,8 @@ struct Counter { hits: SvcCell<u64> }
 
 已实现：服务生命周期（launch / exit / kill / abort）、消息与自定义协议号、session RPC、服务内并发、本地名字表、分层时间轮、独占线程的服务、引导服务、TCP / UDP、信号回调与默认优雅关停、独立进程 minidump/堆栈报告、过程宏、TOML 配置、基于争用的批量让渡调度与工作窃取、过载检测、退出时给在途请求回错误。
 
-尚未实现（下一版）：gate / agent、harbor / cluster 跨节点、monitor 死循环检测、debug_console、消息序列化协议。
+可选的 `cluster` feature 提供 rskynet 节点间的 Protobuf 通信；本地 actor 依然直接传对象。
+尚未实现：gate / agent、monitor 死循环检测、debug_console。
 
 因为内核不碰 epoll/kqueue，目前是**跨平台**的，Windows 上可以直接 `cargo run`。
 
@@ -363,7 +411,8 @@ crates/rskynet-bootstrap/  引导服务
 crates/rskynet-macros/     service / exclusive / msg / signal 过程宏
 crates/rskynet-signal/     进程信号、优雅关停与独立崩溃报告
 crates/rskynet-net/        TCP + UDP 网络层，一个独占线程的服务
-examples/                  Ping / Pong / Echo 与统一示例入口
+crates/rskynet-cluster/    可选的 Protobuf 跨节点通信层
+examples/                  本地与跨节点 Ping / Pong / Echo 示例
 ```
 
 使用方只写一行依赖，要什么按 feature 开：
@@ -450,6 +499,18 @@ $env:RSKYNET_KEEP_NATIVE_CRASH_TEST_DIR='1'
 cargo run -p rskynet-examples -- config/examples/ping_pong.toml
 cargo run -p rskynet-examples -- config/examples/echo_server.toml
 ```
+
+跨节点 ping/pong 要开两个终端，先启动 node 2 的 pong，再启动 node 1 的 ping：
+
+```bash
+# 终端 1
+cargo run -p rskynet-examples -- config/examples/cluster_pong.toml
+
+# 终端 2
+cargo run -p rskynet-examples -- config/examples/cluster_ping.toml
+```
+
+ping 完成 10 次 Protobuf request/reply 后会请求 pong 关闭，两个示例进程都会自行退出。
 
 ### 内核里为什么没有服务
 

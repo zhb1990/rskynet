@@ -1,0 +1,17 @@
+# 节点 1：连接节点 2，执行 10 次跨节点 ping/pong。
+thread = 2
+
+[cluster]
+node_id = 1
+listen = "127.0.0.1:9101"
+advertise = "127.0.0.1:9101"
+request_timeout_ms = 3000
+max_frame_len = 1048576
+seeds = [
+    { node_id = 2, address = "127.0.0.1:9102" },
+]
+
+[bootstrap]
+services = [
+    { name = "cluster-ping", args = "2 10" },
+]

@@ -40,7 +40,7 @@ struct SystemService {
 
 /// 节点配置，对照 skynet 的 `config` 文件。
 ///
-/// 内核认的只有这三个标量，剩下的全是段：`[logger]`、`[signal]`、`[timer]`、`[bootstrap]`
+/// 内核认的只有这两个标量，剩下的全是段：`[logger]`、`[signal]`、`[timer]`、`[bootstrap]`
 /// 归四个内置服务，`[net]` 之类归各自的服务。内核对系统服务的段只读一个 `name`，
 /// 段里其余内容原样留着，由服务自己解析。
 #[derive(Debug, Clone, Deserialize)]
@@ -48,8 +48,6 @@ struct SystemService {
 pub struct Config {
     /// worker 线程数。
     pub thread: usize,
-    /// 本节点编号，会占据 handle 的高 8 位。
-    pub harbor: u32,
     /// 是否统计各服务的消息处理耗时。
     pub profile: bool,
     /// 所有配置段原样留一份，认领它的服务在自己的 `init` 里用
@@ -64,7 +62,6 @@ impl Default for Config {
             thread: thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4),
-            harbor: 0,
             profile: true,
             sections: toml::Table::new(),
         }
@@ -141,9 +138,6 @@ impl Config {
     fn validate(&self) -> Result<()> {
         if self.thread == 0 {
             return Err(Error::Config("worker 线程数必须大于 0".into()));
-        }
-        if self.harbor > 0xff {
-            return Err(Error::Config("harbor 编号必须在 0..=255 之间".into()));
         }
         // `flatten` 把不认识的键统统收进 sections，于是「拼错内核字段就报错」这条
         // 防线得自己补上：配置段一律是表，落在顶层的散键只可能是拼错
@@ -404,7 +398,6 @@ mod tests {
         let config = Config::from_toml_str(
             r#"
             thread = 4
-            harbor = 1
             profile = false
 
             [logger]
@@ -413,7 +406,6 @@ mod tests {
         )
         .expect("配置应解析成功");
         assert_eq!(config.thread, 4);
-        assert_eq!(config.harbor, 1);
         assert!(!config.profile);
         // 段里没写 name，系统服务就走内置的默认类型名
         assert_eq!(
@@ -460,7 +452,7 @@ mod tests {
     #[test]
     fn invalid_config_is_rejected() {
         assert!(Config::from_toml_str("thread = 0").is_err());
-        assert!(Config::from_toml_str("harbor = 256").is_err());
+        assert!(Config::from_toml_str("harbor = 1").is_err());
         assert!(Config::from_toml_str("不认识的键 = 1").is_err());
     }
 

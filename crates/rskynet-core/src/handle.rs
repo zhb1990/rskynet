@@ -1,7 +1,7 @@
 //! handle 注册表与本地名字表，对照 `skynet-src/skynet_handle.c`。
 //!
-//! handle 的低 24 位是节点内序号，高 8 位是 harbor（节点）编号，
-//! 这样跨节点通信时看一眼地址就知道该不该转发。槽位数组按 2 的幂倍增，
+//! handle 是纯本地的 `u32` 序号，不编入节点信息。跨节点寻址由
+//! `rskynet-cluster` 的独立地址类型承担。槽位数组按 2 的幂倍增，
 //! 用 `handle & (slot_size - 1)` 直接定位，与 C 版一致。
 //!
 //! # 读路径为什么不加锁
@@ -25,19 +25,12 @@ use parking_lot::Mutex;
 
 use crate::server::ServiceContext;
 
-/// handle 里属于节点内序号的位，对照 C 版 `HANDLE_MASK`。
-pub(crate) const HANDLE_MASK: u32 = 0x00ff_ffff;
-/// harbor 编号所在的位移，对照 C 版 `HANDLE_REMOTE_SHIFT`。
-pub(crate) const HANDLE_REMOTE_SHIFT: u32 = 24;
-
 const DEFAULT_SLOT_SIZE: usize = 4;
 
 /// 槽位数组。扩容时整条换掉，平时只动其中某个槽。
 type Slots = Box<[ArcSwapOption<ServiceContext>]>;
 
 pub(crate) struct HandleStorage {
-    /// 已经左移到高 8 位的 harbor 编号。
-    harbor: u32,
     slots: ArcSwap<Slots>,
     /// 本地名字表。C 版用有序数组加二分查找，这里用 `BTreeMap`，语义相同。
     names: ArcSwap<BTreeMap<String, u32>>,
@@ -49,17 +42,12 @@ pub(crate) struct HandleStorage {
 }
 
 impl HandleStorage {
-    pub(crate) fn new(harbor: u32) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            harbor: (harbor & 0xff) << HANDLE_REMOTE_SHIFT,
             slots: ArcSwap::from_pointee(empty_slots(DEFAULT_SLOT_SIZE)),
             names: ArcSwap::from_pointee(BTreeMap::new()),
             alloc: Mutex::new(1),
         }
-    }
-
-    pub(crate) fn harbor(&self) -> u32 {
-        self.harbor >> HANDLE_REMOTE_SHIFT
     }
 
     /// 分配 handle 并落表。
@@ -76,19 +64,18 @@ impl HandleStorage {
             let slots = self.slots.load();
             let mut handle = *next;
             for _ in 0..slots.len() {
-                if handle > HANDLE_MASK {
+                if handle == 0 {
                     // 0 号保留
                     handle = 1;
                 }
                 let hash = (handle as usize) & (slots.len() - 1);
                 if slots[hash].load().is_none() {
-                    let ctx =
-                        make.take().expect("闭包只会被调用一次")(handle | self.harbor);
+                    let ctx = make.take().expect("闭包只会被调用一次")(handle);
                     slots[hash].store(Some(ctx.clone()));
-                    *next = handle + 1;
+                    *next = handle.wrapping_add(1);
                     return ctx;
                 }
-                handle += 1;
+                handle = handle.wrapping_add(1);
             }
             drop(slots);
             self.grow();
@@ -99,10 +86,7 @@ impl HandleStorage {
     fn grow(&self) {
         let old = self.slots.load();
         let new_size = old.len() * 2;
-        assert!(
-            new_size <= HANDLE_MASK as usize + 1,
-            "服务数量超出 handle 空间"
-        );
+        assert!(new_size <= u32::MAX as usize, "服务数量超出 handle 空间");
         let new_slots = empty_slots(new_size);
         for ctx in old.iter().filter_map(|slot| slot.load_full()) {
             let hash = (ctx.handle as usize) & (new_size - 1);
@@ -178,20 +162,26 @@ mod tests {
     use super::*;
     use crate::server::tests::dummy_context;
 
-    /// 分配出的 handle 高 8 位应当是 harbor 编号
+    /// handle 从 1 开始，整个 `u32` 空间都属于本地节点。
     #[test]
-    fn allocated_handle_carries_harbor() {
-        let storage = HandleStorage::new(7);
+    fn allocated_handle_is_local() {
+        let storage = HandleStorage::new();
         let ctx = storage.register_with(dummy_context);
-        assert_eq!(ctx.handle >> HANDLE_REMOTE_SHIFT, 7);
-        assert_eq!(ctx.handle & HANDLE_MASK, 1);
-        assert_eq!(storage.harbor(), 7);
+        assert_eq!(ctx.handle, 1);
+    }
+
+    #[test]
+    fn full_u32_handle_space_is_available() {
+        let storage = HandleStorage::new();
+        *storage.alloc.lock() = u32::MAX;
+        assert_eq!(storage.register_with(dummy_context).handle, u32::MAX);
+        assert_eq!(storage.register_with(dummy_context).handle, 1);
     }
 
     /// 槽位不够时按倍数扩容，扩容过程中一个服务都不能丢
     #[test]
     fn slots_grow_without_losing_services() {
-        let storage = HandleStorage::new(0);
+        let storage = HandleStorage::new();
         let mut handles = Vec::new();
         for _ in 0..DEFAULT_SLOT_SIZE * 4 + 1 {
             handles.push(storage.register_with(dummy_context).handle);
@@ -205,7 +195,7 @@ mod tests {
     /// 摘除服务时要连带把它注册过的名字一起清掉
     #[test]
     fn retire_also_clears_names() {
-        let storage = HandleStorage::new(0);
+        let storage = HandleStorage::new();
         let handle = storage.register_with(dummy_context).handle;
         assert!(storage.register_name(handle, "logger"));
         // 名字不可重复注册

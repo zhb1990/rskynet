@@ -1,0 +1,21 @@
+[package]
+name = "rskynet-cluster"
+description = "rskynet 的 Protobuf 跨节点通信层"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rskynet-core = { workspace = true }
+rskynet-macros = { workspace = true }
+rskynet-net = { workspace = true }
+futures-util = { workspace = true }
+inventory = { workspace = true }
+prost = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+futures-executor = { workspace = true }

@@ -23,18 +23,34 @@ signal = ["dep:rskynet-signal"]
 main = []
 # 网络层。要用 socket / gate 时打开
 net = ["dep:rskynet-net"]
+# 跨节点通信：按需开启，同时带上底层网络服务
+cluster = ["net", "bootstrap", "dep:rskynet-cluster", "dep:toml"]
 
 # net 在 dev-dependencies 里也列一份，好让 `cargo test` 不加 feature 也跑网络层的
 # 用例——那些用例直接用 `rskynet_net`，不经过 `rskynet::net` 那个 re-export
 [dev-dependencies]
 rskynet-net = { workspace = true }
+prost = { workspace = true }
 serde = { workspace = true }
+toml = { workspace = true }
+
+[[test]]
+name = "cluster"
+path = "tests/cluster.rs"
+required-features = ["cluster"]
+
+[[test]]
+name = "cluster_auto_duplicate"
+path = "tests/cluster_auto_duplicate.rs"
+required-features = ["cluster"]
 
 [dependencies]
 rskynet-core = { workspace = true }
 rskynet-bootstrap = { workspace = true, optional = true }
+rskynet-cluster = { workspace = true, optional = true }
 rskynet-logger = { workspace = true, optional = true }
 rskynet-macros = { workspace = true, optional = true }
 rskynet-net = { workspace = true, optional = true }
 rskynet-signal = { workspace = true, optional = true }
 rskynet-timer = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }

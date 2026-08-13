@@ -1,0 +1,15 @@
+# 节点 2：接收并应答跨节点 PingRequest。
+thread = 2
+
+[cluster]
+node_id = 2
+listen = "127.0.0.1:9102"
+advertise = "127.0.0.1:9102"
+request_timeout_ms = 3000
+max_frame_len = 1048576
+seeds = []
+
+[bootstrap]
+services = [
+    { name = "cluster-pong" },
+]

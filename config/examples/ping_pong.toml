@@ -1,5 +1,4 @@
 thread = 4
-harbor = 0
 profile = true
 
 [logger]

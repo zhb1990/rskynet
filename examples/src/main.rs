@@ -1,3 +1,4 @@
+mod cluster_ping_pong;
 mod echo;
 mod ping_pong;
 

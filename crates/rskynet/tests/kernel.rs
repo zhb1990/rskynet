@@ -479,7 +479,7 @@ fn runtime_stats_are_available() {
             note(&journal, format!("{}", ctx.message_count() >= 10));
             note(&journal, format!("{}", ctx.pending_calls() == 0));
             note(&journal, format!("{}", ctx.cpu_cost().as_nanos() > 0));
-            note(&journal, format!("{}", ctx.handle() >> 24 == ctx.harbor()));
+            note(&journal, format!("{}", ctx.handle() != 0));
         })
     });
     assert_eq!(seen, vec!["true", "true", "true", "true"]);

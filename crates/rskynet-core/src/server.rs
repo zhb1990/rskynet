@@ -65,7 +65,7 @@ pub(crate) struct ServiceContext {
     /// 已被摘出 handle 表，等待某个 worker 领走做销毁。
     dead: AtomicBool,
     /// 保留服务：不计入退出条件，且要留到最后才释放。
-    /// 对照 `skynet_context_reserve`（C 版用它保住 harbor 服务），logger 用的就是它
+    /// 对照 `skynet_context_reserve`，logger 用它保住自己
     /// ——否则关停时它邮箱里积压的日志会跟着一起被丢掉。
     reserved: AtomicBool,
     /// 销毁记账是否已完成，保证 `total` 只减一次。
@@ -411,7 +411,7 @@ impl Node {
     pub(crate) fn new(config: &Config, modules: Registry, timer: Arc<dyn Timer>) -> Arc<Node> {
         Arc::new(Node {
             sched: Scheduler::new(config.thread),
-            handles: HandleStorage::new(config.harbor),
+            handles: HandleStorage::new(),
             timer,
             modules,
             exclusives: Mutex::new(HashMap::new()),

@@ -72,11 +72,6 @@ impl Ctx {
         &self.inner.kind
     }
 
-    /// 本节点的 harbor 编号，即所有 handle 高 8 位的那个值。
-    pub fn harbor(&self) -> u32 {
-        self.inner.node.handles.harbor()
-    }
-
     /// 节点的对外把手，扩展 crate（网络层等）由此进入内核。
     ///
     /// 业务代码用不着它：`send` / `call` / `launch` 这些都在 `Ctx` 上。

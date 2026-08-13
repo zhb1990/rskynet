@@ -6,7 +6,7 @@
 use std::any::Any;
 use std::fmt;
 
-/// 消息类型。数值与 skynet 的 `PTYPE_*` 保持一致，方便对照与将来接入网络层。
+/// 消息类型。内置类型从 0 连续编号，跨节点协议不占用这个空间。
 ///
 /// 用 newtype 而不是 enum，是为了让使用方能像 skynet 那样自定义协议号
 /// （skynet 里 `PTYPE_RESERVED_LUA = 10` 就是 Lua 服务自己约定的业务协议）。
@@ -21,12 +21,11 @@ impl MsgType {
     pub const MULTICAST: MsgType = MsgType(2);
     pub const CLIENT: MsgType = MsgType(3);
     pub const SYSTEM: MsgType = MsgType(4);
-    pub const HARBOR: MsgType = MsgType(5);
-    pub const SOCKET: MsgType = MsgType(6);
+    pub const SOCKET: MsgType = MsgType(5);
     /// 错误应答，`call` 收到它会得到 `Error::CallFailed`。
-    pub const ERROR: MsgType = MsgType(7);
-    /// 业务消息的默认协议号，对应 skynet 的 `PTYPE_RESERVED_LUA`。
-    pub const USER: MsgType = MsgType(10);
+    pub const ERROR: MsgType = MsgType(6);
+    /// 业务消息的默认协议号。
+    pub const USER: MsgType = MsgType(7);
 
     pub const fn raw(self) -> u8 {
         self.0
@@ -45,7 +44,6 @@ impl MsgType {
             Self::MULTICAST => "MULTICAST",
             Self::CLIENT => "CLIENT",
             Self::SYSTEM => "SYSTEM",
-            Self::HARBOR => "HARBOR",
             Self::SOCKET => "SOCKET",
             Self::ERROR => "ERROR",
             Self::USER => "USER",
@@ -255,13 +253,23 @@ mod tests {
         assert_eq!(*back.downcast::<u8>().unwrap(), 42);
     }
 
-    /// 协议号必须与 skynet 的 PTYPE_* 逐一对齐
+    /// 内置协议号连续分配，应答类型的语义保持不变。
     #[test]
-    fn msg_type_numbers_match_skynet() {
-        assert_eq!(MsgType::TEXT.raw(), 0);
-        assert_eq!(MsgType::RESPONSE.raw(), 1);
-        assert_eq!(MsgType::ERROR.raw(), 7);
-        assert_eq!(MsgType::USER.raw(), 10);
+    fn builtin_message_types_are_contiguous() {
+        assert_eq!(
+            [
+                MsgType::TEXT,
+                MsgType::RESPONSE,
+                MsgType::MULTICAST,
+                MsgType::CLIENT,
+                MsgType::SYSTEM,
+                MsgType::SOCKET,
+                MsgType::ERROR,
+                MsgType::USER
+            ]
+            .map(MsgType::raw),
+            [0, 1, 2, 3, 4, 5, 6, 7]
+        );
         assert!(MsgType::RESPONSE.is_reply() && MsgType::ERROR.is_reply());
         assert!(!MsgType::USER.is_reply());
         assert_eq!(format!("{:?}", MsgType::RESPONSE), "RESPONSE");

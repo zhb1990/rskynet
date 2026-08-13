@@ -1,7 +1,7 @@
 //! 网络层投给属主服务的事件，对照 `socket_server.h` 的 `SOCKET_DATA` 那一组常量。
 //!
-//! 事件以 [`MsgType::SOCKET`][rskynet_core::MsgType::SOCKET]（协议号 6，与 C 版
-//! `PTYPE_SOCKET` 一致）投给持有该连接的服务，与定时器回包走同一条路径。
+//! 事件以 [`MsgType::SOCKET`][rskynet_core::MsgType::SOCKET]（协议号 5）投给
+//! 持有该连接的服务，与定时器回包走同一条路径。
 
 use std::fmt;
 use std::net::SocketAddr;

@@ -11,7 +11,7 @@
 //!   消息，办完 `ctx.reply`，于是调用方那侧写成一句 `await`。这对应 C 版那根命令
 //!   管道加 `PTYPE_RESPONSE` 回包。
 //! - **事件**：socket 事件以 [`MsgType::SOCKET`][rskynet_core::MsgType::SOCKET]
-//!   （即 `PTYPE_SOCKET`，协议号 6）投给持有该连接的服务，与定时器回包同一条路径。
+//!   （协议号 5）投给持有该连接的服务，与定时器回包同一条路径。
 //! - **配置**：`[net]` 段在 `init` 里读，见 [`NetConfig`]。
 //!
 //! 域名解析要另起一条线程（[`ToSocketAddrs`][std::net::ToSocketAddrs] 是阻塞的），

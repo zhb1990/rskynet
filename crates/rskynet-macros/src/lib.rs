@@ -47,10 +47,23 @@
 //!
 //! [`Service`]: https://docs.rs/rskynet-core/latest/rskynet_core/trait.Service.html
 
+mod cluster;
 mod expand;
 mod signal;
 
 use proc_macro::TokenStream;
+
+/// 为 Prost 消息实现 `cluster::ClusterMessage`。
+#[proc_macro_derive(ClusterMessage, attributes(cluster))]
+pub fn cluster_message(item: TokenStream) -> TokenStream {
+    cluster::derive_message(item.into()).into()
+}
+
+/// 把一个无捕获的自由 `async fn` 注册为 cluster handler。
+#[proc_macro_attribute]
+pub fn cluster_handler(attr: TokenStream, item: TokenStream) -> TokenStream {
+    cluster::handler(attr.into(), item.into()).into()
+}
 
 /// 从 inherent `impl` 块生成 `impl Service`。
 ///
