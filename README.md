@@ -363,7 +363,7 @@ crates/rskynet-bootstrap/  引导服务
 crates/rskynet-macros/     service / exclusive / msg / signal 过程宏
 crates/rskynet-signal/     进程信号、优雅关停与独立崩溃报告
 crates/rskynet-net/        TCP + UDP 网络层，一个独占线程的服务
-crates/rskynet-examples/   Ping / Pong / Echo 与统一示例入口
+examples/                  Ping / Pong / Echo 与统一示例入口
 ```
 
 使用方只写一行依赖，要什么按 feature 开：
