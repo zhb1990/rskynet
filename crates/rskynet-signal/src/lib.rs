@@ -170,6 +170,7 @@ fn dispatch(ctx: &Ctx, signal: Signal) {
     if let Some(registration) = registration(signal) {
         registration.call(ctx);
     } else if has_default_shutdown(signal) {
+        ctx.log(format!("收到进程信号 {signal:?}，执行默认 abort"));
         ctx.abort();
     }
 }
