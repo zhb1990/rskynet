@@ -102,6 +102,7 @@ struct Echo {
 #[rskynet::service]
 impl Echo {
     async fn init(&self, ctx: Ctx) -> Result<()> {
+        assert!(ctx.register_name("echo-net"));
         let id = net::listen(&ctx, "127.0.0.1:0").await?;
         // 端口写的是 0，系统挑了哪个得问
         let info = net::info(&ctx, id).await?;
@@ -167,6 +168,7 @@ struct Client {
 #[rskynet::service]
 impl Client {
     async fn init(&self, ctx: Ctx) -> Result<()> {
+        assert!(ctx.register_name("client-net"));
         let this = self.clone();
         let task_ctx = ctx.clone();
         ctx.spawn(async move {
@@ -198,6 +200,8 @@ impl Client {
 
         // 掐掉读：这期间发过去的东西压在内核缓冲里，一个字节都不该上来
         net::pause(ctx, id).await?;
+        self.tape
+            .check("暂停统计为不读", !net::info(ctx, id).await?.reading);
         net::send(ctx, id, b"paused".to_vec())?;
         for _ in 0..20 {
             ctx.sleep(1).await;
@@ -206,6 +210,8 @@ impl Client {
 
         // 恢复读：先前压着的还得原样上来
         net::start(ctx, id).await?;
+        self.tape
+            .check("恢复统计为读", net::info(ctx, id).await?.reading);
         let resumed = until(ctx, || self.tape.len() >= 6).await;
         self.tape.check("恢复后收到", resumed);
         self.tape.note(format!(
@@ -219,6 +225,41 @@ impl Client {
         self.tape.check("对端地址", info.peer == Some(server));
         self.tape.check("读了字节", info.read_bytes >= 11);
 
+        let stats = net::netstat(ctx).await?;
+        let current = stats
+            .iter()
+            .find(|info| info.id == id)
+            .expect("连接应在统计中");
+        self.tape
+            .check("统计归属 handle", current.owner == ctx.handle());
+        self.tape.check(
+            "统计归属类型",
+            current.owner_kind.as_deref() == Some("client"),
+        );
+        self.tape.check(
+            "统计归属名字",
+            current.owner_names.iter().any(|name| name == "client-net"),
+        );
+        self.tape.check(
+            "统计收发时间",
+            current.last_read_at_ms.is_some() && current.last_write_at_ms.is_some(),
+        );
+        self.tape
+            .check("统计无待写", !current.writing && current.write_pending == 0);
+        let listener = stats
+            .iter()
+            .find(|info| info.kind == "listener")
+            .expect("监听口应在统计中");
+        self.tape.check(
+            "监听统计",
+            listener.accept_count == 1 && listener.last_read_at_ms.is_some(),
+        );
+        self.tape.check(
+            "监听归属",
+            listener.owner_kind.as_deref() == Some("echo")
+                && listener.owner_names.iter().any(|name| name == "echo-net"),
+        );
+
         // 自己关的连接也会收到一条 Close：「socket 没了」只有这一个信号
         net::close(ctx, id).await?;
         let closed = until(ctx, || {
@@ -226,6 +267,10 @@ impl Client {
         })
         .await;
         self.tape.check("收到关闭事件", closed);
+        self.tape.check(
+            "释放后不显示",
+            !net::netstat(ctx).await?.iter().any(|info| info.id == id),
+        );
 
         // 已经关掉的 id 再用就该报错，而不是打到别人身上
         self.tape
@@ -267,14 +312,24 @@ fn a_tcp_connection_goes_the_whole_way() {
         vec![
             "回声=true",
             "收到=hello",
+            "暂停统计为不读=true",
             "暂停期间静默=true",
+            "恢复统计为读=true",
             "恢复后收到=true",
             "收到=paused",
             "现状=stream connected",
             "对端地址=true",
             "读了字节=true",
+            "统计归属 handle=true",
+            "统计归属类型=true",
+            "统计归属名字=true",
+            "统计收发时间=true",
+            "统计无待写=true",
+            "监听统计=true",
+            "监听归属=true",
             "关了",
             "收到关闭事件=true",
+            "释放后不显示=true",
             "旧 id 失效=true",
         ]
     );
@@ -405,6 +460,7 @@ struct UdpProbe {
 #[rskynet::service]
 impl UdpProbe {
     async fn init(&self, ctx: Ctx) -> Result<()> {
+        assert!(ctx.register_name("udp-net"));
         let this = self.clone();
         let task_ctx = ctx.clone();
         ctx.spawn(async move {
@@ -432,16 +488,48 @@ impl UdpProbe {
         let both = until(ctx, || self.got.lock().unwrap().len() >= 2).await;
         self.tape.check("两个包都到了", both);
 
-        let got = self.got.lock().unwrap();
-        let from = |what: &[u8]| {
-            got.iter()
-                .find(|(_, data)| data == what)
-                .map(|(from, _)| *from)
+        let (ping_from, pong_from) = {
+            let got = self.got.lock().unwrap();
+            let from = |what: &[u8]| {
+                got.iter()
+                    .find(|(_, data)| data == what)
+                    .map(|(from, _)| *from)
+            };
+            (from(b"ping"), from(b"pong"))
         };
         self.tape
-            .check("ping 的发件人", from(b"ping") == Some(left_addr));
+            .check("ping 的发件人", ping_from == Some(left_addr));
         self.tape
-            .check("pong 走默认对端", from(b"pong") == Some(right_addr));
+            .check("pong 走默认对端", pong_from == Some(right_addr));
+
+        let stats = net::netstat(ctx).await?;
+        let left_stat = stats
+            .iter()
+            .find(|info| info.id == left)
+            .expect("左端口应在统计中");
+        let right_stat = stats
+            .iter()
+            .find(|info| info.id == right)
+            .expect("右端口应在统计中");
+        self.tape.check(
+            "UDP 收发统计",
+            left_stat.read_bytes == 4
+                && left_stat.write_bytes == 4
+                && right_stat.read_bytes == 4
+                && right_stat.write_bytes == 4
+                && left_stat.last_read_at_ms.is_some()
+                && left_stat.last_write_at_ms.is_some()
+                && right_stat.last_read_at_ms.is_some()
+                && right_stat.last_write_at_ms.is_some(),
+        );
+        self.tape.check(
+            "UDP 归属",
+            [left_stat, right_stat].iter().all(|info| {
+                info.owner == ctx.handle()
+                    && info.owner_kind.as_deref() == Some("udp-probe")
+                    && info.owner_names.iter().any(|name| name == "udp-net")
+            }),
+        );
         Ok(())
     }
 
@@ -476,8 +564,50 @@ fn udp_packets_carry_their_sender() {
             "两个包都到了=true",
             "ping 的发件人=true",
             "pong 走默认对端=true",
+            "UDP 收发统计=true",
+            "UDP 归属=true",
         ]
     );
+}
+
+// ------------------------------------------------------------ 空统计
+
+struct EmptyStatProbe {
+    tape: Arc<Tape>,
+}
+
+#[rskynet::service]
+impl EmptyStatProbe {
+    async fn init(&self, ctx: Ctx) -> Result<()> {
+        let tape = self.tape.clone();
+        let task_ctx = ctx.clone();
+        ctx.spawn(async move {
+            tape.check(
+                "空网络统计",
+                net::netstat(&task_ctx)
+                    .await
+                    .is_ok_and(|stats| stats.is_empty()),
+            );
+            task_ctx.abort();
+        });
+        Ok(())
+    }
+}
+
+#[test]
+fn netstat_is_empty_without_sockets() {
+    let tape = Arc::new(Tape::default());
+    let probe_tape = tape.clone();
+    let registry = Registry::new()
+        .with_net()
+        .with("empty-stat-probe", move || EmptyStatProbe {
+            tape: probe_tape.clone(),
+        });
+    run_node(
+        Config::default().with_bootstrap(["empty-stat-probe"]),
+        registry,
+    );
+    assert_eq!(tape.notes(), vec!["空网络统计=true"]);
 }
 
 // ------------------------------------------------------------ DNS 多地址回退

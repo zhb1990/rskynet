@@ -90,6 +90,10 @@ pub struct SocketInfo {
     pub id: SocketId,
     /// 属主服务的 handle，事件投给它。对照 C 版的 `opaque`。
     pub owner: u32,
+    /// 属主服务的类型。属主已经退出时为 `None`。
+    pub owner_kind: Option<String>,
+    /// 属主服务注册过的全部本地名字。属主已退出或没有名字时为空。
+    pub owner_names: Vec<String>,
     /// `listener` / `stream` / `udp`。
     pub kind: &'static str,
     /// 状态名，与 C 版的 `SOCKET_TYPE_*` 对齐。
@@ -100,8 +104,18 @@ pub struct SocketInfo {
     pub peer: Option<SocketAddr>,
     /// 写缓冲里还压着多少字节。
     pub write_pending: usize,
+    /// 监听口累计 accept 成功的连接数；非监听 socket 恒为 0。
+    pub accept_count: u64,
     pub read_bytes: u64,
     pub write_bytes: u64,
+    /// 最后一次成功读取或 accept 时，节点启动后的毫秒数。
+    pub last_read_at_ms: Option<u64>,
+    /// 最后一次成功写出时，节点启动后的毫秒数。
+    pub last_write_at_ms: Option<u64>,
+    /// 当前是否允许继续读取或 accept。
+    pub reading: bool,
+    /// 当前是否有数据等待写出。
+    pub writing: bool,
 }
 
 boxed_payload!(SocketInfo);

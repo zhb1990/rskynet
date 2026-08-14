@@ -10,6 +10,9 @@
 //! - **命令**：[`listen`] / [`connect`] / [`send`] / [`close`] 都是发给本服务的
 //!   消息，办完 `ctx.reply`，于是调用方那侧写成一句 `await`。这对应 C 版那根命令
 //!   管道加 `PTYPE_RESPONSE` 回包。
+//! - **统计**：[`info`] 查询单个 socket，[`netstat`] 枚举全部活跃 socket，包含
+//!   Skynet 的累计收发、accept、最后收发时间、写缓冲与读写状态，并补充属主
+//!   service 的 handle、类型和本地名字。
 //! - **事件**：socket 事件以 [`MsgType::SOCKET`][rskynet_core::MsgType::SOCKET]
 //!   （协议号 5）投给持有该连接的服务，与定时器回包同一条路径。
 //! - **配置**：`[net]` 段在 `init` 里读，见 [`NetConfig`]。
@@ -95,7 +98,7 @@ mod socket;
 use rskynet_core::Registry;
 
 pub use command::{
-    Answer, Command, close, connect, connect_timeout, info, listen, pause, send, send_low,
+    Answer, Command, close, connect, connect_timeout, info, listen, netstat, pause, send, send_low,
     send_low_wait, send_wait, set_nodelay, shutdown, start, udp, udp_connect, udp_send,
 };
 pub use config::NetConfig;

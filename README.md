@@ -269,6 +269,27 @@ impl Calculator {
 `cargo run -p rskynet-examples -- config/examples/echo_server.toml`，再用
 `telnet 127.0.0.1 8888` 验证回声。
 
+`net::info(&ctx, id)` 查询单个 socket，`net::netstat(&ctx)` 则像 Skynet 的
+`socket.netstat()` 一样返回全部活跃 socket（释放后的连接不会保留）：
+
+```rust
+for socket in rskynet::net::netstat(&ctx).await? {
+    println!(
+        "{} owner=:{:08x} kind={:?} names={:?} read={} write={} pending={}",
+        socket.id,
+        socket.owner,
+        socket.owner_kind,
+        socket.owner_names,
+        socket.read_bytes,
+        socket.write_bytes,
+        socket.write_pending,
+    );
+}
+```
+
+统计还包含监听口 accept 次数、读写状态及最后成功收发时间；时间字段以节点启动为
+起点，单位为毫秒。尚未 `start`、正在连接和半关闭的过渡态也会显示。
+
 TLS 层用 `tls` feature 打开（会同时打开 `net`）。出现 `[tls]` 时会按
 `net → tls → 业务服务` 自动启动；缺少的 `[net]` 使用默认配置。`rskynet-tls` 不接管 socket，而是在网络层之上
 把 rustls 驱动成一个普通 actor 服务。客户端和服务端证书配置分别通过

@@ -67,6 +67,8 @@ pub enum Command {
     },
     /// 问一个 socket 的现状，对照 `'Q'`。
     Info(SocketId),
+    /// 枚举全部活跃 socket 及其统计，对照 `socket.netstat()`。
+    Netstat,
     #[doc(hidden)]
     ConnectTimeoutElapsed(SocketId),
 }
@@ -82,6 +84,7 @@ pub enum Answer {
     /// 新建的 socket 编号。
     Id(SocketId),
     Info(SocketInfo),
+    Infos(Vec<SocketInfo>),
     /// 办好了，没什么要回的。
     Done,
     Failed(String),
@@ -267,6 +270,17 @@ pub fn udp_send(ctx: &Ctx, id: SocketId, to: Option<SocketAddr>, data: Vec<u8>) 
 pub async fn info(ctx: &Ctx, id: SocketId) -> Result<SocketInfo> {
     match ask(ctx, Command::Info(id)).await? {
         Answer::Info(info) => Ok(info),
+        other => Err(unexpected(other)),
+    }
+}
+
+/// 枚举网络层中全部活跃 socket 及其统计，按 [`SocketId`] 升序返回。
+///
+/// 返回 listener、TCP、UDP 以及尚未 `start`、正在连接、半关闭等过渡态。
+/// 已经关闭并释放槽位的 socket 不会出现在结果中。
+pub async fn netstat(ctx: &Ctx) -> Result<Vec<SocketInfo>> {
+    match ask(ctx, Command::Netstat).await? {
+        Answer::Infos(infos) => Ok(infos),
         other => Err(unexpected(other)),
     }
 }

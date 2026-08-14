@@ -18,7 +18,7 @@
 //! 它由**任意线程**调用（谁给本服务投消息谁调），所以它只许碰 `Arc<Waker>` 那一个
 //! 字段，别的一概不能摸。
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -34,7 +34,7 @@ use crate::NAME;
 use crate::buffer::Chunk;
 use crate::command::{Answer, Command};
 use crate::config::NetConfig;
-use crate::event::{SocketEvent, SocketId};
+use crate::event::{SocketEvent, SocketId, SocketInfo};
 use crate::resolve::{Resolved, Resolver};
 use crate::socket::{Kind, Pending, Sockets, State, WAKE};
 
@@ -286,6 +286,11 @@ impl NetService {
                 }
             };
 
+            if let Some(socket) = self.sockets.borrow_mut().get_mut(listen) {
+                socket.stat.accept_count += 1;
+                socket.stat.last_read_at_ms = Some(ctx.now());
+            }
+
             // 属主先跟着监听口，等它（或它指定的那个服务）调 start 时再改
             let fresh = self
                 .sockets
@@ -337,6 +342,7 @@ impl NetService {
                         buf.truncate(n);
                         socket.read.observe(n);
                         socket.stat.read_bytes += n as u64;
+                        socket.stat.last_read_at_ms = Some(ctx.now());
                         Got::Data {
                             owner: socket.owner,
                             data: buf,
@@ -385,6 +391,7 @@ impl NetService {
                 Ok((len, from)) => {
                     if let Some(socket) = self.sockets.borrow_mut().get_mut(id) {
                         socket.stat.read_bytes += len as u64;
+                        socket.stat.last_read_at_ms = Some(ctx.now());
                     }
                     let _ = ctx.send(
                         owner,
@@ -525,6 +532,7 @@ impl NetService {
                     Ok(n) => {
                         socket.wb.consume(n);
                         socket.stat.write_bytes += n as u64;
+                        socket.stat.last_write_at_ms = Some(ctx.now());
                         Step::Wrote
                     }
                     Err(err) if err.kind() == ErrorKind::WouldBlock => Step::Blocked,
@@ -667,7 +675,8 @@ impl NetService {
                 Some(Answer::Done)
             }
             Command::NoDelay { id, on } => Some(self.do_nodelay(id, on)),
-            Command::Info(id) => Some(self.do_info(id)),
+            Command::Info(id) => Some(self.do_info(ctx, id)),
+            Command::Netstat => Some(Answer::Infos(self.do_netstat(ctx))),
             Command::ConnectTimeoutElapsed(id) => {
                 self.connect_timeout_elapsed(ctx, id);
                 None
@@ -1006,11 +1015,35 @@ impl NetService {
         }
     }
 
-    fn do_info(&self, id: SocketId) -> Answer {
+    fn do_info(&self, ctx: &Ctx, id: SocketId) -> Answer {
         match self.sockets.borrow().get(id) {
-            Some(socket) => Answer::Info(socket.info()),
+            Some(socket) => {
+                let mut info = socket.info();
+                if let Ok(owner) = ctx.node().service_stats(info.owner) {
+                    info.owner_kind = Some(owner.kind);
+                    info.owner_names = owner.names;
+                }
+                Answer::Info(info)
+            }
             None => missing(id),
         }
+    }
+
+    fn do_netstat(&self, ctx: &Ctx) -> Vec<SocketInfo> {
+        let owners: HashMap<_, _> = ctx
+            .node()
+            .services()
+            .into_iter()
+            .map(|owner| (owner.handle, (owner.kind, owner.names)))
+            .collect();
+        let mut infos = self.sockets.borrow().infos();
+        for info in &mut infos {
+            if let Some((kind, names)) = owners.get(&info.owner) {
+                info.owner_kind = Some(kind.clone());
+                info.owner_names.clone_from(names);
+            }
+        }
+        infos
     }
 }
 

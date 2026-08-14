@@ -118,8 +118,11 @@ impl Pending {
 
 #[derive(Default)]
 pub(crate) struct Stat {
+    pub(crate) accept_count: u64,
     pub(crate) read_bytes: u64,
     pub(crate) write_bytes: u64,
+    pub(crate) last_read_at_ms: Option<u64>,
+    pub(crate) last_write_at_ms: Option<u64>,
 }
 
 pub(crate) struct Socket {
@@ -230,14 +233,21 @@ impl Socket {
         SocketInfo {
             id: self.id,
             owner: self.owner,
+            owner_kind: None,
+            owner_names: Vec::new(),
             kind: self.kind.name(),
             state: self.state.name(),
             paused: self.paused,
             local: self.kind.local_addr(),
             peer,
             write_pending: self.wb.size(),
+            accept_count: self.stat.accept_count,
             read_bytes: self.stat.read_bytes,
             write_bytes: self.stat.write_bytes,
+            last_read_at_ms: self.stat.last_read_at_ms,
+            last_write_at_ms: self.stat.last_write_at_ms,
+            reading: !self.paused && matches!(self.state, State::Listen | State::Connected),
+            writing: !self.wb.is_empty(),
         }
     }
 }
@@ -310,6 +320,17 @@ impl Sockets {
         } else {
             None
         }
+    }
+
+    /// 枚举当前仍占着槽位的全部 socket，按 id 排序以提供稳定输出。
+    pub(crate) fn infos(&self) -> Vec<SocketInfo> {
+        let mut infos: Vec<_> = self
+            .slots
+            .iter()
+            .filter_map(|slot| slot.as_ref().map(Socket::info))
+            .collect();
+        infos.sort_unstable_by_key(|info| info.id);
+        infos
     }
 }
 
@@ -409,5 +430,31 @@ mod tests {
 
         socket.state = State::HalfCloseWrite;
         assert_eq!(socket.desired(), Some(Interest::WRITABLE), "只剩把欠的写完");
+    }
+
+    #[test]
+    fn infos_include_transitional_states_and_are_sorted() {
+        let mut sockets = Sockets::new(4, 64);
+        // id 3 落在槽 3，id 4 落在槽 0；直接按槽遍历会得到 [4, 3]。
+        sockets.next = 3;
+        let low = sockets
+            .insert(3, listener(), State::PreListen)
+            .expect("应能插入")
+            .id;
+        let high = sockets
+            .insert(2, listener(), State::Listen)
+            .expect("应能插入")
+            .id;
+
+        let infos = sockets.infos();
+        assert_eq!(
+            infos.iter().map(|info| info.id).collect::<Vec<_>>(),
+            vec![low, high]
+        );
+        assert_eq!(infos[0].state, "prelisten");
+        assert_eq!(infos[1].state, "listen");
+
+        sockets.remove(high);
+        assert_eq!(sockets.infos().len(), 1, "释放后的 socket 不应再显示");
     }
 }
