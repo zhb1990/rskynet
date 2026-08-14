@@ -1721,6 +1721,7 @@ dependencies = [
  "rskynet-core",
  "rskynet-macros",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

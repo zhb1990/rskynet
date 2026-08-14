@@ -7,12 +7,13 @@ use std::fmt;
 use std::net::SocketAddr;
 
 use rskynet_core::boxed_payload;
+use serde::Serialize;
 
 /// 一个连接、监听口或 UDP 端口的编号，对照 C 版的 socket id。
 ///
 /// 单调递增，`id % max_socket` 就是它的槽位（照搬 C 版的 `HASH_ID`），所以同一个
 /// 槽位被复用时 id 一定变了——迟到的事件因此不会张冠李戴。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct SocketId(pub u32);
 
 impl SocketId {
@@ -85,7 +86,7 @@ impl SocketEvent {
 }
 
 /// 一个 socket 的现状，[`info`][crate::info] 的返回值。对照 C 版 `'Q'` 那条命令。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SocketInfo {
     pub id: SocketId,
     /// 属主服务的 handle，事件投给它。对照 C 版的 `opaque`。
@@ -119,3 +120,40 @@ pub struct SocketInfo {
 }
 
 boxed_payload!(SocketInfo);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_info_serializes_for_observation_apis() {
+        let info = SocketInfo {
+            id: SocketId(7),
+            owner: 0x100,
+            owner_kind: Some("dashboard".into()),
+            owner_names: vec!["dashboard".into()],
+            kind: "stream",
+            state: "connected",
+            paused: false,
+            local: Some("127.0.0.1:8080".parse().unwrap()),
+            peer: None,
+            write_pending: 32,
+            accept_count: 0,
+            read_bytes: 64,
+            write_bytes: 128,
+            last_read_at_ms: Some(1_000),
+            last_write_at_ms: None,
+            reading: true,
+            writing: true,
+        };
+
+        let value = serde_json::to_value(info).unwrap();
+        assert_eq!(value["id"], 7);
+        assert_eq!(value["owner"], 0x100);
+        assert_eq!(value["owner_kind"], "dashboard");
+        assert_eq!(value["local"], "127.0.0.1:8080");
+        assert!(value["peer"].is_null());
+        assert_eq!(value["last_read_at_ms"], 1_000);
+        assert!(value["last_write_at_ms"].is_null());
+    }
+}

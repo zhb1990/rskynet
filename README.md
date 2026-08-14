@@ -312,9 +312,10 @@ HTTP/1.1 用 `http` feature 打开，HTTPS 用 `https`（会同时启用 `http` 
 address = "127.0.0.1:8080"
 ```
 
-页面与 `/api/v1/stats` 都直接嵌入可执行文件，部署时不需要额外静态资源。页面展示
-节点和 service 统计、启动/运行时间及浏览器内短期趋势；存在 `[cluster]` 时还会显示
-本节点的 `node_id`。可运行
+页面与 `/api/v1/stats` 都直接嵌入可执行文件，部署时不需要额外静态资源。页面通过
+“服务 / 网络”标签展示节点、service 与活跃 socket 统计、启动/运行时间及浏览器内
+短期趋势；`/api/v1/stats` 的同一份快照也包含 `services` 和 `sockets`。存在
+`[cluster]` 时还会显示本节点的 `node_id`。可运行
 `cargo run -p rskynet-examples -- config/examples/dashboard.toml` 预览。
 
 WebSocket 用 `websocket` feature 打开，协议和握手由 `tungstenite` 驱动。服务端仍

@@ -117,7 +117,16 @@
     canvas { width: 100%; height: 112px; display: block; margin-top: 4px; }
 
     .main-panel { min-width: 0; background: var(--surface); border: 1px solid #142b3d; border-radius: var(--radius); overflow: hidden; }
+    .tabbar { min-height: 50px; display: flex; align-items: stretch; gap: 4px; padding: 0 16px; border-bottom: 1px solid var(--line-soft); background: #0d2031; }
+    .tab { position: relative; min-width: 92px; border: 0; background: transparent; color: var(--muted); cursor: pointer; font-weight: 650; }
+    .tab::after { content: ""; position: absolute; left: 12px; right: 12px; bottom: -1px; height: 3px; border-radius: 3px 3px 0 0; background: transparent; }
+    .tab:hover { color: var(--text); }
+    .tab:focus-visible { outline: 1px solid var(--cyan); outline-offset: -4px; }
+    .tab.active { color: var(--text); }
+    .tab.active::after { background: var(--teal); }
+    .tab-panel[hidden] { display: none; }
     .toolbar { min-height: 104px; display: grid; grid-template-columns: minmax(230px, 1fr) 190px auto minmax(350px, 1.3fr); align-items: center; gap: 14px; padding: 16px; border-bottom: 1px solid var(--line-soft); }
+    .network-toolbar { min-height: 82px; grid-template-columns: minmax(260px, 1fr) 170px 200px auto; }
     .search, .filter {
       height: 40px;
       width: 100%;
@@ -130,6 +139,7 @@
     .search::placeholder { color: var(--faint); }
     .search:focus, .filter:focus { outline: 1px solid var(--cyan); border-color: var(--cyan); }
     .service-total { white-space: nowrap; color: var(--muted); }
+    .socket-total { white-space: nowrap; color: var(--muted); text-align: right; }
     .pressure { min-width: 0; border-left: 1px solid var(--line-soft); padding-left: 16px; }
     .pressure-title { color: #d9e5ed; margin-bottom: 9px; }
     .pressure-bars { display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; }
@@ -144,6 +154,7 @@
 
     .table-wrap { overflow: auto; max-height: calc(100vh - 292px); min-height: 565px; }
     table { width: 100%; min-width: 1000px; border-collapse: collapse; }
+    .socket-table { min-width: 1660px; }
     th, td { text-align: left; border-bottom: 1px solid var(--line-soft); padding: 10px 12px; white-space: nowrap; }
     th { position: sticky; top: 0; z-index: 2; background: #122639; color: #d8e5ee; font-size: 13px; font-weight: 620; }
     th button { display: inline-flex; gap: 5px; color: inherit; border: 0; background: none; padding: 0; cursor: pointer; }
@@ -160,6 +171,8 @@
     .mailbox.hot { color: var(--orange); font-weight: 650; }
     .flags { display: flex; gap: 5px; }
     .flag { padding: 2px 6px; border: 1px solid var(--line); border-radius: 4px; color: var(--muted); font-size: 11px; }
+    .flag.active { color: var(--teal); border-color: #27776f; }
+    .flag.warn { color: var(--orange); border-color: #8f672e; }
     .flag.danger { color: #ffb0b0; border-color: #9d424b; }
     .detail-row td { padding: 0; background: #163149; white-space: normal; }
     .detail { display: grid; grid-template-columns: 1.1fr .8fr .9fr 1.1fr; gap: 22px; padding: 18px 24px 20px; border-bottom: 1px solid #31516c; }
@@ -180,6 +193,8 @@
       .sidebar { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); }
       .health-panel { grid-row: span 1; }
       .toolbar { grid-template-columns: 1fr 180px auto; }
+      .network-toolbar { grid-template-columns: minmax(240px, 1fr) 170px 190px; }
+      .socket-total { grid-column: 1 / -1; text-align: left; }
       .pressure { grid-column: 1 / -1; border-left: 0; border-top: 1px solid var(--line-soft); padding: 12px 0 0; }
       .table-wrap { max-height: none; min-height: 420px; }
     }
@@ -193,6 +208,8 @@
       .time-item + .time-item { border-left: 0; border-top: 1px solid var(--line-soft); }
       .sidebar { grid-template-columns: 1fr; }
       .toolbar { grid-template-columns: 1fr; }
+      .network-toolbar { grid-template-columns: 1fr; }
+      .socket-total { grid-column: auto; }
       .service-total { justify-self: start; }
       .detail { grid-template-columns: 1fr; }
     }
@@ -260,38 +277,91 @@
       </aside>
 
       <section class="main-panel">
-        <div class="toolbar">
-          <input id="search" class="search" type="search" autocomplete="off" placeholder="搜索服务名、类型或句柄">
-          <select id="lifecycleFilter" class="filter" aria-label="生命周期筛选">
-            <option value="all">生命周期：全部</option>
-            <option value="running">运行中</option>
-            <option value="initializing">初始化中</option>
-            <option value="failed">失败</option>
-          </select>
-          <span class="service-total">服务总数：<strong id="toolbarTotal" class="mono">0</strong></span>
-          <div class="pressure">
-            <div class="pressure-title">邮箱压力分布</div>
-            <div id="pressureBars" class="pressure-bars"></div>
+        <div class="tabbar" role="tablist" aria-label="节点统计类型">
+          <button id="serviceTab" class="tab active" type="button" role="tab" aria-selected="true" aria-controls="servicePanel" tabindex="0">服务</button>
+          <button id="networkTab" class="tab" type="button" role="tab" aria-selected="false" aria-controls="networkPanel" tabindex="-1">网络</button>
+        </div>
+
+        <div id="servicePanel" class="tab-panel" role="tabpanel" aria-labelledby="serviceTab">
+          <div class="toolbar">
+            <input id="search" class="search" type="search" autocomplete="off" placeholder="搜索服务名、类型或句柄">
+            <select id="lifecycleFilter" class="filter" aria-label="生命周期筛选">
+              <option value="all">生命周期：全部</option>
+              <option value="running">运行中</option>
+              <option value="initializing">初始化中</option>
+              <option value="failed">失败</option>
+            </select>
+            <span class="service-total">服务总数：<strong id="toolbarTotal" class="mono">0</strong></span>
+            <div class="pressure">
+              <div class="pressure-title">邮箱压力分布</div>
+              <div id="pressureBars" class="pressure-bars"></div>
+            </div>
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th><button data-service-sort="handle">句柄 <span>↕</span></button></th>
+                  <th><button data-service-sort="kind">服务类型 / 名称 <span>↕</span></button></th>
+                  <th><button data-service-sort="lifecycle">生命周期 <span>↕</span></button></th>
+                  <th><button data-service-sort="mailbox_len">邮箱积压 <span>↕</span></button></th>
+                  <th><button data-service-sort="task_count">任务数 <span>↕</span></button></th>
+                  <th><button data-service-sort="pending_calls">挂起调用 <span>↕</span></button></th>
+                  <th><button data-service-sort="message_count">消息总数 <span>↕</span></button></th>
+                  <th><button data-service-sort="cpu_time_micros">CPU 时间 <span>↕</span></button></th>
+                  <th>标志</th>
+                </tr>
+              </thead>
+              <tbody id="serviceRows"><tr><td class="empty" colspan="9">正在加载节点统计…</td></tr></tbody>
+            </table>
           </div>
         </div>
 
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th><button data-sort="handle">句柄 <span>↕</span></button></th>
-                <th><button data-sort="kind">服务类型 / 名称 <span>↕</span></button></th>
-                <th><button data-sort="lifecycle">生命周期 <span>↕</span></button></th>
-                <th><button data-sort="mailbox_len">邮箱积压 <span>↕</span></button></th>
-                <th><button data-sort="task_count">任务数 <span>↕</span></button></th>
-                <th><button data-sort="pending_calls">挂起调用 <span>↕</span></button></th>
-                <th><button data-sort="message_count">消息总数 <span>↕</span></button></th>
-                <th><button data-sort="cpu_time_micros">CPU 时间 <span>↕</span></button></th>
-                <th>标志</th>
-              </tr>
-            </thead>
-            <tbody id="serviceRows"><tr><td class="empty" colspan="9">正在加载节点统计…</td></tr></tbody>
-          </table>
+        <div id="networkPanel" class="tab-panel" role="tabpanel" aria-labelledby="networkTab" hidden>
+          <div class="toolbar network-toolbar">
+            <input id="networkSearch" class="search" type="search" autocomplete="off" placeholder="搜索 Socket ID、属主、服务名或地址">
+            <select id="networkKindFilter" class="filter" aria-label="Socket 类型筛选">
+              <option value="all">类型：全部</option>
+              <option value="listener">Listener</option>
+              <option value="stream">Stream</option>
+              <option value="udp">UDP</option>
+            </select>
+            <select id="networkStateFilter" class="filter" aria-label="Socket 状态筛选">
+              <option value="all">状态：全部</option>
+              <option value="prelisten">Pre-listen</option>
+              <option value="listen">Listen</option>
+              <option value="connecting">Connecting</option>
+              <option value="preaccept">Pre-accept</option>
+              <option value="connected">Connected</option>
+              <option value="halfclose_read">Half-close read</option>
+              <option value="halfclose_write">Half-close write</option>
+            </select>
+            <span class="socket-total">活跃 Socket：<strong id="socketTotal" class="mono">0</strong> · 当前显示：<strong id="socketVisible" class="mono">0</strong></span>
+          </div>
+
+          <div class="table-wrap">
+            <table class="socket-table">
+              <thead>
+                <tr>
+                  <th><button data-socket-sort="id">Socket ID <span>↕</span></button></th>
+                  <th><button data-socket-sort="kind">类型 <span>↕</span></button></th>
+                  <th><button data-socket-sort="state">状态 <span>↕</span></button></th>
+                  <th><button data-socket-sort="owner">属主服务 <span>↕</span></button></th>
+                  <th><button data-socket-sort="local">Local <span>↕</span></button></th>
+                  <th><button data-socket-sort="peer">Peer <span>↕</span></button></th>
+                  <th><button data-socket-sort="read_bytes">读取 <span>↕</span></button></th>
+                  <th><button data-socket-sort="write_bytes">写入 <span>↕</span></button></th>
+                  <th><button data-socket-sort="write_pending">写缓冲 <span>↕</span></button></th>
+                  <th><button data-socket-sort="accept_count">Accept <span>↕</span></button></th>
+                  <th><button data-socket-sort="last_read_at_ms">最近读取 <span>↕</span></button></th>
+                  <th><button data-socket-sort="last_write_at_ms">最近写入 <span>↕</span></button></th>
+                  <th>标志</th>
+                </tr>
+              </thead>
+              <tbody id="socketRows"><tr><td class="empty" colspan="13">正在加载网络统计…</td></tr></tbody>
+            </table>
+          </div>
         </div>
       </section>
     </section>
@@ -308,6 +378,8 @@
       selected: null,
       sortKey: 'mailbox_len',
       sortDirection: -1,
+      socketSortKey: 'id',
+      socketSortDirection: 1,
       refreshing: false,
     };
 
@@ -315,6 +387,9 @@
     $('refreshButton').addEventListener('click', refresh);
     $('search').addEventListener('input', renderTable);
     $('lifecycleFilter').addEventListener('change', renderTable);
+    $('networkSearch').addEventListener('input', renderNetworkTable);
+    $('networkKindFilter').addEventListener('change', renderNetworkTable);
+    $('networkStateFilter').addEventListener('change', renderNetworkTable);
     $('serviceRows').addEventListener('click', (event) => {
       const row = event.target.closest('tr.data-row');
       if (!row) return;
@@ -322,15 +397,50 @@
       state.selected = state.selected === handle ? null : handle;
       renderTable();
     });
-    document.querySelectorAll('[data-sort]').forEach((button) => {
+    document.querySelectorAll('[data-service-sort]').forEach((button) => {
       button.addEventListener('click', () => {
-        const key = button.dataset.sort;
+        const key = button.dataset.serviceSort;
         if (state.sortKey === key) state.sortDirection *= -1;
         else { state.sortKey = key; state.sortDirection = key === 'kind' || key === 'lifecycle' ? 1 : -1; }
         renderTable();
       });
     });
+    document.querySelectorAll('[data-socket-sort]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const key = button.dataset.socketSort;
+        if (state.socketSortKey === key) state.socketSortDirection *= -1;
+        else { state.socketSortKey = key; state.socketSortDirection = 1; }
+        renderNetworkTable();
+      });
+    });
+    document.querySelectorAll('[role="tab"]').forEach((tab) => {
+      tab.addEventListener('click', () => selectTab(tab.id === 'networkTab' ? 'network' : 'service'));
+      tab.addEventListener('keydown', (event) => {
+        if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+        event.preventDefault();
+        const tabs = ['service', 'network'];
+        const current = tab.id === 'networkTab' ? 1 : 0;
+        const index = event.key === 'Home' ? 0
+          : event.key === 'End' ? tabs.length - 1
+          : (current + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+        selectTab(tabs[index], true);
+      });
+    });
     window.addEventListener('resize', drawCharts);
+
+    function selectTab(name, focus = false) {
+      const network = name === 'network';
+      $('servicePanel').hidden = network;
+      $('networkPanel').hidden = !network;
+      [['serviceTab', !network], ['networkTab', network]].forEach(([id, active]) => {
+        const tab = $(id);
+        tab.classList.toggle('active', active);
+        tab.setAttribute('aria-selected', active);
+        tab.tabIndex = active ? 0 : -1;
+      });
+      if (focus) $(network ? 'networkTab' : 'serviceTab').focus();
+      if (!network) requestAnimationFrame(() => { drawCharts(); drawSelectedServiceChart(); });
+    }
 
     async function refresh() {
       if (state.refreshing) return;
@@ -356,6 +466,7 @@
     }
 
     function acceptSnapshot(snapshot) {
+      snapshot.sockets = snapshot.sockets || [];
       const previous = state.snapshot;
       state.previous = previous;
       state.snapshot = snapshot;
@@ -424,11 +535,13 @@
       $('failedCount').textContent = snapshot.services.filter((s) => s.lifecycle === 'failed').length;
       $('endlessCount').textContent = snapshot.services.filter((s) => s.endless).length;
       $('toolbarTotal').textContent = formatNumber(snapshot.services.length);
+      $('socketTotal').textContent = formatNumber(snapshot.sockets.length);
       $('messageRate').textContent = formatCompact(messageRate);
       $('mailboxTotal').textContent = formatCompact(totals.mailbox);
       $('cpuRate').textContent = `${cpuRate.toFixed(1)}%`;
       renderPressure(snapshot.services);
       renderTable();
+      renderNetworkTable();
       drawCharts();
     }
 
@@ -575,6 +688,66 @@
       return (typeof left === 'string' ? left.localeCompare(right) : left - right) * state.sortDirection;
     }
 
+    function renderNetworkTable() {
+      if (!state.snapshot) return;
+      const query = $('networkSearch').value.trim().toLowerCase();
+      const kind = $('networkKindFilter').value;
+      const socketState = $('networkStateFilter').value;
+      const sockets = state.snapshot.sockets.filter((socket) => {
+        const ownerHandle = socket.owner.toString(16).padStart(8, '0');
+        const haystack = [
+          socket.id, `#${socket.id}`, socket.kind, socket.state, socket.owner, ownerHandle,
+          socket.owner_kind || '', ...(socket.owner_names || []), socket.local || '', socket.peer || '',
+        ].join(' ').toLowerCase();
+        return (!query || haystack.includes(query))
+          && (kind === 'all' || socket.kind === kind)
+          && (socketState === 'all' || socket.state === socketState);
+      }).sort(compareSockets);
+
+      $('socketVisible').textContent = formatNumber(sockets.length);
+      if (!sockets.length) {
+        $('socketRows').innerHTML = '<tr><td class="empty" colspan="13">没有符合条件的 Socket</td></tr>';
+        return;
+      }
+      $('socketRows').innerHTML = sockets.map(socketRow).join('');
+    }
+
+    function compareSockets(a, b) {
+      const key = state.socketSortKey;
+      const left = a[key];
+      const right = b[key];
+      if (left === null || left === undefined) return right === null || right === undefined ? a.id - b.id : 1;
+      if (right === null || right === undefined) return -1;
+      const order = typeof left === 'string' ? left.localeCompare(right) : left - right;
+      return (order || a.id - b.id) * state.socketSortDirection;
+    }
+
+    function socketRow(socket) {
+      const ownerName = socket.owner_names && socket.owner_names.length ? socket.owner_names.join(', ') : '—';
+      const ownerKind = socket.owner_kind || '未知属主';
+      const flags = [
+        socket.paused ? '<span class="flag danger">暂停</span>' : '',
+        socket.reading ? '<span class="flag active">读取</span>' : '',
+        socket.writing ? '<span class="flag warn">写入</span>' : '',
+      ].join('') || '<span class="muted">—</span>';
+      return `
+        <tr>
+          <td class="mono">#${socket.id}</td>
+          <td><strong>${escapeHtml(socket.kind)}</strong></td>
+          <td class="mono">${escapeHtml(socket.state)}</td>
+          <td><strong>${escapeHtml(ownerKind)}</strong> <span class="muted">/ ${escapeHtml(ownerName)}</span><br><span class="mono muted">:${socket.owner.toString(16).padStart(8, '0')}</span></td>
+          <td class="mono">${escapeHtml(socket.local || '—')}</td>
+          <td class="mono">${escapeHtml(socket.peer || '—')}</td>
+          <td class="numeric">${formatBytes(socket.read_bytes)}</td>
+          <td class="numeric">${formatBytes(socket.write_bytes)}</td>
+          <td class="numeric ${socket.write_pending > 0 ? 'mailbox hot' : ''}">${formatBytes(socket.write_pending)}</td>
+          <td class="numeric">${socket.kind === 'listener' ? formatNumber(socket.accept_count) : '—'}</td>
+          <td class="mono">${formatActivity(socket.last_read_at_ms)}</td>
+          <td class="mono">${formatActivity(socket.last_write_at_ms)}</td>
+          <td><span class="flags">${flags}</span></td>
+        </tr>`;
+    }
+
     function serviceRow(service) {
       const selected = state.selected === service.handle;
       const name = service.names[0] || '—';
@@ -703,10 +876,29 @@
       const clock = [hours, minutes, seconds].map((value) => String(value).padStart(2, '0')).join(':');
       return days ? `${days}天 ${clock}` : clock;
     }
+    function formatActivity(atMilliseconds) {
+      if (atMilliseconds === null || atMilliseconds === undefined) return '—';
+      const elapsed = Math.max(0, state.snapshot.node.uptime_ms - atMilliseconds);
+      if (elapsed < 1000) return '刚刚';
+      const seconds = Math.floor(elapsed / 1000);
+      if (seconds < 60) return `${seconds} 秒前`;
+      const minutes = Math.floor(seconds / 60);
+      if (minutes < 60) return `${minutes} 分钟前`;
+      const hours = Math.floor(minutes / 60);
+      if (hours < 24) return `${hours} 小时前`;
+      return `${Math.floor(hours / 24)} 天前`;
+    }
     function formatDate(value) { return new Date(value).toLocaleString([], { hour12: false }); }
     function formatClock(value) { return new Date(value).toLocaleTimeString([], { hour12: false }); }
     function formatNumber(value) { return new Intl.NumberFormat().format(value || 0); }
     function formatCompact(value) { return new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 }).format(value || 0); }
+    function formatBytes(value) {
+      const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+      let size = Math.max(0, Number(value) || 0);
+      let unit = 0;
+      while (size >= 1024 && unit < units.length - 1) { size /= 1024; unit++; }
+      return `${unit === 0 ? Math.round(size) : size.toFixed(size >= 10 ? 1 : 2)} ${units[unit]}`;
+    }
     function formatCpu(micros) { return micros >= 1000000 ? `${(micros / 1000000).toFixed(2)}s` : `${(micros / 1000).toFixed(2)}ms`; }
     function formatSigned(value) { return `${value >= 0 ? '+' : ''}${formatNumber(value)}`; }
     function escapeHtml(value) {

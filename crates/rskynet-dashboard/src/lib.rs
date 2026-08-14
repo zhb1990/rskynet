@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use rskynet_core::{Ctx, Error, MsgType, NodeStats, Registry, Result, ServiceStats, SvcCell};
 use rskynet_http::http::{Method, Response, StatusCode};
 use rskynet_http::{BodySpec, HttpError, HttpServer, ServerRequest};
-use rskynet_net::SocketEvent;
+use rskynet_net::{SocketEvent, SocketInfo};
 use serde::{Deserialize, Serialize};
 
 /// Dashboard 服务的约定类型名和配置段名。
@@ -57,17 +57,19 @@ pub struct DashboardSnapshot {
     pub start_time_unix_ms: u64,
     pub server_time_unix_ms: u64,
     pub services: Vec<ServiceStats>,
+    pub sockets: Vec<SocketInfo>,
 }
 
 impl DashboardSnapshot {
-    fn capture(ctx: &Ctx, cluster_id: Option<u32>) -> Self {
-        Self {
+    async fn capture(ctx: &Ctx, cluster_id: Option<u32>) -> Result<Self> {
+        Ok(Self {
             node: ctx.node().stats(),
             cluster_id,
             start_time_unix_ms: ctx.node().start_time(),
             server_time_unix_ms: ctx.node().time(),
             services: ctx.node().services(),
-        }
+            sockets: rskynet_net::netstat(ctx).await?,
+        })
     }
 }
 
@@ -182,7 +184,10 @@ async fn serve(
             .await
         }
         "/api/v1/stats" => {
-            let bytes = serde_json::to_vec(&DashboardSnapshot::capture(ctx, cluster_id))
+            let snapshot = DashboardSnapshot::capture(ctx, cluster_id)
+                .await
+                .map_err(|error| HttpError::Protocol(error.to_string()))?;
+            let bytes = serde_json::to_vec(&snapshot)
                 .map_err(|error| HttpError::Protocol(error.to_string()))?;
             send(
                 ctx,
@@ -327,10 +332,32 @@ mod tests {
             start_time_unix_ms: 1_000,
             server_time_unix_ms: 2_000,
             services: Vec::new(),
+            sockets: vec![SocketInfo {
+                id: rskynet_net::SocketId(7),
+                owner: 0x100,
+                owner_kind: Some(NAME.into()),
+                owner_names: vec![NAME.into()],
+                kind: "listener",
+                state: "listen",
+                paused: false,
+                local: Some("127.0.0.1:8080".parse().unwrap()),
+                peer: None,
+                write_pending: 0,
+                accept_count: 3,
+                read_bytes: 0,
+                write_bytes: 0,
+                last_read_at_ms: Some(42),
+                last_write_at_ms: None,
+                reading: true,
+                writing: false,
+            }],
         };
         let value = serde_json::to_value(snapshot).unwrap();
         assert_eq!(value["cluster_id"], u32::MAX);
         assert_eq!(value["node"]["uptime_ms"], 42);
+        assert_eq!(value["sockets"][0]["id"], 7);
+        assert_eq!(value["sockets"][0]["kind"], "listener");
+        assert_eq!(value["sockets"][0]["local"], "127.0.0.1:8080");
     }
 
     #[test]
@@ -340,6 +367,11 @@ mod tests {
         assert!(INDEX_HTML.contains("setInterval(refresh, 5000)"));
         assert!(INDEX_HTML.contains("近 1 分钟增量"));
         assert!(INDEX_HTML.contains("单个服务邮箱积压趋势"));
+        assert!(INDEX_HTML.contains("networkTab"));
+        assert!(INDEX_HTML.contains("networkKindFilter"));
+        assert!(INDEX_HTML.contains("networkStateFilter"));
+        assert!(INDEX_HTML.contains("data-socket-sort=\"write_pending\""));
+        assert!(INDEX_HTML.contains("formatActivity(socket.last_read_at_ms)"));
         assert!(!INDEX_HTML.contains("较上次采样"));
     }
 }

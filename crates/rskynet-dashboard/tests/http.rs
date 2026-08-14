@@ -85,6 +85,19 @@ fn dashboard_serves_embedded_ui_and_live_stats() {
             && service["start_time_unix_ms"].as_u64().unwrap() >= start_time
             && service["uptime_ms"].as_u64().is_some()
     }));
+    let sockets = json["sockets"].as_array().unwrap();
+    assert!(sockets.iter().any(|socket| {
+        socket["kind"] == "listener"
+            && socket["state"] == "listen"
+            && socket["owner_kind"] == rskynet_dashboard::NAME
+            && socket["local"] == address.to_string()
+            && socket["id"].as_u64().is_some()
+    }));
+    assert!(sockets.iter().any(|socket| {
+        socket["kind"] == "stream"
+            && socket["owner_kind"] == rskynet_dashboard::NAME
+            && socket["peer"].as_str().is_some()
+    }));
 
     let method = request(
         address,
