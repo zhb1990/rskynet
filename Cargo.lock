@@ -1601,6 +1601,7 @@ dependencies = [
  "rskynet-bootstrap",
  "rskynet-cluster",
  "rskynet-core",
+ "rskynet-dashboard",
  "rskynet-http",
  "rskynet-logger",
  "rskynet-macros",
@@ -1652,6 +1653,20 @@ dependencies = [
  "slab",
  "thiserror",
  "toml",
+]
+
+[[package]]
+name = "rskynet-dashboard"
+version = "0.1.0"
+dependencies = [
+ "rskynet-bootstrap",
+ "rskynet-core",
+ "rskynet-http",
+ "rskynet-macros",
+ "rskynet-net",
+ "rskynet-timer",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

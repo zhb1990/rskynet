@@ -14,6 +14,7 @@ repository = "https://github.com/zhuhb/rskynet"
 rskynet-bootstrap = { version = "0.1.0", path = "crates/rskynet-bootstrap" }
 rskynet-cluster = { version = "0.1.0", path = "crates/rskynet-cluster" }
 rskynet-core = { version = "0.1.0", path = "crates/rskynet-core" }
+rskynet-dashboard = { version = "0.1.0", path = "crates/rskynet-dashboard" }
 rskynet-logger = { version = "0.1.0", path = "crates/rskynet-logger" }
 rskynet-http = { version = "0.1.0", path = "crates/rskynet-http" }
 rskynet-macros = { version = "0.1.0", path = "crates/rskynet-macros" }

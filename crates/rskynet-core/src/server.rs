@@ -179,6 +179,10 @@ pub(crate) struct ServiceContext {
     message_count: AtomicU64,
     /// 累计占用 worker 的时间，单位微秒；仅在 `profile` 打开时统计。
     cpu_cost: AtomicU64,
+    /// 服务上下文创建、开始初始化时的节点内相对时间。
+    started_at_ms: u64,
+    /// 服务上下文创建、开始初始化时的 Unix 时间。
+    started_at_unix_ms: u64,
     /// 指向自己，给任务 waker 用：waker 可能被外部长期扣着，不该吊住整个服务。
     me: Weak<ServiceContext>,
 }
@@ -286,6 +290,14 @@ impl ServiceContext {
     /// 本服务是否独占一条线程。
     pub(crate) fn is_exclusive(&self) -> bool {
         self.exclusive.is_some()
+    }
+
+    pub(crate) fn started_at_ms(&self) -> u64 {
+        self.started_at_ms
+    }
+
+    pub(crate) fn started_at_unix_ms(&self) -> u64 {
+        self.started_at_unix_ms
     }
 
     /// 有活干了，把服务交给它的执行者。
@@ -696,6 +708,12 @@ impl Node {
         let init = InitTicket::new(kind);
         let init_for_ctx = init.clone();
         let node = self.clone();
+        let started_at_ms = self.timer.now();
+        let started_at_unix_ms = self
+            .timer
+            .start_seconds()
+            .saturating_mul(1_000)
+            .saturating_add(started_at_ms);
         let kind_name = kind.to_string();
         let ctx = self.handles.register_with(move |handle| {
             Arc::new_cyclic(|me| ServiceContext {
@@ -718,6 +736,8 @@ impl Node {
                 endless: AtomicBool::new(false),
                 message_count: AtomicU64::new(0),
                 cpu_cost: AtomicU64::new(0),
+                started_at_ms,
+                started_at_unix_ms,
                 me: me.clone(),
             })
         });
@@ -1114,6 +1134,8 @@ pub(crate) mod tests {
             endless: AtomicBool::new(false),
             message_count: AtomicU64::new(0),
             cpu_cost: AtomicU64::new(0),
+            started_at_ms: 0,
+            started_at_unix_ms: 0,
             me: me.clone(),
         })
     }
@@ -1338,6 +1360,8 @@ pub(crate) mod tests {
         assert_eq!(service.handle, handle);
         assert_eq!(service.kind, "null");
         assert_eq!(service.names, ["alpha", "beta"]);
+        assert_eq!(service.start_time_unix_ms, 0);
+        assert_eq!(service.uptime_ms, 0);
         assert_eq!(service.lifecycle, crate::ServiceLifecycle::Initializing);
         assert_eq!(service.task_count, 1, "init 任务应已登记");
 

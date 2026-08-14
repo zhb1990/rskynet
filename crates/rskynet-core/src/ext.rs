@@ -45,6 +45,10 @@ pub struct ServiceStats {
     pub handle: u32,
     pub kind: String,
     pub names: Vec<String>,
+    /// 服务上下文创建、开始初始化时的 Unix 时间。
+    pub start_time_unix_ms: u64,
+    /// 服务上下文创建至本次采样的运行时间。
+    pub uptime_ms: u64,
     pub lifecycle: ServiceLifecycle,
     pub exclusive: bool,
     pub reserved: bool,
@@ -247,6 +251,8 @@ fn service_stats(ctx: &crate::server::ServiceContext, names: Vec<String>) -> Ser
         handle: ctx.handle,
         kind: ctx.kind.clone(),
         names,
+        start_time_unix_ms: ctx.started_at_unix_ms(),
+        uptime_ms: ctx.node.timer.now().saturating_sub(ctx.started_at_ms()),
         lifecycle: ctx.lifecycle(),
         exclusive: ctx.is_exclusive(),
         reserved: ctx.is_reserved(),

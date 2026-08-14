@@ -57,6 +57,7 @@
 //! | `rskynet-net` | socket 层，一个[独占线程的服务][Exclusive] | `net` |
 //! | `rskynet-tls` | 基于 rustls、复用 net 的双向 TLS 协议服务 | `tls` |
 //! | `rskynet-http` | HTTP/1.1 客户端服务与可嵌入服务端 | `http` / `https` |
+//! | `rskynet-dashboard` | 节点统计 API 与内嵌 Dashboard | `dashboard` |
 //! | `rskynet-cluster` | Protobuf 节点间通信 | `cluster` |
 //!
 //! 内核里一个服务都没有，连时间都不在里面：分层时间轮住在 `rskynet-timer`，内核
@@ -87,6 +88,10 @@ pub use rskynet_tls as tls;
 /// HTTP/1.1 客户端服务与可嵌入业务服务的服务端驱动。
 #[cfg(feature = "http")]
 pub use rskynet_http as http;
+
+/// 节点统计 HTTP API 与内嵌 Dashboard。
+#[cfg(feature = "dashboard")]
+pub use rskynet_dashboard as dashboard;
 
 /// WebSocket 客户端、服务端升级与消息类型。
 #[cfg(feature = "websocket")]
@@ -246,6 +251,13 @@ impl BuilderExt for Builder {
         {
             builder = builder.service(rskynet_http::NAME, rskynet_http::HttpClientService::new);
         }
+        #[cfg(feature = "dashboard")]
+        {
+            builder = builder.service(
+                rskynet_dashboard::NAME,
+                rskynet_dashboard::DashboardService::new,
+            );
+        }
         builder
     }
 }
@@ -269,11 +281,13 @@ fn prepare_startup(config: &Config, registry: &mut Registry) -> Result<Vec<&'sta
     const TLS: &str = "tls";
     const HTTP: &str = "http-client";
     const CLUSTER: &str = "cluster";
+    const DASHBOARD: &str = "dashboard";
 
     let has_net = config.has_section(NET);
     let has_tls = config.has_section(TLS);
     let has_http = config.has_section(HTTP);
     let has_cluster = config.has_section(CLUSTER);
+    let has_dashboard = config.has_section(DASHBOARD);
     #[cfg(not(feature = "cluster"))]
     let _ = registry;
 
@@ -297,16 +311,23 @@ fn prepare_startup(config: &Config, registry: &mut Registry) -> Result<Vec<&'sta
     if has_cluster {
         return Err(Error::Config("[cluster] 需要启用 `cluster` feature".into()));
     }
+    #[cfg(not(feature = "dashboard"))]
+    if has_dashboard {
+        return Err(Error::Config(
+            "[dashboard] 需要启用 `dashboard` feature".into(),
+        ));
+    }
 
     #[cfg(feature = "bootstrap")]
     if let Some(bootstrap) =
         config.section::<rskynet_bootstrap::BootstrapConfig>(rskynet_core::service::BOOTSTRAP)?
     {
-        if let Some(service) = bootstrap
-            .services
-            .iter()
-            .find(|service| matches!(service.name.as_str(), NET | TLS | HTTP | CLUSTER))
-        {
+        if let Some(service) = bootstrap.services.iter().find(|service| {
+            matches!(
+                service.name.as_str(),
+                NET | TLS | HTTP | CLUSTER | DASHBOARD
+            )
+        }) {
             return Err(Error::Config(format!(
                 "[bootstrap].services 不应手工启动 `{}`；请改用对应配置段",
                 service.name
@@ -326,8 +347,9 @@ fn prepare_startup(config: &Config, registry: &mut Registry) -> Result<Vec<&'sta
 
     let need_http = has_http;
     let need_cluster = has_cluster;
+    let need_dashboard = has_dashboard;
     let need_tls = has_tls || (need_http && cfg!(feature = "https"));
-    let need_net = has_net || need_tls || need_http || need_cluster;
+    let need_net = has_net || need_tls || need_http || need_cluster || need_dashboard;
     let mut startup = Vec::new();
     if need_net {
         startup.push(NET);
@@ -340,6 +362,9 @@ fn prepare_startup(config: &Config, registry: &mut Registry) -> Result<Vec<&'sta
     }
     if need_cluster {
         startup.push(CLUSTER);
+    }
+    if need_dashboard {
+        startup.push(DASHBOARD);
     }
     Ok(startup)
 }
@@ -419,5 +444,31 @@ mod startup_tests {
             ["net", "cluster"]
         );
         assert!(registry.contains("cluster"));
+    }
+
+    #[cfg(feature = "dashboard")]
+    #[test]
+    fn dashboard_adds_net_before_dashboard() {
+        let config = with_empty_section(Config::default(), "dashboard");
+        assert_eq!(
+            prepare_startup(&config, &mut Registry::new()).unwrap(),
+            ["net", "dashboard"]
+        );
+    }
+
+    #[cfg(not(feature = "dashboard"))]
+    #[test]
+    fn configured_dashboard_requires_the_feature() {
+        let config = with_empty_section(Config::default(), "dashboard");
+        let error = prepare_startup(&config, &mut Registry::new()).unwrap_err();
+        assert!(error.to_string().contains("`dashboard` feature"));
+    }
+
+    #[cfg(feature = "bootstrap")]
+    #[test]
+    fn bootstrap_must_not_repeat_dashboard() {
+        let config = Config::default().with_bootstrap(["dashboard"]);
+        let error = prepare_startup(&config, &mut Registry::new()).unwrap_err();
+        assert!(error.to_string().contains("不应手工启动 `dashboard`"));
     }
 }

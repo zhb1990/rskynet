@@ -1,0 +1,20 @@
+[package]
+name = "rskynet-dashboard"
+description = "rskynet 节点统计 HTTP API 与内嵌 Dashboard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rskynet-core = { workspace = true }
+rskynet-http = { workspace = true }
+rskynet-macros = { workspace = true }
+rskynet-net = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+rskynet-bootstrap = { workspace = true }
+rskynet-timer = { workspace = true }

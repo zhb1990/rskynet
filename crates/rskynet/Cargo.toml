@@ -27,6 +27,8 @@ net = ["dep:rskynet-net"]
 tls = ["net", "dep:rskynet-tls"]
 # HTTP/1.1 客户端服务与明文嵌入式服务端
 http = ["net", "dep:rskynet-http"]
+# 节点统计 HTTP API 与内嵌 Dashboard
+dashboard = ["http", "dep:rskynet-dashboard"]
 # 为 HTTP 层增加 HTTPS 客户端与 TLS 服务端传输
 https = ["http", "tls", "rskynet-http/tls"]
 # WebSocket 协议；wss 另外组合 `https` feature
@@ -54,6 +56,7 @@ required-features = ["cluster"]
 
 [dependencies]
 rskynet-core = { workspace = true }
+rskynet-dashboard = { workspace = true, optional = true }
 rskynet-bootstrap = { workspace = true, optional = true }
 rskynet-cluster = { workspace = true, optional = true }
 rskynet-logger = { workspace = true, optional = true }

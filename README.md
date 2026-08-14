@@ -238,8 +238,8 @@ cargo run -p rskynet-examples -- config/examples/ping_pong.toml
 节点级观测也统一走 `NodeRef`：`node.stats()` 返回 service 总数、业务 service 数、
 运行队列长度与 uptime；`node.services()` / `service_stats(addr)` 返回每个 service 的
 kind、全部本地别名、生命周期、邮箱积压、活动 task、pending call、累计消息数与
-CPU 微秒数。这些是可序列化的拥有型近似快照，适合监控线程和后续 HTTP UI；抓取
-过程不访问 service 的 `SvcCell`，也不阻塞它执行。
+CPU 微秒数，并包含每个 service 的启动时间与运行时间。这些是可序列化的拥有型近似
+快照，适合监控线程和 HTTP UI；抓取过程不访问 service 的 `SvcCell`，也不阻塞它执行。
 
 ## 过程宏与网络层
 
@@ -303,6 +303,19 @@ HTTP/1.1 用 `http` feature 打开，HTTPS 用 `https`（会同时启用 `http` 
 `SocketEvent` / `TlsEvent` 交给它解析，再处理返回的 `ServerRequest`。两侧都基于
 `ureq-proto` 的 Sans-IO HTTP/1.1 状态机，支持 keep-alive、chunked、
 `100-continue`、流式 body、超时和高低水位背压。
+
+节点 Dashboard 用 `dashboard` feature 打开。只有配置中出现 `[dashboard]` 才会按
+`net → dashboard → 业务服务` 自动启动，且监听地址必须显式提供：
+
+```toml
+[dashboard]
+address = "127.0.0.1:8080"
+```
+
+页面与 `/api/v1/stats` 都直接嵌入可执行文件，部署时不需要额外静态资源。页面展示
+节点和 service 统计、启动/运行时间及浏览器内短期趋势；存在 `[cluster]` 时还会显示
+本节点的 `node_id`。可运行
+`cargo run -p rskynet-examples -- config/examples/dashboard.toml` 预览。
 
 WebSocket 用 `websocket` feature 打开，协议和握手由 `tungstenite` 驱动。服务端仍
 内嵌在业务 actor 的 `HttpServer` 中；客户端则由业务 actor 自己持有
@@ -562,6 +575,7 @@ crates/rskynet-signal/     进程信号、优雅关停与独立崩溃报告
 crates/rskynet-net/        TCP + UDP 网络层，一个独占线程的服务
 crates/rskynet-tls/        基于 rustls、复用 net 的双向 TLS 协议服务
 crates/rskynet-http/       HTTP/1.1 客户端/服务端及可选 WebSocket
+crates/rskynet-dashboard/  节点统计 API 与内嵌 Dashboard
 crates/rskynet-cluster/    可选的 Protobuf 跨节点通信层
 examples/                  本地与跨节点 Ping / Pong / Echo 示例
 ```
@@ -572,6 +586,7 @@ examples/                  本地与跨节点 Ping / Pong / Echo 示例
 rskynet = { version = "0.1", features = ["net"] }   # macros / logger / timer / bootstrap / signal / main 默认已开
 rskynet = { version = "0.1", features = ["tls"] }   # TLS 会隐含启用 net
 rskynet = { version = "0.1", features = ["http"] }  # 明文 HTTP/1.1
+rskynet = { version = "0.1", features = ["dashboard"] } # 节点统计页面与 JSON API
 rskynet = { version = "0.1", features = ["https"] } # HTTP + TLS
 rskynet = { version = "0.1", features = ["websocket"] } # ws 客户端与服务端
 rskynet = { version = "0.1", features = ["websocket", "https"] } # ws + wss

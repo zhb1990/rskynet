@@ -1,0 +1,9 @@
+# 启动内嵌节点 Dashboard，浏览器访问 http://127.0.0.1:8080/。
+thread = 2
+profile = true
+
+[dashboard]
+address = "127.0.0.1:8080"
+
+[bootstrap]
+services = []

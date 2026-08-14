@@ -1,0 +1,720 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>rskynet dashboard</title>
+  <style>
+    :root {
+      --bg: #071321;
+      --header: #06111e;
+      --surface: #112334;
+      --surface-2: #152a3d;
+      --surface-3: #193249;
+      --line: #294157;
+      --line-soft: #20374b;
+      --text: #edf5fb;
+      --muted: #9fb0bf;
+      --faint: #6f8496;
+      --teal: #3dd5c4;
+      --cyan: #54adf5;
+      --orange: #ff9d28;
+      --red: #ff6262;
+      --yellow: #f1c64d;
+      --radius: 7px;
+      --mono: "Cascadia Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      --sans: Inter, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--text); }
+    body { font-family: var(--sans); font-size: 14px; line-height: 1.45; }
+    button, input, select { font: inherit; }
+    .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+    .muted { color: var(--muted); }
+    [hidden] { display: none !important; }
+
+    .topbar {
+      height: 68px;
+      padding: 0 22px;
+      display: flex;
+      align-items: center;
+      gap: 22px;
+      background: var(--header);
+      border-bottom: 1px solid #12283b;
+    }
+    .brand { font-size: 25px; font-weight: 720; letter-spacing: -.4px; white-space: nowrap; }
+    .connection { display: flex; align-items: center; gap: 8px; color: var(--muted); font-weight: 600; }
+    .connection-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--yellow); }
+    .connection.online .connection-dot { background: var(--teal); }
+    .connection.offline .connection-dot { background: var(--red); }
+    .topbar-spacer { flex: 1; }
+    .badge, .endpoint {
+      min-height: 34px;
+      display: inline-flex;
+      align-items: center;
+      padding: 6px 11px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: #d6e4ee;
+      background: #102234;
+      white-space: nowrap;
+    }
+    .endpoint { gap: 7px; }
+    .endpoint img { width: 18px; height: 18px; }
+    .badge { color: var(--teal); border-color: #27776f; }
+    .last-refresh { color: var(--muted); white-space: nowrap; }
+    .refresh-button {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: transparent;
+      color: var(--text);
+      padding: 7px 12px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+    }
+    .refresh-button img { width: 17px; height: 17px; }
+    .refresh-button:hover, .refresh-button:focus-visible { border-color: var(--cyan); outline: none; }
+
+    .page { padding: 0 16px 18px; }
+    .time-strip {
+      margin: 0 0 10px;
+      min-height: 98px;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--teal);
+      border-radius: var(--radius);
+    }
+    .time-item { padding: 20px 30px; display: grid; grid-template-columns: 38px 1fr; grid-template-rows: auto auto; column-gap: 16px; align-content: center; }
+    .time-icon { width: 34px; height: 34px; grid-row: 1 / 3; align-self: center; }
+    .time-item + .time-item { border-left: 1px solid var(--line-soft); }
+    .time-label { color: var(--muted); margin-bottom: 5px; }
+    .time-value { font-family: var(--mono); font-size: clamp(19px, 1.65vw, 25px); color: #f5f9fc; white-space: nowrap; }
+
+    .workspace { display: grid; grid-template-columns: 318px minmax(0, 1fr); gap: 10px; }
+    .sidebar { display: flex; flex-direction: column; gap: 10px; }
+    .panel { background: var(--surface); border: 1px solid #142b3d; border-radius: var(--radius); overflow: hidden; }
+    .panel-heading { padding: 16px 18px 8px; font-size: 17px; font-weight: 650; }
+    .health-list { margin: 0 10px 12px; border: 1px solid var(--line-soft); border-radius: 6px; }
+    .health-row { min-height: 35px; padding: 7px 11px; display: flex; align-items: center; gap: 9px; }
+    .health-row + .health-row { border-top: 1px solid rgba(41,65,87,.42); }
+    .health-key { color: var(--muted); }
+    .health-value { margin-left: auto; font-family: var(--mono); font-size: 16px; }
+    .status-mark { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); }
+    .status-mark.good { background: var(--teal); }
+    .status-mark.bad { background: var(--red); }
+    .status-mark.warn { background: var(--yellow); }
+
+    .chart-panel { min-height: 162px; padding: 14px 16px 12px; }
+    .chart-title { display: flex; align-items: baseline; justify-content: space-between; font-size: 15px; font-weight: 620; }
+    .chart-value { font-family: var(--mono); color: var(--teal); font-size: 18px; }
+    .chart-value.orange { color: var(--orange); }
+    canvas { width: 100%; height: 112px; display: block; margin-top: 4px; }
+
+    .main-panel { min-width: 0; background: var(--surface); border: 1px solid #142b3d; border-radius: var(--radius); overflow: hidden; }
+    .toolbar { min-height: 104px; display: grid; grid-template-columns: minmax(230px, 1fr) 190px auto minmax(350px, 1.3fr); align-items: center; gap: 14px; padding: 16px; border-bottom: 1px solid var(--line-soft); }
+    .search, .filter {
+      height: 40px;
+      width: 100%;
+      color: var(--text);
+      background: #102234;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 0 12px;
+    }
+    .search::placeholder { color: var(--faint); }
+    .search:focus, .filter:focus { outline: 1px solid var(--cyan); border-color: var(--cyan); }
+    .service-total { white-space: nowrap; color: var(--muted); }
+    .pressure { min-width: 0; border-left: 1px solid var(--line-soft); padding-left: 16px; }
+    .pressure-title { color: #d9e5ed; margin-bottom: 9px; }
+    .pressure-bars { display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; }
+    .pressure-bin { min-width: 0; text-align: center; }
+    .pressure-count { font-family: var(--mono); margin-bottom: 4px; }
+    .pressure-line { display: block; height: 5px; border-radius: 3px; background: var(--cyan); }
+    .pressure-bin:nth-child(3) .pressure-line { background: var(--teal); }
+    .pressure-bin:nth-child(4) .pressure-line { background: var(--yellow); }
+    .pressure-bin:nth-child(5) .pressure-line { background: var(--orange); }
+    .pressure-bin:nth-child(6) .pressure-line { background: var(--red); }
+    .pressure-label { display: block; margin-top: 5px; color: var(--muted); font-family: var(--mono); font-size: 11px; white-space: nowrap; }
+
+    .table-wrap { overflow: auto; max-height: calc(100vh - 292px); min-height: 565px; }
+    table { width: 100%; min-width: 1000px; border-collapse: collapse; }
+    th, td { text-align: left; border-bottom: 1px solid var(--line-soft); padding: 10px 12px; white-space: nowrap; }
+    th { position: sticky; top: 0; z-index: 2; background: #122639; color: #d8e5ee; font-size: 13px; font-weight: 620; }
+    th button { display: inline-flex; gap: 5px; color: inherit; border: 0; background: none; padding: 0; cursor: pointer; }
+    th button:hover, th button:focus-visible { color: var(--cyan); outline: none; }
+    tbody tr.data-row { cursor: pointer; }
+    tbody tr.data-row:hover { background: #172e43; }
+    tbody tr.data-row.selected { background: #1d4262; }
+    tbody tr.failed td { color: #ffb0b0; }
+    td.numeric { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+    .life { display: inline-flex; align-items: center; gap: 7px; }
+    .life-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--teal); }
+    .life.initializing .life-dot { background: var(--yellow); }
+    .life.failed .life-dot { background: var(--red); }
+    .mailbox.hot { color: var(--orange); font-weight: 650; }
+    .flags { display: flex; gap: 5px; }
+    .flag { padding: 2px 6px; border: 1px solid var(--line); border-radius: 4px; color: var(--muted); font-size: 11px; }
+    .flag.danger { color: #ffb0b0; border-color: #9d424b; }
+    .detail-row td { padding: 0; background: #163149; white-space: normal; }
+    .detail { display: grid; grid-template-columns: 1.1fr .8fr .9fr 1.1fr; gap: 22px; padding: 18px 24px 20px; border-bottom: 1px solid #31516c; }
+    .detail-group { min-width: 0; }
+    .detail-title { color: var(--muted); margin-bottom: 9px; }
+    .detail-grid { display: grid; grid-template-columns: auto 1fr; gap: 7px 14px; }
+    .detail-grid dt { color: var(--muted); }
+    .detail-grid dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+    .delta { color: var(--orange); }
+    .service-chart { min-height: 132px; border: 1px solid var(--line); border-radius: 6px; padding: 10px 10px 4px; }
+    .service-chart canvas { height: 105px; }
+    .empty { text-align: center; color: var(--muted); padding: 60px 20px; }
+
+    @media (max-width: 1120px) {
+      .topbar { flex-wrap: wrap; height: auto; padding-top: 12px; padding-bottom: 12px; gap: 12px; }
+      .topbar-spacer { display: none; }
+      .workspace { grid-template-columns: 1fr; }
+      .sidebar { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+      .health-panel { grid-row: span 1; }
+      .toolbar { grid-template-columns: 1fr 180px auto; }
+      .pressure { grid-column: 1 / -1; border-left: 0; border-top: 1px solid var(--line-soft); padding: 12px 0 0; }
+      .table-wrap { max-height: none; min-height: 420px; }
+    }
+    @media (max-width: 760px) {
+      .page { padding-left: 8px; padding-right: 8px; }
+      .topbar { padding-left: 14px; padding-right: 14px; }
+      .brand { width: 100%; }
+      .last-refresh { display: none; }
+      .time-strip { grid-template-columns: 1fr; }
+      .time-item { padding: 14px 20px; }
+      .time-item + .time-item { border-left: 0; border-top: 1px solid var(--line-soft); }
+      .sidebar { grid-template-columns: 1fr; }
+      .toolbar { grid-template-columns: 1fr; }
+      .service-total { justify-self: start; }
+      .detail { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">rskynet dashboard</div>
+    <div id="connection" class="connection">
+      <span class="connection-dot"></span>
+      <span id="connectionText">正在连接</span>
+    </div>
+    <div class="topbar-spacer"></div>
+    <div id="clusterBadge" class="badge mono" hidden></div>
+    <div class="endpoint"><img src="/assets/server.svg" alt=""><span id="endpoint" class="mono"></span></div>
+    <div class="last-refresh">最后刷新&nbsp; <span id="lastRefresh" class="mono">--:--:--</span></div>
+    <button id="refreshButton" class="refresh-button" type="button"><img src="/assets/refresh.svg" alt="">刷新</button>
+  </header>
+
+  <main class="page">
+    <section class="time-strip" aria-label="节点时间">
+      <div class="time-item">
+        <img class="time-icon" src="/assets/clock.svg" alt="">
+        <span class="time-label">节点启动时间</span>
+        <strong id="startTime" class="time-value">--</strong>
+      </div>
+      <div class="time-item">
+        <img class="time-icon" src="/assets/clock.svg" alt="">
+        <span class="time-label">运行时间</span>
+        <strong id="uptime" class="time-value">--</strong>
+      </div>
+      <div class="time-item">
+        <img class="time-icon" src="/assets/clock.svg" alt="">
+        <span class="time-label">服务器系统时间</span>
+        <strong id="serverTime" class="time-value">--</strong>
+      </div>
+    </section>
+
+    <section class="workspace">
+      <aside class="sidebar">
+        <section class="panel health-panel">
+          <h2 class="panel-heading">节点健康</h2>
+          <div class="health-list">
+            <div class="health-row"><span class="status-mark"></span><span class="health-key">服务总数</span><span id="serviceCount" class="health-value">0</span></div>
+            <div class="health-row"><span class="status-mark good"></span><span class="health-key">业务服务</span><span id="businessCount" class="health-value">0</span></div>
+            <div class="health-row"><span class="status-mark good"></span><span class="health-key">可运行服务</span><span id="runnableCount" class="health-value">0</span></div>
+            <div class="health-row"><span class="status-mark warn"></span><span class="health-key">初始化中</span><span id="initializingCount" class="health-value">0</span></div>
+            <div class="health-row"><span class="status-mark bad"></span><span class="health-key">失败</span><span id="failedCount" class="health-value">0</span></div>
+            <div class="health-row"><span class="status-mark warn"></span><span class="health-key">疑似死循环</span><span id="endlessCount" class="health-value">0</span></div>
+          </div>
+        </section>
+
+        <section class="panel chart-panel">
+          <div class="chart-title"><span>消息速率 (msg/s)</span><strong id="messageRate" class="chart-value">0</strong></div>
+          <canvas id="messageChart" aria-label="消息速率趋势"></canvas>
+        </section>
+        <section class="panel chart-panel">
+          <div class="chart-title"><span>总邮箱积压</span><strong id="mailboxTotal" class="chart-value orange">0</strong></div>
+          <canvas id="mailboxChart" aria-label="总邮箱积压趋势"></canvas>
+        </section>
+        <section class="panel chart-panel">
+          <div class="chart-title"><span>CPU 使用率</span><strong id="cpuRate" class="chart-value">0%</strong></div>
+          <canvas id="cpuChart" aria-label="CPU 使用率趋势"></canvas>
+        </section>
+      </aside>
+
+      <section class="main-panel">
+        <div class="toolbar">
+          <input id="search" class="search" type="search" autocomplete="off" placeholder="搜索服务名、类型或句柄">
+          <select id="lifecycleFilter" class="filter" aria-label="生命周期筛选">
+            <option value="all">生命周期：全部</option>
+            <option value="running">运行中</option>
+            <option value="initializing">初始化中</option>
+            <option value="failed">失败</option>
+          </select>
+          <span class="service-total">服务总数：<strong id="toolbarTotal" class="mono">0</strong></span>
+          <div class="pressure">
+            <div class="pressure-title">邮箱压力分布</div>
+            <div id="pressureBars" class="pressure-bars"></div>
+          </div>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th><button data-sort="handle">句柄 <span>↕</span></button></th>
+                <th><button data-sort="kind">服务类型 / 名称 <span>↕</span></button></th>
+                <th><button data-sort="lifecycle">生命周期 <span>↕</span></button></th>
+                <th><button data-sort="mailbox_len">邮箱积压 <span>↕</span></button></th>
+                <th><button data-sort="task_count">任务数 <span>↕</span></button></th>
+                <th><button data-sort="pending_calls">挂起调用 <span>↕</span></button></th>
+                <th><button data-sort="message_count">消息总数 <span>↕</span></button></th>
+                <th><button data-sort="cpu_time_micros">CPU 时间 <span>↕</span></button></th>
+                <th>标志</th>
+              </tr>
+            </thead>
+            <tbody id="serviceRows"><tr><td class="empty" colspan="9">正在加载节点统计…</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const state = {
+      snapshot: null,
+      previous: null,
+      samples: [],
+      serviceSamples: new Map(),
+      deltas: new Map(),
+      selected: null,
+      sortKey: 'mailbox_len',
+      sortDirection: -1,
+      refreshing: false,
+    };
+
+    $('endpoint').textContent = location.host || 'local';
+    $('refreshButton').addEventListener('click', refresh);
+    $('search').addEventListener('input', renderTable);
+    $('lifecycleFilter').addEventListener('change', renderTable);
+    $('serviceRows').addEventListener('click', (event) => {
+      const row = event.target.closest('tr.data-row');
+      if (!row) return;
+      const handle = Number(row.dataset.handle);
+      state.selected = state.selected === handle ? null : handle;
+      renderTable();
+    });
+    document.querySelectorAll('[data-sort]').forEach((button) => {
+      button.addEventListener('click', () => {
+        const key = button.dataset.sort;
+        if (state.sortKey === key) state.sortDirection *= -1;
+        else { state.sortKey = key; state.sortDirection = key === 'kind' || key === 'lifecycle' ? 1 : -1; }
+        renderTable();
+      });
+    });
+    window.addEventListener('resize', drawCharts);
+
+    async function refresh() {
+      if (state.refreshing) return;
+      state.refreshing = true;
+      try {
+        const response = await fetch('/api/v1/stats', { cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const snapshot = await response.json();
+        acceptSnapshot(snapshot);
+        setConnectionStatus('connection online', '运行中');
+      } catch (error) {
+        setConnectionStatus('connection offline', '连接断开');
+        console.error('dashboard refresh failed', error);
+      } finally {
+        state.refreshing = false;
+      }
+    }
+
+    function setConnectionStatus(className, text) {
+      const connection = $('connection');
+      if (connection.className !== className) connection.className = className;
+      setText($('connectionText'), text);
+    }
+
+    function acceptSnapshot(snapshot) {
+      const previous = state.snapshot;
+      state.previous = previous;
+      state.snapshot = snapshot;
+      const totals = snapshot.services.reduce((sum, service) => {
+        sum.messages += service.message_count;
+        sum.cpu += service.cpu_time_micros;
+        sum.mailbox += service.mailbox_len;
+        return sum;
+      }, { messages: 0, cpu: 0, mailbox: 0 });
+      let messageRate = 0;
+      let cpuRate = 0;
+      if (previous) {
+        const elapsed = Math.max(1, snapshot.server_time_unix_ms - previous.server_time_unix_ms);
+        const oldTotals = previous.services.reduce((sum, service) => {
+          sum.messages += service.message_count;
+          sum.cpu += service.cpu_time_micros;
+          return sum;
+        }, { messages: 0, cpu: 0 });
+        messageRate = Math.max(0, totals.messages - oldTotals.messages) * 1000 / elapsed;
+        cpuRate = Math.max(0, totals.cpu - oldTotals.cpu) / (elapsed * 1000) * 100;
+      }
+      state.samples.push({
+        time: snapshot.server_time_unix_ms,
+        messageRate,
+        mailbox: totals.mailbox,
+        cpuRate,
+      });
+      if (state.samples.length > 60) state.samples.shift();
+      const liveHandles = new Set();
+      snapshot.services.forEach((service) => {
+        liveHandles.add(service.handle);
+        const samples = state.serviceSamples.get(service.handle) || [];
+        samples.push({
+          time: snapshot.server_time_unix_ms,
+          messages: service.message_count,
+          cpu: service.cpu_time_micros,
+          mailbox: service.mailbox_len,
+          tasks: service.task_count,
+        });
+        if (samples.length > 60) samples.shift();
+        state.serviceSamples.set(service.handle, samples);
+      });
+      Array.from(state.serviceSamples.keys()).forEach((handle) => {
+        if (!liveHandles.has(handle)) state.serviceSamples.delete(handle);
+      });
+      state.deltas = calculateServiceDeltas(snapshot);
+      render(snapshot, totals, messageRate, cpuRate);
+    }
+
+    function render(snapshot, totals, messageRate, cpuRate) {
+      const clusterBadge = $('clusterBadge');
+      if (snapshot.cluster_id === null || snapshot.cluster_id === undefined) {
+        clusterBadge.hidden = true;
+      } else {
+        clusterBadge.textContent = `Cluster ID · ${snapshot.cluster_id}`;
+        clusterBadge.hidden = false;
+      }
+      $('lastRefresh').textContent = formatClock(snapshot.server_time_unix_ms);
+      $('startTime').textContent = formatDate(snapshot.start_time_unix_ms);
+      $('uptime').textContent = formatDuration(snapshot.node.uptime_ms);
+      $('serverTime').textContent = formatDate(snapshot.server_time_unix_ms);
+      $('serviceCount').textContent = formatNumber(snapshot.node.service_count);
+      $('businessCount').textContent = formatNumber(snapshot.node.business_service_count);
+      $('runnableCount').textContent = formatNumber(snapshot.node.runnable_services);
+      $('initializingCount').textContent = snapshot.services.filter((s) => s.lifecycle === 'initializing').length;
+      $('failedCount').textContent = snapshot.services.filter((s) => s.lifecycle === 'failed').length;
+      $('endlessCount').textContent = snapshot.services.filter((s) => s.endless).length;
+      $('toolbarTotal').textContent = formatNumber(snapshot.services.length);
+      $('messageRate').textContent = formatCompact(messageRate);
+      $('mailboxTotal').textContent = formatCompact(totals.mailbox);
+      $('cpuRate').textContent = `${cpuRate.toFixed(1)}%`;
+      renderPressure(snapshot.services);
+      renderTable();
+      drawCharts();
+    }
+
+    function calculateServiceDeltas(snapshot) {
+      const result = new Map();
+      snapshot.services.forEach((service) => {
+        const samples = state.serviceSamples.get(service.handle) || [];
+        if (!samples.length) return;
+        const cutoff = snapshot.server_time_unix_ms - 60_000;
+        const baseline = samples.find((sample) => sample.time >= cutoff) || samples[samples.length - 1];
+        result.set(service.handle, {
+          messages: Math.max(0, service.message_count - baseline.messages),
+          cpu: Math.max(0, service.cpu_time_micros - baseline.cpu),
+          mailbox: service.mailbox_len - baseline.mailbox,
+          tasks: service.task_count - baseline.tasks,
+          windowMs: Math.max(0, snapshot.server_time_unix_ms - baseline.time),
+        });
+      });
+      return result;
+    }
+
+    function renderPressure(services) {
+      const bins = [0, 0, 0, 0, 0, 0];
+      services.forEach((service) => {
+        const value = service.mailbox_len;
+        bins[value === 0 ? 0 : value <= 100 ? 1 : value <= 1000 ? 2 : value <= 10000 ? 3 : value <= 100000 ? 4 : 5]++;
+      });
+      const labels = ['0', '1~100', '101~1K', '1K~10K', '10K~100K', '>100K'];
+      $('pressureBars').innerHTML = bins.map((count, index) => `
+        <div class="pressure-bin"><div class="pressure-count">${count}</div><span class="pressure-line"></span><span class="pressure-label">${labels[index]}</span></div>
+      `).join('');
+    }
+
+    function renderTable() {
+      if (!state.snapshot) return;
+      const query = $('search').value.trim().toLowerCase();
+      const lifecycle = $('lifecycleFilter').value;
+      const rows = state.snapshot.services.filter((service) => {
+        const haystack = `${service.handle.toString(16)} ${service.kind} ${service.names.join(' ')}`.toLowerCase();
+        return (!query || haystack.includes(query)) && (lifecycle === 'all' || service.lifecycle === lifecycle);
+      }).sort(compareServices);
+
+      if (!rows.length) {
+        $('serviceRows').innerHTML = '<tr><td class="empty" colspan="9">没有符合条件的服务</td></tr>';
+        return;
+      }
+      const body = $('serviceRows');
+      const dataRows = new Map(Array.from(body.querySelectorAll('tr.data-row'), (row) => [row.dataset.handle, row]));
+      const detailRows = new Map(Array.from(body.querySelectorAll('tr.detail-row[data-handle]'), (row) => [row.dataset.handle, row]));
+      let cursor = body.firstElementChild;
+      const placeRow = (row) => {
+        if (row !== cursor) body.insertBefore(row, cursor);
+        cursor = row.nextElementSibling;
+      };
+      rows.forEach((service) => {
+        const key = String(service.handle);
+        const row = dataRows.get(key) || createRow(serviceRow(service));
+        updateServiceRow(row, service);
+        placeRow(row);
+        if (state.selected === service.handle) {
+          const detail = detailRows.get(key) || createRow(detailRow(service));
+          updateDetailRow(detail, service);
+          placeRow(detail);
+        }
+      });
+      while (cursor) {
+        const obsolete = cursor;
+        cursor = cursor.nextElementSibling;
+        obsolete.remove();
+      }
+      drawSelectedServiceChart();
+    }
+
+    function createRow(html) {
+      const template = document.createElement('template');
+      template.innerHTML = html.trim();
+      return template.content.firstElementChild;
+    }
+
+    function setText(element, value) {
+      if (element.textContent !== String(value)) element.textContent = value;
+    }
+
+    function updateServiceRow(row, service) {
+      const selected = state.selected === service.handle;
+      const name = service.names[0] || '—';
+      row.className = `data-row ${selected ? 'selected' : ''} ${service.lifecycle === 'failed' ? 'failed' : ''}`;
+      row.dataset.handle = service.handle;
+      row.setAttribute('aria-expanded', selected);
+      setText(row.cells[0], `:${service.handle.toString(16).padStart(8, '0')}`);
+      const identity = `${service.kind}\0${name}`;
+      if (row.dataset.identity !== identity) {
+        row.cells[1].innerHTML = `<strong>${escapeHtml(service.kind)}</strong> <span class="muted">/ ${escapeHtml(name)}</span>`;
+        row.dataset.identity = identity;
+      }
+      if (row.dataset.lifecycle !== service.lifecycle) {
+        row.cells[2].innerHTML = lifecycleLabel(service.lifecycle);
+        row.dataset.lifecycle = service.lifecycle;
+      }
+      setText(row.cells[3], formatNumber(service.mailbox_len));
+      row.cells[3].className = `numeric mailbox ${service.mailbox_len >= 1000 ? 'hot' : ''}`;
+      setText(row.cells[4], formatNumber(service.task_count));
+      setText(row.cells[5], formatNumber(service.pending_calls));
+      setText(row.cells[6], formatNumber(service.message_count));
+      setText(row.cells[7], formatCpu(service.cpu_time_micros));
+      const flags = [
+        service.reserved ? '<span class="flag">保留</span>' : '',
+        service.exclusive ? '<span class="flag">独占</span>' : '',
+        service.endless ? '<span class="flag danger">死循环</span>' : '',
+      ].join('') || '<span class="muted">—</span>';
+      if (row.dataset.flags !== flags) {
+        row.cells[8].innerHTML = `<span class="flags">${flags}</span>`;
+        row.dataset.flags = flags;
+      }
+    }
+
+    function updateDetailRow(row, service) {
+      const delta = state.deltas.get(service.handle) || { messages: 0, cpu: 0, mailbox: 0, tasks: 0, windowMs: 0 };
+      row.dataset.handle = service.handle;
+      const values = row.querySelectorAll('.detail-grid dd');
+      [
+        service.kind,
+        service.names.join(', ') || '—',
+        `:${service.handle.toString(16).padStart(8, '0')}`,
+        formatDate(service.start_time_unix_ms),
+        formatDuration(service.uptime_ms),
+        lifecycleText(service.lifecycle),
+        service.reserved ? '是' : '否',
+        service.exclusive ? '是' : '否',
+        service.endless ? '是' : '否',
+        `+${formatNumber(delta.messages)}`,
+        `+${formatCpu(delta.cpu)}`,
+        formatSigned(delta.mailbox),
+        formatSigned(delta.tasks),
+      ].forEach((value, index) => setText(values[index], value));
+      const windowLabel = row.querySelector('.detail-title .muted');
+      setText(windowLabel, `已采样 ${formatWindow(delta.windowMs)}`);
+    }
+
+    function compareServices(a, b) {
+      const key = state.sortKey;
+      const left = key === 'kind' ? `${a.kind} ${a.names.join(' ')}` : a[key];
+      const right = key === 'kind' ? `${b.kind} ${b.names.join(' ')}` : b[key];
+      return (typeof left === 'string' ? left.localeCompare(right) : left - right) * state.sortDirection;
+    }
+
+    function serviceRow(service) {
+      const selected = state.selected === service.handle;
+      const name = service.names[0] || '—';
+      const flags = [
+        service.reserved ? '<span class="flag">保留</span>' : '',
+        service.exclusive ? '<span class="flag">独占</span>' : '',
+        service.endless ? '<span class="flag danger">死循环</span>' : '',
+      ].join('');
+      const row = `
+        <tr class="data-row ${selected ? 'selected' : ''} ${service.lifecycle === 'failed' ? 'failed' : ''}" data-handle="${service.handle}" aria-expanded="${selected}">
+          <td class="mono">:${service.handle.toString(16).padStart(8, '0')}</td>
+          <td><strong>${escapeHtml(service.kind)}</strong> <span class="muted">/ ${escapeHtml(name)}</span></td>
+          <td>${lifecycleLabel(service.lifecycle)}</td>
+          <td class="numeric mailbox ${service.mailbox_len >= 1000 ? 'hot' : ''}">${formatNumber(service.mailbox_len)}</td>
+          <td class="numeric">${formatNumber(service.task_count)}</td>
+          <td class="numeric">${formatNumber(service.pending_calls)}</td>
+          <td class="numeric">${formatNumber(service.message_count)}</td>
+          <td class="numeric">${formatCpu(service.cpu_time_micros)}</td>
+          <td><span class="flags">${flags || '<span class="muted">—</span>'}</span></td>
+        </tr>`;
+      return selected ? row + detailRow(service) : row;
+    }
+
+    function detailRow(service) {
+      const delta = state.deltas.get(service.handle) || { messages: 0, cpu: 0, mailbox: 0, tasks: 0, windowMs: 0 };
+      return `
+        <tr class="detail-row" data-handle="${service.handle}"><td colspan="9"><div class="detail">
+          <section class="detail-group"><div class="detail-title">服务身份</div><dl class="detail-grid">
+            <dt>类型</dt><dd>${escapeHtml(service.kind)}</dd>
+            <dt>名称</dt><dd>${escapeHtml(service.names.join(', ') || '—')}</dd>
+            <dt>句柄</dt><dd>:${service.handle.toString(16).padStart(8, '0')}</dd>
+            <dt>启动时间</dt><dd>${escapeHtml(formatDate(service.start_time_unix_ms))}</dd>
+            <dt>运行时间</dt><dd>${escapeHtml(formatDuration(service.uptime_ms))}</dd>
+          </dl></section>
+          <section class="detail-group"><div class="detail-title">运行属性</div><dl class="detail-grid">
+            <dt>生命周期</dt><dd>${lifecycleText(service.lifecycle)}</dd>
+            <dt>保留服务</dt><dd>${service.reserved ? '是' : '否'}</dd>
+            <dt>独占线程</dt><dd>${service.exclusive ? '是' : '否'}</dd>
+            <dt>疑似死循环</dt><dd>${service.endless ? '是' : '否'}</dd>
+          </dl></section>
+          <section class="detail-group"><div class="detail-title">近 1 分钟增量 <span class="muted">已采样 ${formatWindow(delta.windowMs)}</span></div><dl class="detail-grid">
+            <dt>消息</dt><dd class="delta">+${formatNumber(delta.messages)}</dd>
+            <dt>CPU</dt><dd class="delta">+${formatCpu(delta.cpu)}</dd>
+            <dt>邮箱</dt><dd class="delta">${formatSigned(delta.mailbox)}</dd>
+            <dt>任务</dt><dd class="delta">${formatSigned(delta.tasks)}</dd>
+          </dl></section>
+          <section class="detail-group service-chart"><div class="detail-title">邮箱积压趋势</div><canvas id="serviceMailboxChart" aria-label="单个服务邮箱积压趋势"></canvas></section>
+        </div></td></tr>`;
+    }
+
+    function lifecycleLabel(lifecycle) {
+      return `<span class="life ${lifecycle}"><span class="life-dot"></span>${lifecycleText(lifecycle)}</span>`;
+    }
+    function lifecycleText(lifecycle) {
+      const labels = { running: '运行中', initializing: '初始化中', failed: '失败' };
+      return labels[lifecycle] || escapeHtml(lifecycle);
+    }
+
+    function formatWindow(milliseconds) {
+      const seconds = Math.min(60, Math.max(0, Math.floor(milliseconds / 1000)));
+      return seconds >= 60 ? '1 分钟' : `${seconds} 秒`;
+    }
+
+    function drawCharts() {
+      drawChart($('messageChart'), 'messageRate', '#3dd5c4');
+      drawChart($('mailboxChart'), 'mailbox', '#ff9d28');
+      drawChart($('cpuChart'), 'cpuRate', '#54adf5');
+    }
+
+    function drawSelectedServiceChart() {
+      const canvas = $('serviceMailboxChart');
+      if (!canvas || state.selected === null) return;
+      drawChart(canvas, 'mailbox', '#ff9d28', state.serviceSamples.get(state.selected) || []);
+    }
+
+    function drawChart(canvas, key, color, samples = state.samples) {
+      const rect = canvas.getBoundingClientRect();
+      if (!rect.width || !rect.height) return;
+      const ratio = window.devicePixelRatio || 1;
+      canvas.width = Math.round(rect.width * ratio);
+      canvas.height = Math.round(rect.height * ratio);
+      const context = canvas.getContext('2d');
+      context.scale(ratio, ratio);
+      const width = rect.width;
+      const height = rect.height;
+      const padding = { left: 34, right: 6, top: 8, bottom: 22 };
+      const values = samples.map((sample) => sample[key]);
+      const maximum = Math.max(1, ...values) * 1.12;
+      context.clearRect(0, 0, width, height);
+      context.strokeStyle = '#294157';
+      context.lineWidth = 1;
+      context.fillStyle = '#8196a8';
+      context.font = '10px Cascadia Mono, Consolas, monospace';
+      for (let step = 0; step < 3; step++) {
+        const y = padding.top + (height - padding.top - padding.bottom) * step / 2;
+        context.beginPath(); context.moveTo(padding.left, y); context.lineTo(width - padding.right, y); context.stroke();
+        context.fillText(formatCompact(maximum * (2 - step) / 2), 0, y + 3);
+      }
+      if (values.length > 1) {
+        context.strokeStyle = color;
+        context.lineWidth = 2;
+        context.beginPath();
+        values.forEach((value, index) => {
+          const x = padding.left + (width - padding.left - padding.right) * index / Math.max(1, values.length - 1);
+          const y = height - padding.bottom - (height - padding.top - padding.bottom) * value / maximum;
+          if (index === 0) context.moveTo(x, y); else context.lineTo(x, y);
+        });
+        context.stroke();
+      }
+      const first = samples[0];
+      const last = samples[samples.length - 1];
+      if (first) context.fillText(formatClock(first.time), padding.left, height - 5);
+      if (last) {
+        const label = formatClock(last.time);
+        const measured = context.measureText(label).width;
+        context.fillText(label, width - measured - padding.right, height - 5);
+      }
+    }
+
+    function formatDuration(ms) {
+      const total = Math.floor(ms / 1000);
+      const days = Math.floor(total / 86400);
+      const hours = Math.floor(total % 86400 / 3600);
+      const minutes = Math.floor(total % 3600 / 60);
+      const seconds = total % 60;
+      const clock = [hours, minutes, seconds].map((value) => String(value).padStart(2, '0')).join(':');
+      return days ? `${days}天 ${clock}` : clock;
+    }
+    function formatDate(value) { return new Date(value).toLocaleString([], { hour12: false }); }
+    function formatClock(value) { return new Date(value).toLocaleTimeString([], { hour12: false }); }
+    function formatNumber(value) { return new Intl.NumberFormat().format(value || 0); }
+    function formatCompact(value) { return new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 }).format(value || 0); }
+    function formatCpu(micros) { return micros >= 1000000 ? `${(micros / 1000000).toFixed(2)}s` : `${(micros / 1000).toFixed(2)}ms`; }
+    function formatSigned(value) { return `${value >= 0 ? '+' : ''}${formatNumber(value)}`; }
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' })[char]);
+    }
+
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>
