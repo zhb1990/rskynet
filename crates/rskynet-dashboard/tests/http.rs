@@ -74,10 +74,15 @@ fn dashboard_serves_embedded_ui_and_live_stats() {
     let body = stats.split_once("\r\n\r\n").unwrap().1;
     let json: serde_json::Value = serde_json::from_str(body).unwrap();
     assert_eq!(json["cluster_id"], u32::MAX);
-    assert!(json["server_time_unix_ms"].as_u64().unwrap() > 0);
+    let start_time = json["start_time_unix_ms"].as_u64().unwrap();
+    let server_time = json["server_time_unix_ms"].as_u64().unwrap();
+    let node_uptime = json["node"]["uptime_ms"].as_u64().unwrap();
+    assert!(start_time > 1_600_000_000_000, "启动时间应为 Unix 毫秒");
+    assert!(server_time >= start_time);
+    assert!(server_time - start_time >= node_uptime);
     assert!(json["services"].as_array().unwrap().iter().any(|service| {
         service["kind"] == rskynet_dashboard::NAME
-            && service["start_time_unix_ms"].as_u64().is_some()
+            && service["start_time_unix_ms"].as_u64().unwrap() >= start_time
             && service["uptime_ms"].as_u64().is_some()
     }));
 

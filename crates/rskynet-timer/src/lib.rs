@@ -47,25 +47,22 @@ use wheel::{TimerEvent, Wheel};
 
 /// 时间轮版的时间来源，注入给内核的就是它，见 [`Timer`]。
 ///
-/// 跨线程共享的只有这里的两样东西：谁都可以把事件压进 `incoming`，由定时器服务
-/// 每 tick 排空后插进轮子；`elapsed` 则是所有人都要读的时钟。时间轮本身不在这里
-/// ——它归定时器服务独占，因此一把锁都不需要。
+/// 谁都可以把事件压进 `incoming`，由定时器服务每 tick 排空后插进轮子；相对时间
+/// 则直接读单调时钟。时间轮本身不在这里——它归定时器服务独占，因此一把锁都不需要。
 pub struct WheelTimer {
     /// 等着被插进时间轮的事件。
     ///
     /// `sleep` 与 `call` 超时都要挂表，而挂表的是任意 worker 线程；它们够不着
-    /// 时间轮，只能排队等定时器服务代插——精度本来就是 10ms，晚一个 tick 没区别。
+    /// 时间轮，只能排队等定时器服务代插。到期时刻在入队前已经按绝对时间算好。
     incoming: SegQueue<TimerEvent>,
     /// 进程启动时刻，用来把单调时钟换算成 unix 时间。
     started: Instant,
-    /// 启动时刻的 unix 时间，单位秒。
-    start_seconds: u64,
-    /// 启动时刻的 unix 时间零头，单位毫秒。
-    start_centis: u64,
-    /// 已经推进过的刻度数（毫秒），对照 C 版 `TI->current`。
+    /// 启动时刻的 unix 时间，单位毫秒。
+    start_time_unix_ms: u64,
+    /// 时间轮已经推进过的 10ms 刻度数，对照 C 版 `TI->current`。
     ///
-    /// 只有定时器服务会写；`ctx.now()` / `time()` 每次调用都要读它，所以是原子量。
-    elapsed: AtomicU64,
+    /// 只有定时器服务会写；这里用原子量是为了让测试与观测能无锁读取推进位置。
+    wheel_ticks: AtomicU64,
 }
 
 impl Default for WheelTimer {
@@ -82,9 +79,8 @@ impl WheelTimer {
         Self {
             incoming: SegQueue::new(),
             started: Instant::now(),
-            start_seconds: now.as_secs(),
-            start_centis: u64::from(now.subsec_millis() / 10),
-            elapsed: AtomicU64::new(0),
+            start_time_unix_ms: now.as_millis().min(u128::from(u64::MAX)) as u64,
+            wheel_ticks: AtomicU64::new(0),
         }
     }
 
@@ -92,9 +88,9 @@ impl WheelTimer {
     ///
     /// `wheel` 由调用方（定时器服务）持有，这里只负责收集事件，派发由调用方做。
     fn update(&self, wheel: &mut Wheel) -> Vec<TimerEvent> {
-        let now = self.started.elapsed().as_millis() as u64 / 10;
-        let elapsed = self.elapsed.load(Ordering::Relaxed);
-        let diff = now.saturating_sub(elapsed);
+        let target_tick = self.now() / 10;
+        let wheel_ticks = self.wheel_ticks.load(Ordering::Relaxed);
+        let diff = target_tick.saturating_sub(wheel_ticks);
 
         let mut out = Vec::new();
         // 新挂的表先插进轮子：哪怕这一 tick 没走满一格，也不能把它们攒着
@@ -106,7 +102,7 @@ impl WheelTimer {
             wheel.execute(&mut out);
             return out;
         }
-        self.elapsed.store(now, Ordering::Relaxed);
+        self.wheel_ticks.store(target_tick, Ordering::Relaxed);
         for _ in 0..diff {
             // 先捞一遍 0 延迟的（极少见），再推进刻度、再捞一遍
             wheel.execute(&mut out);
@@ -120,8 +116,11 @@ impl WheelTimer {
 impl Timer for WheelTimer {
     /// 只是排进队列，真正插轮子由定时器服务在下一个 tick 做。到期时刻按当前刻度
     /// 算好带上，所以延后插入不会让定时器变长。
-    fn timeout(&self, handle: u32, session: i32, ticks: u32) {
-        let expire = (self.now() as u32).wrapping_add(ticks);
+    fn timeout(&self, handle: u32, session: i32, delay_ms: u32) {
+        // 时间轮内部仍是 10ms 一格。先算绝对毫秒截止时间再向上取整，避免在当前
+        // 刻度已经走过一部分时把延迟截短。
+        let deadline_ms = self.now().saturating_add(u64::from(delay_ms));
+        let expire = deadline_ms.div_ceil(10) as u32;
         self.incoming.push(TimerEvent {
             handle,
             session,
@@ -130,15 +129,15 @@ impl Timer for WheelTimer {
     }
 
     fn now(&self) -> u64 {
-        self.elapsed.load(Ordering::Relaxed)
+        self.started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
     }
 
     fn wall_clock(&self) -> u64 {
-        self.start_seconds * 100 + self.start_centis + self.now()
+        self.start_time_unix_ms.saturating_add(self.now())
     }
 
-    fn start_seconds(&self) -> u64 {
-        self.start_seconds
+    fn start_time(&self) -> u64 {
+        self.start_time_unix_ms
     }
 }
 
@@ -156,20 +155,20 @@ pub struct Timestamp {
     pub now: u64,
     /// 当前 unix 时间，单位毫秒。
     pub wall_clock: u64,
-    /// 节点启动时刻的 unix 时间，单位秒，对照 `skynet.starttime`。
-    pub start_seconds: u64,
+    /// 节点启动时刻的 unix 时间，单位毫秒。
+    pub start_time: u64,
 }
 
 impl Timestamp {
-    /// 当前 unix 时间，单位秒，对照 `skynet.time`。
-    pub fn unix_time(&self) -> f64 {
-        self.wall_clock as f64 / 100.0
+    /// 当前 unix 时间，单位毫秒。
+    pub fn unix_time(&self) -> u64 {
+        self.wall_clock
     }
 }
 
 /// 问定时器服务要一份时间戳。
 ///
-/// 服务内部直接用 `ctx.now()` / `time()` 更省事（那是一次原子读，不经过邮箱）。
+/// 服务内部直接用 `ctx.now()` / `time()` 更省事（那是一次本地读，不经过邮箱）。
 /// 这条消息路径是给「手里只有一个地址」的场景准备的：调试命令、将来的跨节点查询，
 /// 以及任何想把时间也当成一次普通服务调用来看待的地方。
 pub async fn timestamp(ctx: &Ctx) -> Result<Timestamp> {
@@ -212,10 +211,36 @@ mod tests {
         timer.update(&mut wheel);
         assert!(timer.now() >= before);
         assert!(
-            timer.start_seconds() > 1_600_000_000,
+            timer.start_time() > 1_600_000_000_000,
             "unix 时间应当是合理值"
         );
-        assert!(timer.wall_clock() >= timer.start_seconds() * 100);
+        assert!(timer.wall_clock() >= timer.start_time());
+    }
+
+    /// 对外延迟是毫秒，进入 10ms 时间轮时必须向上对齐，不能提前。
+    #[test]
+    fn millisecond_delays_round_up_to_wheel_ticks() {
+        for delay_ms in [1, 10, 11] {
+            let timer = WheelTimer::new();
+            let before_ms = timer.now();
+            timer.timeout(7, 42, delay_ms);
+            let after_ms = timer.now();
+            let event = timer.incoming.pop().expect("定时器应当已经入队");
+            let deadline_tick = u64::from(event.expire);
+            let requested_deadline_ms = before_ms + u64::from(delay_ms);
+            assert!(deadline_tick * 10 >= requested_deadline_ms);
+            assert!(deadline_tick * 10 < after_ms + u64::from(delay_ms) + 10);
+        }
+    }
+
+    /// 定时器线程晚醒时要一次追完遗漏的全部 10ms 刻度。
+    #[test]
+    fn update_catches_up_multiple_wheel_ticks() {
+        let timer = WheelTimer::new();
+        let mut wheel = Wheel::new();
+        std::thread::sleep(std::time::Duration::from_millis(35));
+        timer.update(&mut wheel);
+        assert!(timer.wheel_ticks.load(Ordering::Relaxed) >= 3);
     }
 
     /// 挂上的表要在推到那个刻度时到期，而且回的是挂表时那个 session

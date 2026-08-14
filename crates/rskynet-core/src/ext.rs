@@ -222,14 +222,14 @@ impl NodeRef {
         self.node.timer.now()
     }
 
-    /// 当前 unix 时间，单位秒。
-    pub fn time(&self) -> f64 {
-        self.node.timer.wall_clock() as f64 / 100.0
+    /// 当前 unix 时间，单位毫秒。
+    pub fn time(&self) -> u64 {
+        self.node.timer.wall_clock()
     }
 
-    /// 节点启动时刻的 unix 时间，单位秒。
+    /// 节点启动时刻的 unix 时间，单位毫秒。
     pub fn start_time(&self) -> u64 {
-        self.node.timer.start_seconds()
+        self.node.timer.start_time()
     }
 
     /// 写一条日志，走的是发给 logger 服务的那条路。

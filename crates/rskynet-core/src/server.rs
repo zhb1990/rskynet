@@ -709,11 +709,7 @@ impl Node {
         let init_for_ctx = init.clone();
         let node = self.clone();
         let started_at_ms = self.timer.now();
-        let started_at_unix_ms = self
-            .timer
-            .start_seconds()
-            .saturating_mul(1_000)
-            .saturating_add(started_at_ms);
+        let started_at_unix_ms = self.timer.wall_clock();
         let kind_name = kind.to_string();
         let ctx = self.handles.register_with(move |handle| {
             Arc::new_cyclic(|me| ServiceContext {
@@ -1026,11 +1022,11 @@ impl Node {
     ///
     /// 零延迟不必惊动时间来源：直接回包，语义上等价于「本刻度就到期」，
     /// 也让 `ctx.yield_now()` 这条最常走的路少绕一圈。
-    pub(crate) fn timeout(&self, handle: u32, ticks: u32, session: i32) {
-        if ticks == 0 {
+    pub(crate) fn timeout(&self, handle: u32, delay_ms: u32, session: i32) {
+        if delay_ms == 0 {
             let _ = self.send_raw(0, handle, MsgType::RESPONSE, session, Payload::None);
         } else {
-            self.timer.timeout(handle, session, ticks);
+            self.timer.timeout(handle, session, delay_ms);
         }
     }
 
@@ -1079,7 +1075,7 @@ pub(crate) mod tests {
     pub(crate) struct StubTimer;
 
     impl Timer for StubTimer {
-        fn timeout(&self, _handle: u32, _session: i32, _ticks: u32) {}
+        fn timeout(&self, _handle: u32, _session: i32, _delay_ms: u32) {}
 
         fn now(&self) -> u64 {
             0
@@ -1089,7 +1085,7 @@ pub(crate) mod tests {
             0
         }
 
-        fn start_seconds(&self) -> u64 {
+        fn start_time(&self) -> u64 {
             0
         }
     }
@@ -1397,7 +1393,7 @@ pub(crate) mod tests {
         .join()
         .expect("node 代理不应触发所有权断言");
 
-        assert_eq!(observed, (Some(victim), 0, 0.0, 0));
+        assert_eq!(observed, (Some(victim), 0, 0, 0));
         assert!(node.handles.grab(victim).is_none());
         assert!(node.handles.grab(owner).is_none());
     }

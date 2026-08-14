@@ -311,9 +311,15 @@ fn the_timer_service_answers_timestamp_requests() {
     let seen = stamp.lock().unwrap();
     let (stamp, now, start_time) = seen.expect("应当拿到时间戳");
     assert!(stamp.now > 0, "睡过之后刻度应当已经推进");
-    assert!(stamp.now >= now, "消息晚于本地读数发出，读到的时间只会更大");
-    assert_eq!(stamp.start_seconds, start_time);
-    assert!(stamp.unix_time() > 1_600_000_000.0, "unix 时间应当是合理值");
+    assert!(
+        stamp.now <= now,
+        "本地读数发生在收到时间戳之后，只会相等或更大"
+    );
+    assert_eq!(stamp.start_time, start_time);
+    assert!(
+        stamp.unix_time() > 1_600_000_000_000,
+        "unix 时间应当是合理值"
+    );
 }
 
 /// tick 配成 0 是没法工作的，启动时就要报错
@@ -341,7 +347,7 @@ fn a_custom_timer_can_replace_the_wheel() {
     }
 
     impl Timer for FakeTimer {
-        fn timeout(&self, _handle: u32, _session: i32, _ticks: u32) {}
+        fn timeout(&self, _handle: u32, _session: i32, _delay_ms: u32) {}
 
         fn now(&self) -> u64 {
             self.elapsed.fetch_add(1, SeqCst)
@@ -351,8 +357,8 @@ fn a_custom_timer_can_replace_the_wheel() {
             self.now()
         }
 
-        fn start_seconds(&self) -> u64 {
-            42
+        fn start_time(&self) -> u64 {
+            42_000
         }
     }
 
@@ -389,5 +395,5 @@ fn a_custom_timer_can_replace_the_wheel() {
         .run()
         .expect("节点应当正常启动并退出");
 
-    assert_eq!(seen.load(SeqCst), 42, "读到的应当是假时钟给的启动时刻");
+    assert_eq!(seen.load(SeqCst), 42_000, "读到的应当是假时钟给的启动时刻");
 }

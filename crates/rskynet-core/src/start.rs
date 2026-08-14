@@ -170,10 +170,10 @@ impl Config {
 /// # use rskynet_core::{Builder, Config, Registry, Timer};
 /// # struct MyTimer;
 /// # impl Timer for MyTimer {
-/// #     fn timeout(&self, _handle: u32, _session: i32, _ticks: u32) {}
+/// #     fn timeout(&self, _handle: u32, _session: i32, _delay_ms: u32) {}
 /// #     fn now(&self) -> u64 { 0 }
 /// #     fn wall_clock(&self) -> u64 { 0 }
-/// #     fn start_seconds(&self) -> u64 { 0 }
+/// #     fn start_time(&self) -> u64 { 0 }
 /// # }
 /// Builder::new(Config::default())
 ///     .registry(Registry::new())

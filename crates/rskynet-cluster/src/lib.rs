@@ -152,19 +152,19 @@ impl RemoteContext {
         self.ctx.now()
     }
 
-    /// 当前 Unix 时间，单位秒。
-    pub fn time(&self) -> f64 {
+    /// 当前 Unix 时间，单位毫秒。
+    pub fn time(&self) -> u64 {
         self.ctx.time()
     }
 
-    /// 节点启动时刻的 Unix 时间，单位秒。
+    /// 节点启动时刻的 Unix 时间，单位毫秒。
     pub fn start_time(&self) -> u64 {
         self.ctx.start_time()
     }
 
     /// 挂起指定毫秒数，不阻塞其他 cluster 请求。
-    pub async fn sleep(&self, ticks: u32) {
-        self.ctx.sleep(ticks).await;
+    pub async fn sleep(&self, millis: u32) {
+        self.ctx.sleep(millis).await;
     }
 
     /// 挂起指定毫秒数，不阻塞其他 cluster 请求。

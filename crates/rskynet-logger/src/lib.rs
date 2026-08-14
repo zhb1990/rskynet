@@ -107,11 +107,11 @@ impl Logger {
 
     fn write(&self, ctx: &Ctx, source: u32, text: &str) {
         // 时间戳用节点内相对时间（毫秒），免掉一个日期库依赖，排查问题也更直观
-        let centis = ctx.now();
+        let elapsed_ms = ctx.now();
         let line = format!(
-            "[{:>6}.{:02}] [:{:08x}] {}",
-            centis / 100,
-            centis % 100,
+            "[{:>6}.{:03}] [:{:08x}] {}",
+            elapsed_ms / 1_000,
+            elapsed_ms % 1_000,
             source,
             text
         );

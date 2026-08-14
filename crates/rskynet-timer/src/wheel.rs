@@ -1,6 +1,6 @@
 //! 分层时间轮，对照 `skynet-src/skynet_timer.c`。
 //!
-//! 时间精度是毫秒（10ms），和 skynet 完全一致：近期轮 256 格覆盖 2.56 秒，
+//! 时间轮内部每格 10ms，和 skynet 完全一致：近期轮 256 格覆盖 2.56 秒，
 //! 之后 4 层各 64 格逐级放大，添加与到期都是 O(1)。
 //!
 //! 与 C 版的实现差异有两处：一是 C 版用侵入式链表串联同一格里的定时器，这里用
@@ -28,7 +28,7 @@ pub(crate) struct TimerEvent {
 /// 由定时器服务独占持有（而那个服务独占一条线程），所以这里全是普通的 `&mut`
 /// 方法，不需要锁：别的线程想挂表只能走 [`crate::WheelTimer::timeout`]。
 pub(crate) struct Wheel {
-    /// 当前刻度，单位毫秒。
+    /// 当前时间轮刻度，每格 10ms。
     time: u32,
     near: Vec<Vec<TimerEvent>>,
     levels: [Vec<Vec<TimerEvent>>; 4],
@@ -185,9 +185,9 @@ mod tests {
             let mut wheel = Wheel::new();
             arm(&mut wheel, 1, ticks);
             let early = advance(&mut wheel, ticks - 1);
-            assert!(early.is_empty(), "{ticks} 毫秒的定时器提前到期了");
+            assert!(early.is_empty(), "{ticks} 刻度的定时器提前到期了");
             let fired = advance(&mut wheel, 1);
-            assert_eq!(fired.len(), 1, "{ticks} 毫秒的定时器没有按时到期");
+            assert_eq!(fired.len(), 1, "{ticks} 刻度的定时器没有按时到期");
         }
     }
 

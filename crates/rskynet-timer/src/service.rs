@@ -57,7 +57,7 @@ impl TimerService {
         Timestamp {
             now: self.timer.now(),
             wall_clock: self.timer.wall_clock(),
-            start_seconds: self.timer.start_seconds(),
+            start_time: self.timer.start_time(),
         }
     }
 }

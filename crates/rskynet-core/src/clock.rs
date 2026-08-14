@@ -11,12 +11,12 @@
 /// 实现方通常分成两半：这个对象负责记账与读时钟（谁都可以碰，所以要 `Sync`），
 /// 另有一个独占线程的服务负责推刻度、把到期的表派发成消息。
 pub trait Timer: Send + Sync + 'static {
-    /// 挂一个 `ticks` 毫秒后到期的定时器，对照 `skynet_timeout`。
+    /// 挂一个 `delay_ms` 毫秒后到期的定时器，对照 `skynet_timeout`。
     ///
     /// 到期时由实现方给 `handle` 投一条 `RESPONSE`（`session` 与请求配对），
-    /// 走 [`crate::NodeRef::send`] 那条路。`ticks` 为 0 的情形内核直接回包，
+    /// 走 [`crate::NodeRef::send`] 那条路。`delay_ms` 为 0 的情形内核直接回包，
     /// 不会走到这里。
-    fn timeout(&self, handle: u32, session: i32, ticks: u32);
+    fn timeout(&self, handle: u32, session: i32, delay_ms: u32);
 
     /// 节点启动至今的毫秒数，对照 `skynet_now`。
     fn now(&self) -> u64;
@@ -24,6 +24,6 @@ pub trait Timer: Send + Sync + 'static {
     /// 当前 unix 时间，单位毫秒。
     fn wall_clock(&self) -> u64;
 
-    /// 节点启动时刻的 unix 时间，单位秒，对照 `skynet_starttime`。
-    fn start_seconds(&self) -> u64;
+    /// 节点启动时刻的 unix 时间，单位毫秒。
+    fn start_time(&self) -> u64;
 }

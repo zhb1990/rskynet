@@ -48,13 +48,13 @@ impl SlowEcho {
     }
 
     async fn dispatch(&self, ctx: Ctx, mut msg: Message) {
-        let centis: u32 = msg
+        let millis: u32 = msg
             .take_payload()
             .as_str()
             .and_then(|s| s.parse().ok())
             .unwrap_or(1);
-        ctx.sleep(centis).await;
-        let _ = ctx.reply(&msg, Payload::text(format!("睡了{centis}")));
+        ctx.sleep(millis).await;
+        let _ = ctx.reply(&msg, Payload::text(format!("睡了{millis}")));
     }
 }
 
@@ -315,12 +315,12 @@ fn sleep_is_woken_by_the_timer() {
             let started = Instant::now();
             ctx.sleep(15).await;
             let millis = started.elapsed().as_millis();
-            note(&journal, format!("{}", (140..3000).contains(&millis)));
+            note(&journal, format!("{}", (15..3000).contains(&millis)));
             // 时间轮的刻度也应当推进了
             note(&journal, format!("{}", ctx.now() >= 15));
         })
     });
-    assert_eq!(seen, vec!["true", "true"], "sleep(15) 应睡满 150ms 上下");
+    assert_eq!(seen, vec!["true", "true"], "sleep(15) 不得提前唤醒");
 }
 
 /// 主任务被 call 挂起时，服务照常处理其它任务——挂起的是任务不是服务
@@ -357,12 +357,12 @@ fn requests_are_served_concurrently() {
             let done: Arc<SvcCell<Vec<String>>> = Arc::new(SvcCell::default());
             let started = Instant::now();
 
-            for centis in ["20", "10", "15"] {
+            for millis in ["20", "10", "15"] {
                 let task_ctx = ctx.clone();
                 let done = done.clone();
                 ctx.spawn(async move {
                     let reply = task_ctx
-                        .request(".slow", Payload::text(centis))
+                        .request(".slow", Payload::text(millis))
                         .await
                         .unwrap();
                     done.borrow_mut().push(reply.as_str().unwrap().to_string());

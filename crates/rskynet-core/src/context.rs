@@ -215,14 +215,14 @@ impl Ctx {
         self.inner.spawn(Box::pin(future));
     }
 
-    /// 挂起 `ticks` 毫秒（10ms 一格），对照 `skynet.sleep`。
+    /// 挂起指定毫秒数。具体时间源可以采用更粗的内部格度，但不得提前唤醒。
     ///
     /// 挂表交给注入的 [`crate::Timer`]，到期时它投一条 `RESPONSE` 回来。挂表本身
     /// 从节点建起来那一刻就可用，哪怕推刻度的那条线程还没上线。
-    pub async fn sleep(&self, ticks: u32) {
+    pub async fn sleep(&self, millis: u32) {
         self.inner.assert_ownership();
         let session = self.inner.sessions.alloc();
-        self.inner.node.timeout(self.handle(), ticks, session);
+        self.inner.node.timeout(self.handle(), millis, session);
         let _ = Call {
             ctx: &self.inner,
             session,
@@ -231,10 +231,9 @@ impl Ctx {
         .await;
     }
 
-    /// 按毫秒挂起，内部换算成毫秒（向上取整，至少一格）。
+    /// 按毫秒挂起，超过 `u32` 可表达范围时饱和到最大值。
     pub async fn sleep_ms(&self, millis: u64) {
-        let ticks = millis.div_ceil(10).min(u32::MAX as u64) as u32;
-        self.sleep(ticks).await;
+        self.sleep(millis.min(u32::MAX as u64) as u32).await;
     }
 
     /// 让出一次调度，对照 `skynet.yield`：把后面的活儿排到当前就绪队列尾部。
@@ -294,14 +293,14 @@ impl Ctx {
         self.inner.node.timer.now()
     }
 
-    /// 当前 unix 时间，单位秒，是 [`NodeRef::time`] 的便捷代理。
-    pub fn time(&self) -> f64 {
-        self.inner.node.timer.wall_clock() as f64 / 100.0
+    /// 当前 unix 时间，单位毫秒，是 [`NodeRef::time`] 的便捷代理。
+    pub fn time(&self) -> u64 {
+        self.inner.node.timer.wall_clock()
     }
 
-    /// 节点启动时刻的 unix 时间，单位秒，是 [`NodeRef::start_time`] 的便捷代理。
+    /// 节点启动时刻的 unix 时间，单位毫秒，是 [`NodeRef::start_time`] 的便捷代理。
     pub fn start_time(&self) -> u64 {
-        self.inner.node.timer.start_seconds()
+        self.inner.node.timer.start_time()
     }
 
     /// 写一条日志，对照 `skynet.error`：日志本身也是发给 logger 服务的消息。

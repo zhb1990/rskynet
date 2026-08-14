@@ -64,8 +64,8 @@ impl DashboardSnapshot {
         Self {
             node: ctx.node().stats(),
             cluster_id,
-            start_time_unix_ms: ctx.node().start_time().saturating_mul(1_000),
-            server_time_unix_ms: (ctx.node().time() * 1_000.0).max(0.0) as u64,
+            start_time_unix_ms: ctx.node().start_time(),
+            server_time_unix_ms: ctx.node().time(),
             services: ctx.node().services(),
         }
     }

@@ -5,7 +5,7 @@ use rskynet::{Ctx, Message, Payload, Result, SvcCell};
 
 enum Ask {
     Ball(u64),
-    Delayed { centis: u32, tag: String },
+    Delayed { millis: u32, tag: String },
     Shutdown,
 }
 
@@ -34,8 +34,8 @@ impl Pong {
             Ask::Ball(round) => {
                 let _ = ctx.reply(&msg, Payload::of(Ask::Ball(round)));
             }
-            Ask::Delayed { centis, tag } => {
-                ctx.sleep(centis).await;
+            Ask::Delayed { millis, tag } => {
+                ctx.sleep(millis).await;
                 let _ = ctx.reply(&msg, Payload::text(tag));
             }
             Ask::Shutdown => {
@@ -117,13 +117,13 @@ impl Ping {
     async fn concurrent_asks(&self, ctx: &Ctx) -> Result<()> {
         let delays = [30u32, 10, 20];
         let done: Arc<SvcCell<Vec<String>>> = Arc::new(SvcCell::default());
-        for centis in delays {
+        for millis in delays {
             let task_ctx = ctx.clone();
             let done = done.clone();
             ctx.spawn(async move {
                 let ask = Ask::Delayed {
-                    centis,
-                    tag: format!("睡{centis}毫秒"),
+                    millis,
+                    tag: format!("睡{millis}毫秒"),
                 };
                 match task_ctx.request(".pong", Payload::of(ask)).await {
                     Ok(reply) => done
