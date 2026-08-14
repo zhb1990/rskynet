@@ -138,7 +138,8 @@ impl Logger {
     async fn dispatch(&self, ctx: Ctx, msg: Message) {
         match msg.mtype {
             MsgType::TEXT => {
-                let decision = self.backpressure.borrow_mut().decide(ctx.mailbox_len());
+                let queued = ctx.node().mailbox_len(ctx.handle()).unwrap_or(0);
+                let decision = self.backpressure.borrow_mut().decide(queued);
                 let LogDecision::Write { dropped } = decision else {
                     return;
                 };

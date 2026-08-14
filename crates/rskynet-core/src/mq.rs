@@ -44,13 +44,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::thread::{self, Thread};
 
-use arc_swap::ArcSwapOption;
-use crossbeam_queue::SegQueue;
-use futures_util::future::BoxFuture;
-
 use crate::bwos::{self, CachePad, Owner, Stealer};
 use crate::message::Message;
 use crate::server::ServiceContext;
+use arc_swap::ArcSwapOption;
+use crossbeam_queue::SegQueue;
 
 /// 过载报警的初始阈值，对照 C 版 `MQ_OVERLOAD`。
 pub(crate) const OVERLOAD_THRESHOLD: usize = 1024;
@@ -59,8 +57,6 @@ pub(crate) const OVERLOAD_THRESHOLD: usize = 1024;
 pub(crate) enum Ready {
     /// 服务内某个任务被唤醒了，去 poll 它。
     Task(usize),
-    /// 别的线程托我们插一个新任务，见 [`crate::server::ServiceContext::spawn`]。
-    Spawn(BoxFuture<'static, ()>),
 }
 
 /// 一次调度取到的活儿：要么是一条新消息，要么是就绪队列里的一件活。

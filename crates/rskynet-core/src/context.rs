@@ -51,7 +51,12 @@ pub trait Service: Send + Sync + 'static {
     fn dispatch(self: Arc<Self>, ctx: Ctx, msg: Message) -> BoxFuture<'static, ()>;
 }
 
-/// 服务句柄：既是自己的身份，也是访问内核的唯一入口。
+/// 当前 service 的执行上下文。
+///
+/// 它必须是 `Send`，以便 service Future 在 worker 间迁移。`launch`、`kill`、
+/// `abort`、名字与时间查询只是线程安全的 node 代理，可以跨线程调用；`call`、
+/// `sleep`、`spawn`、`send`、`reply`、`exit` 等 service 本地接口则只能在运行时
+/// 当前正执行这个 service 时调用。需要长期交给外部线程时应导出 [`NodeRef`]。
 #[derive(Clone)]
 pub struct Ctx {
     pub(crate) inner: Arc<ServiceContext>,
@@ -72,9 +77,7 @@ impl Ctx {
         &self.inner.kind
     }
 
-    /// 节点的对外把手，扩展 crate（网络层等）由此进入内核。
-    ///
-    /// 业务代码用不着它：`send` / `call` / `launch` 这些都在 `Ctx` 上。
+    /// 节点的线程安全把手。节点管理、时间、名字查询和观测接口都在这里。
     pub fn node(&self) -> NodeRef {
         NodeRef::new(self.inner.node.clone())
     }
@@ -85,6 +88,7 @@ impl Ctx {
 
     /// 发一条消息，不等应答，对照 `skynet.send`。
     pub fn send(&self, dest: impl Into<Addr>, mtype: MsgType, payload: Payload) -> Result<()> {
+        self.inner.assert_ownership();
         let dest = self.resolve(dest)?;
         self.inner
             .node
@@ -106,6 +110,7 @@ impl Ctx {
         mtype: MsgType,
         payload: Payload,
     ) -> Result<Payload> {
+        self.inner.assert_ownership();
         let dest = self.resolve(dest)?;
         let session = self.inner.sessions.alloc();
         if let Err(err) = self
@@ -151,6 +156,7 @@ impl Ctx {
     where
         F: FnOnce(ReplyToken),
     {
+        self.inner.assert_ownership();
         let session = self.inner.sessions.alloc();
         f(ReplyToken::new(
             self.inner.node.clone(),
@@ -169,6 +175,7 @@ impl Ctx {
     ///
     /// 请求方没带 session（即 `send` 而非 `call`）时静默忽略。
     pub fn reply(&self, request: &Message, payload: Payload) -> Result<()> {
+        self.inner.assert_ownership();
         if !request.needs_reply() {
             return Ok(());
         }
@@ -183,6 +190,7 @@ impl Ctx {
 
     /// 告诉请求方「这活儿办不了」，对方的 `call` 会拿到 [`crate::Error::CallFailed`]。
     pub fn reply_error(&self, request: &Message) -> Result<()> {
+        self.inner.assert_ownership();
         if !request.needs_reply() {
             return Ok(());
         }
@@ -203,6 +211,7 @@ impl Ctx {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        self.inner.assert_ownership();
         self.inner.spawn(Box::pin(future));
     }
 
@@ -211,6 +220,7 @@ impl Ctx {
     /// 挂表交给注入的 [`crate::Timer`]，到期时它投一条 `RESPONSE` 回来。挂表本身
     /// 从节点建起来那一刻就可用，哪怕推刻度的那条线程还没上线。
     pub async fn sleep(&self, ticks: u32) {
+        self.inner.assert_ownership();
         let session = self.inner.sessions.alloc();
         self.inner.node.timeout(self.handle(), ticks, session);
         let _ = Call {
@@ -232,10 +242,9 @@ impl Ctx {
         self.sleep(0).await;
     }
 
-    /// 启动一个新服务，对照 `skynet.newservice`。
+    /// 启动一个新 service 并等待其 init Future 完整成功。
     ///
-    /// 新服务会被调度到它自己的执行者；共享服务由 worker 初始化，独占服务由
-    /// 专属线程初始化。本调用等待 `init` 完整成功后才返回 handle。
+    /// 这是 [`NodeRef::launch`] 的便捷代理，可跨线程调用。
     pub async fn launch(&self, kind: &str, args: impl AsRef<str>) -> Result<u32> {
         let service = self.inner.node.new_service(kind, args.as_ref())?;
         service.init.await?;
@@ -244,13 +253,14 @@ impl Ctx {
 
     /// 给自己注册一个本地名字，对照 `skynet.register`。名字已被占用时返回 false。
     pub fn register_name(&self, name: &str) -> bool {
+        self.inner.assert_ownership();
         self.inner
             .node
             .handles
             .register_name(self.handle(), name.trim_start_matches('.'))
     }
 
-    /// 按名字查地址，对照 `skynet.localname`。
+    /// 按本地注册名查 handle，是 [`NodeRef::query_name`] 的便捷代理。
     pub fn query_name(&self, name: &str) -> Option<u32> {
         self.inner
             .node
@@ -262,85 +272,42 @@ impl Ctx {
     ///
     /// 返回后当前任务仍会继续跑到下一次挂起点，真正的资源释放发生在那之后。
     pub fn exit(&self) {
+        self.inner.assert_ownership();
         self.inner.request_exit();
     }
 
-    /// 干掉别的服务，对照 `skynet.kill`。
+    /// 摘除一个 service，是 [`NodeRef::kill`] 的便捷代理。
     pub fn kill(&self, dest: impl Into<Addr>) -> bool {
-        match self.resolve(dest) {
+        match self.inner.node.resolve(&dest.into()) {
             Ok(handle) => self.inner.node.retire(handle),
             Err(_) => false,
         }
     }
 
-    /// 关停整个节点，对照 `skynet.abort`：干掉所有服务，`start` 随之返回。
+    /// 摘除全部非 reserved service，是 [`NodeRef::abort`] 的便捷代理。
     pub fn abort(&self) {
         self.inner.node.retire_all();
     }
 
-    /// 节点启动至今的毫秒数，对照 `skynet.now`。
+    /// 节点启动至今的毫秒数，是 [`NodeRef::now`] 的便捷代理。
     pub fn now(&self) -> u64 {
         self.inner.node.timer.now()
     }
 
-    /// 当前 unix 时间，单位秒，对照 `skynet.time`。
+    /// 当前 unix 时间，单位秒，是 [`NodeRef::time`] 的便捷代理。
     pub fn time(&self) -> f64 {
         self.inner.node.timer.wall_clock() as f64 / 100.0
     }
 
-    /// 节点启动时刻的 unix 时间（秒），对照 `skynet.starttime`。
+    /// 节点启动时刻的 unix 时间，单位秒，是 [`NodeRef::start_time`] 的便捷代理。
     pub fn start_time(&self) -> u64 {
         self.inner.node.timer.start_seconds()
     }
 
     /// 写一条日志，对照 `skynet.error`：日志本身也是发给 logger 服务的消息。
     pub fn log(&self, text: impl Into<String>) {
+        self.inner.assert_ownership();
         self.inner.node.log(self.handle(), text.into());
-    }
-
-    /// 自己邮箱里积压的消息数，对照 `skynet.stat("mqlen")`。
-    pub fn mailbox_len(&self) -> usize {
-        self.inner.mailbox.len()
-    }
-
-    /// 自己处理过的消息总数，对照 `skynet.stat("message")`。
-    pub fn message_count(&self) -> u64 {
-        self.inner.message_count()
-    }
-
-    /// monitor 是否发现过本服务疑似死循环，对照 `skynet.stat("endless")`。
-    ///
-    /// 这是一次性状态：返回 `true` 的同时会清除标记。
-    pub fn take_endless(&self) -> bool {
-        self.inner.take_endless()
-    }
-
-    /// 服务内当前活着的任务数（含正在等应答的），用于观察并发情况。
-    pub fn task_count(&self) -> usize {
-        self.inner.task_count()
-    }
-
-    /// 自己发出去、还没收到回包的请求数。
-    pub fn pending_calls(&self) -> usize {
-        self.inner.sessions.pending()
-    }
-
-    /// 本服务累计占用 worker 的时长，对照 `skynet.stat("cpu")`。
-    /// 需要配置里打开 `profile`（默认开）。
-    pub fn cpu_cost(&self) -> std::time::Duration {
-        self.inner.cpu_cost()
-    }
-
-    /// 本节点当前活着的服务数，对照 `skynet_context_total`。
-    pub fn service_count(&self) -> i64 {
-        self.inner.node.total()
-    }
-
-    /// 运行队列里排队的服务数，观察负载用。
-    ///
-    /// 队列按 worker 拆开之后这个数字是各队列长度之和，允许短暂不精确。
-    pub fn runnable_services(&self) -> usize {
-        self.inner.node.sched.len()
     }
 }
 
@@ -365,6 +332,7 @@ impl Future for Call<'_> {
     type Output = Result<Payload>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.ctx.assert_ownership();
         match self.ctx.sessions.poll(self.session, cx.waker()) {
             Poll::Ready(result) => {
                 self.finished = true;
@@ -378,6 +346,10 @@ impl Future for Call<'_> {
 impl Drop for Call<'_> {
     fn drop(&mut self) {
         if !self.finished {
+            if std::thread::panicking() && !self.ctx.owns_current_thread() {
+                return;
+            }
+            self.ctx.assert_ownership();
             self.ctx.sessions.abandon(self.session);
         }
     }

@@ -3,8 +3,10 @@
 //! 套路是固定的：注册一个「驱动」服务，它在 init 里执行用例逻辑、把观察到的
 //! 现象写进共享记录，最后 `abort` 关停节点；`start` 返回后再断言记录内容。
 
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex};
+use std::task::Context;
 use std::time::Instant;
 
 use rskynet::{
@@ -541,14 +543,17 @@ fn failed_init_leaves_no_trace() {
         Box::pin(async move {
             // 先等引导服务退场，服务计数稳定下来再取基准
             ctx.sleep(3).await;
-            let before = ctx.service_count();
+            let before = ctx.node().service_count();
 
             note(
                 &journal,
                 format!("{}", ctx.launch("stillborn", "").await.is_err()),
             );
             ctx.sleep(3).await;
-            note(&journal, format!("{}", ctx.service_count() == before));
+            note(
+                &journal,
+                format!("{}", ctx.node().service_count() == before),
+            );
         })
     });
     assert_eq!(seen, vec!["true", "true"]);
@@ -583,7 +588,8 @@ fn many_local_tasks_all_get_scheduled() {
                     *done.borrow_mut() += 1;
                 });
             }
-            note(&journal, format!("在飞任务 {}", ctx.task_count() >= 200));
+            let stats = ctx.node().service_stats(ctx.handle()).unwrap();
+            note(&journal, format!("在飞任务 {}", stats.task_count >= 200));
             while *done.borrow() < 200 {
                 ctx.sleep(1).await;
             }
@@ -593,32 +599,51 @@ fn many_local_tasks_all_get_scheduled() {
     assert_eq!(seen, vec!["在飞任务 true", "全部完成 200"]);
 }
 
-/// `Ctx` 是 `Send` 的，用户从自己起的 OS 线程 spawn 任务也得能跑起来
-///
-/// 那个线程碰不得服务的任务集，所以走的是「把 future 塞进邮箱、由持有者插入」
-/// 这条慢路径。
+/// `Ctx` 是 `Send` 只为了随 service Future 在 worker 间迁移；外部线程不能调用
+/// service 本地接口。
 #[test]
-fn spawn_from_a_foreign_thread_still_runs() {
+fn service_local_ctx_methods_panic_on_a_foreign_thread() {
     let seen = run_node(&["driver"], |ctx, journal| {
         Box::pin(async move {
-            let done = Arc::new(AtomicU64::new(0));
             let outside = ctx.clone();
-            let flag = done.clone();
-            std::thread::spawn(move || {
-                outside.spawn(async move {
-                    flag.fetch_add(1, SeqCst);
-                });
+            let spawn_panicked = std::thread::spawn(move || outside.spawn(async {}))
+                .join()
+                .is_err();
+
+            let outside = ctx.clone();
+            let send_panicked = std::thread::spawn(move || {
+                outside.post(outside.handle(), Payload::None).unwrap();
             })
             .join()
-            .unwrap();
+            .is_err();
 
-            while done.load(SeqCst) == 0 {
-                ctx.sleep(1).await;
-            }
-            note(&journal, "外部线程托付的任务跑了");
+            let outside = ctx.clone();
+            let sleep_panicked = std::thread::spawn(move || poll_once(outside.sleep(1)))
+                .join()
+                .is_err();
+
+            let outside = ctx.clone();
+            let call_panicked = std::thread::spawn(move || {
+                poll_once(outside.request(outside.handle(), Payload::None));
+            })
+            .join()
+            .is_err();
+
+            note(
+                &journal,
+                format!(
+                    "外部接口 panic {spawn_panicked}/{send_panicked}/{sleep_panicked}/{call_panicked}"
+                ),
+            );
         })
     });
-    assert_eq!(seen, vec!["外部线程托付的任务跑了"]);
+    assert_eq!(seen, vec!["外部接口 panic true/true/true/true"]);
+}
+
+fn poll_once(future: impl Future) {
+    let mut future = std::pin::pin!(future);
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    let _ = future.as_mut().poll(&mut cx);
 }
 
 /// 对照 skynet.stat 的那几个统计口径都要有值
@@ -630,9 +655,10 @@ fn runtime_stats_are_available() {
                 ctx.request(".echo", Payload::text("x")).await.unwrap();
             }
             // 10 条应答消息
-            note(&journal, format!("{}", ctx.message_count() >= 10));
-            note(&journal, format!("{}", ctx.pending_calls() == 0));
-            note(&journal, format!("{}", ctx.cpu_cost().as_nanos() > 0));
+            let stats = ctx.node().service_stats(ctx.handle()).unwrap();
+            note(&journal, format!("{}", stats.message_count >= 10));
+            note(&journal, format!("{}", stats.pending_calls == 0));
+            note(&journal, format!("{}", stats.cpu_time_micros > 0));
             note(&journal, format!("{}", ctx.handle() != 0));
         })
     });

@@ -64,7 +64,7 @@ pub struct WheelTimer {
     start_centis: u64,
     /// 已经推进过的刻度数（毫秒），对照 C 版 `TI->current`。
     ///
-    /// 只有定时器服务会写；`ctx.now()` / `ctx.time()` 每次调用都要读它，所以是原子量。
+    /// 只有定时器服务会写；`ctx.now()` / `time()` 每次调用都要读它，所以是原子量。
     elapsed: AtomicU64,
 }
 
@@ -169,7 +169,7 @@ impl Timestamp {
 
 /// 问定时器服务要一份时间戳。
 ///
-/// 服务内部直接用 `ctx.now()` / `ctx.time()` 更省事（那是一次原子读，不经过邮箱）。
+/// 服务内部直接用 `ctx.now()` / `time()` 更省事（那是一次原子读，不经过邮箱）。
 /// 这条消息路径是给「手里只有一个地址」的场景准备的：调试命令、将来的跨节点查询，
 /// 以及任何想把时间也当成一次普通服务调用来看待的地方。
 pub async fn timestamp(ctx: &Ctx) -> Result<Timestamp> {

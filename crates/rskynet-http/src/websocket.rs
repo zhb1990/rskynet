@@ -387,9 +387,9 @@ impl SharedSocket {
         if !output.is_empty() {
             self.transport.send_wait(ctx, output).await?;
         }
-        let started = ctx.node().now();
+        let started = ctx.now();
         while !self.state.borrow().ended {
-            if ctx.node().now().saturating_sub(started) >= self.close_timeout_ms {
+            if ctx.now().saturating_sub(started) >= self.close_timeout_ms {
                 self.transport.shutdown(ctx);
                 self.on_closed(None);
                 break;

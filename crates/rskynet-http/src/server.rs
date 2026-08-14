@@ -553,7 +553,7 @@ impl ServerBodyHandle {
 
     pub(crate) async fn next_chunk(&self, ctx: &Ctx) -> Result<Option<Vec<u8>>> {
         self.ensure_continue(ctx).await?;
-        let started = ctx.node().now();
+        let started = ctx.now();
         loop {
             let (answer, resume) = {
                 let mut state = self.core.state.borrow_mut();
@@ -584,7 +584,7 @@ impl ServerBodyHandle {
             if let Some(answer) = answer {
                 return answer;
             }
-            if ctx.node().now().saturating_sub(started) >= self.core.config.body_idle_timeout_ms {
+            if ctx.now().saturating_sub(started) >= self.core.config.body_idle_timeout_ms {
                 self.transport.shutdown(ctx);
                 self.core.remove_connection(self.transport);
                 return Err(HttpError::Timeout("server body idle"));

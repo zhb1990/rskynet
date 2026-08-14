@@ -56,7 +56,7 @@ worker 的一轮调度（对照 C 版 `skynet_context_message_dispatch`）：
 
 每个共享 worker 各有一份 monitor 进度，另有一条 `rskynet-monitor` 线程每 5 秒扫描一次。worker 在每次 poll Future 的前后推进版本；同一次 poll 连续跨过两个检查点仍未返回，就会记录包含消息来源和目标 handle 的疑似死循环日志。
 
-检测只告警，不强杀线程或节点。服务可用 `ctx.take_endless()` 读取并清除这个一次性标记，对应 `skynet.stat("endless")`。监测边界是共享 worker 上的单次 Future poll；独占服务线程和启动阶段的同步初始化不在其中。
+检测只告警，不强杀线程或节点。监控方可用 `node.take_endless(handle)` 读取并清除这个一次性标记，对应 `skynet.stat("endless")`。监测边界是共享 worker 上的单次 Future poll；独占服务线程和启动阶段的同步初始化不在其中。
 
 ### 独占一条线程的服务
 
@@ -226,7 +226,7 @@ cargo run -p rskynet-examples -- config/examples/ping_pong.toml
 | `skynet.abort()` | `ctx.abort()` |
 | `skynet.now()` / `skynet.time()` | `ctx.now()` / `ctx.time()` |
 | `skynet.error(...)` | `ctx.log(...)` / `rskynet::log!(ctx, "...")` |
-| `skynet.stat("mqlen"/"message"/"cpu"/"endless")` | `ctx.mailbox_len()` / `ctx.message_count()` / `ctx.cpu_cost()` / `ctx.take_endless()` |
+| `skynet.stat("mqlen"/"message"/"cpu"/"endless")` | `node.service_stats(addr)` / `node.take_endless(addr)` |
 | `socket.listen(addr, port)` / `socket.start(id)` | `net::listen(&ctx, addr).await` / `net::start(&ctx, id).await` |
 | `socket.open(addr, port)` | `net::connect(&ctx, addr).await` |
 | `socket.write(id, data)` / `socket.lwrite(id, data)` | `net::send(&ctx, id, data)` / `net::send_low(&ctx, id, data)` |
@@ -234,6 +234,12 @@ cargo run -p rskynet-examples -- config/examples/ping_pong.toml
 | `socket.udp(...)` / `socket.sendto(...)` | `net::udp(&ctx, bind).await` / `net::udp_send(&ctx, id, to, data)` |
 
 寻址方式也照搬：`":0100000a"` 是十六进制 handle，`".name"` 是本地名字，直接传 `u32` 则是 handle。
+
+节点级观测也统一走 `NodeRef`：`node.stats()` 返回 service 总数、业务 service 数、
+运行队列长度与 uptime；`node.services()` / `service_stats(addr)` 返回每个 service 的
+kind、全部本地别名、生命周期、邮箱积压、活动 task、pending call、累计消息数与
+CPU 微秒数。这些是可序列化的拥有型近似快照，适合监控线程和后续 HTTP UI；抓取
+过程不访问 service 的 `SvcCell`，也不阻塞它执行。
 
 ## 过程宏与网络层
 
@@ -469,9 +475,9 @@ struct Counter { hits: SvcCell<u64> }
 *self.hits.borrow_mut() += 1;      // 没有锁，没有原子操作
 ```
 
-内核自己也吃这条不变量：任务集（`Slab<TaskSlot>`）就是一个 `SvcCell`，不再有锁。代价是**跨线程调用要能识别出来**——`Ctx` 是 `Send`，用户完全可以从自己起的 OS 线程调 `ctx.spawn`，那时碰 `SvcCell` 就是 UB。所以有一个 `CURRENT_SERVICE` 线程局部量记着「本线程此刻在跑哪个服务」：是持有者就地插入，不是就把 future 当成一件活投进邮箱，由持有者代插。`task_count()` 之类的观测接口读一个原子计数，跨线程调用照样安全。
+内核自己也吃这条不变量：任务集（`Slab<TaskSlot>`）与 `SessionTable` 都是 `SvcCell`，不再有锁。`CURRENT_SERVICE` 线程局部量记着「本线程此刻在跑哪个服务」，整个消息处理、任务 poll、回包与销毁过程都处于这个所有权作用域。`Ctx::call` / `sleep` / `spawn` 等 service 本地接口会强制校验它；从外部 OS 线程调用会立即 panic。
 
-`SessionTable` 有意保留了 `Mutex`：`Ctx::call` / `sleep` 同样可能来自外部线程，去锁会变成 unsound，而它每次 RPC 只有三四次无竞争加锁，量级远小于邮箱。等将来明确禁止跨线程 `call` 再说。
+`Ctx` 仍然是 `Send`，因为 service 在一次 `await` 之后可能被另一条 worker 窃取并继续 poll。`launch` / `kill` / `abort`、名字与时间查询只是线程安全的 node 代理，可以跨线程调用；`call` / `sleep` / `spawn` / `send` / `reply` / `exit` 等 service 本地接口不能在任意线程调用。需要长期交给外部线程时仍推荐只导出 `NodeRef`，用它投消息、管理节点和抓取 `NodeStats` / `ServiceStats` 近似快照，或者用 `ReplyToken` 完成一次外部请求。任务数、session 数、消息数与 CPU 时长都由原子量镜像，观测线程不会碰 `SvcCell`。
 
 ## 相对 C 版的几处有意改动
 
@@ -587,7 +593,7 @@ fn main() -> rskynet::Result<()> {
 }
 ```
 
-Unix 的 `SIGINT` 与 `SIGTERM`、Windows 的 Ctrl+C 默认调用 `Ctx::abort()` 优雅
+Unix 的 `SIGINT` 与 `SIGTERM`、Windows 的 Ctrl+C 默认调用 `NodeRef::abort()` 优雅
 关停。属性宏可以覆盖某个信号的默认行为：
 
 ```rust
@@ -691,7 +697,7 @@ C 版的 socket 线程与内核同住一个编译单元，`skynet_socket_*` 直�
 
 | 扩展点 | 作用 | 对应 skynet |
 | --- | --- | --- |
-| `NodeRef` | 从内核之外的线程往服务邮箱投消息 | `skynet_context_push` |
+| `NodeRef` | 跨线程投消息、管理节点，并抓取 node/service 观测快照 | `skynet_context_push` + monitor |
 | `ReplyToken` | 一张可以跨线程搬的回执单，别的线程办完活调 `reply`，服务侧那句 `ctx.call_external(…).await` 就醒过来 | socket 线程回一条带 session 的 `PTYPE_RESPONSE` |
 
 于是网络层写起来是这样的：socket 服务用 `with_exclusive` 注册，它的 `idle` 就是 `poll.poll(events, None)`，`interrupt` 敲 mio 的 `Waker`；业务服务的 `listen` / `connect` / `send` / `close` 是发给它的消息，办完由它 `reply`，调用方写成一句 `await`；socket 事件以 `MsgType::SOCKET` 投给连接的属主服务，与定时器回包同一条路径。真要再起子线程（比如把阻塞的域名解析挪出去），那条线程靠 `NodeRef` 与 `ReplyToken` 回话。

@@ -75,7 +75,9 @@ impl Ping {
                 rskynet::log!(
                     ctx,
                     "ping 处理过 {} 条消息，通知 pong 后退出",
-                    ctx.message_count()
+                    ctx.node()
+                        .service_stats(ctx.handle())
+                        .map_or(0, |stats| stats.message_count)
                 );
                 ctx.post(".pong", Payload::of(Ask::Shutdown))?;
                 ctx.exit();

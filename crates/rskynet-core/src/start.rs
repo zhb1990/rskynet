@@ -253,7 +253,7 @@ impl Builder {
 /// 启动节点并阻塞到所有服务退出。
 ///
 /// worker 与 monitor 先进入运行状态，随后主线程依次等待 logger、signal、timer、
-/// 可选基础设施与默认 bootstrap 完整初始化。任何一个服务调用 `Ctx::abort`，或者
+/// 可选基础设施与默认 bootstrap 完整初始化。任何一方调用 `NodeRef::abort`，或者
 /// 启动完成后最后一个服务退出，都会让本函数返回。
 pub fn start(config: Config, registry: Registry, timer: Arc<dyn Timer>) -> Result<()> {
     Builder::new(config).registry(registry).timer(timer).run()

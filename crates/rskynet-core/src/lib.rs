@@ -25,7 +25,7 @@
 //! 只留下三个约定俗成的名字（见 [`service`]）与拉起它们的顺序。
 //!
 //! 时间也一样。分层时间轮不在内核里，内核只认 [`Timer`] 这个抽象，启动前必须
-//! 由调用方注入一个实现（[`Builder::timer`]）。`ctx.sleep` 与 `ctx.now` 都从
+//! 由调用方注入一个实现（[`Builder::timer`]）。`ctx.sleep` 与 `ctx.node().now` 都从
 //! 那里取值。
 //!
 //! ## 模块划分
@@ -62,7 +62,7 @@ pub use clock::Timer;
 pub use context::{Ctx, Service};
 pub use error::{Error, Result};
 pub use exclusive::{Exclusive, Idler};
-pub use ext::{NodeRef, ReplyToken};
+pub use ext::{NodeRef, NodeStats, ReplyToken, ServiceLifecycle, ServiceStats};
 pub use message::{Addr, Message, MsgType, Payload};
 pub use module::{AutoService, Registry};
 pub use payload::{FromPayload, IntoPayload};

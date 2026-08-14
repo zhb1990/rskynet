@@ -211,9 +211,16 @@ impl Drop for Running {
 
 impl ServiceContext {
     /// 本线程此刻是否正在执行本服务，也就是能不能直接动服务内部那些不加锁的容器。
-    fn owns_current_thread(&self) -> bool {
+    pub(crate) fn owns_current_thread(&self) -> bool {
         let me = self as *const ServiceContext as usize;
         CURRENT_SERVICE.with(|cell| cell.get()) == me
+    }
+
+    pub(crate) fn assert_ownership(&self) {
+        assert!(
+            self.owns_current_thread(),
+            "Ctx 的 service 本地接口只能在当前 service 的执行上下文中调用"
+        );
     }
 
     /// 顶着「本线程正在执行本服务」的标记跑一段同步代码。
@@ -341,16 +348,10 @@ impl ServiceContext {
 
     /// 起一个服务内任务，等价于 skynet 的 `skynet.fork`。
     ///
-    /// `Ctx` 是 `Send` 的，用户完全可以从自己起的 OS 线程调它，而那个线程碰不得
-    /// 服务的任务集（见 [`crate::task`] 的安全契约）。所以这里分两条路：本线程
-    /// 正执行本服务就直接插入，否则把 future 当成一件活塞进邮箱，由持有者插入。
+    /// 调用方必须正持有本服务；外部线程应投消息让服务自己决定是否 spawn。
     pub(crate) fn spawn(self: &Arc<Self>, future: BoxFuture<'static, ()>) {
-        if self.owns_current_thread() {
-            self.install_task(future, None, 0);
-        } else {
-            let queued = self.mailbox.push_ready(Ready::Spawn(future));
-            self.wake(queued);
-        }
+        self.assert_ownership();
+        self.install_task(future, None, 0);
     }
 
     /// 把一个 future 放进任务集并排进就绪队列。只有持有本服务的线程能调用。
@@ -377,13 +378,25 @@ impl ServiceContext {
         self.endless.swap(false, Ordering::AcqRel)
     }
 
+    pub(crate) fn endless(&self) -> bool {
+        self.endless.load(Ordering::Acquire)
+    }
+
     fn mark_endless(&self) {
         self.endless.store(true, Ordering::Release);
     }
 
     /// 累计占用 worker 的时长，对照 `skynet.stat("cpu")`。
-    pub(crate) fn cpu_cost(&self) -> std::time::Duration {
-        std::time::Duration::from_micros(self.cpu_cost.load(Ordering::Relaxed))
+    pub(crate) fn cpu_cost_micros(&self) -> u64 {
+        self.cpu_cost.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn lifecycle(&self) -> crate::ext::ServiceLifecycle {
+        match self.lifecycle.load(Ordering::Acquire) {
+            lifecycle::INITIALIZING => crate::ext::ServiceLifecycle::Initializing,
+            lifecycle::RUNNING => crate::ext::ServiceLifecycle::Running,
+            _ => crate::ext::ServiceLifecycle::Failed,
+        }
     }
 
     /// 处理一条消息，对照 C 版 `dispatch_message` 与 skynet.lua 的
@@ -445,10 +458,6 @@ impl ServiceContext {
     fn run_ready(self: &Arc<Self>, ready: Ready) {
         match ready {
             Ready::Task(task) => self.poll_task(task),
-            // 别的线程托我们插的任务：插进去就会排到就绪队列尾部，随后被 poll
-            Ready::Spawn(future) => {
-                self.install_task(future, None, 0);
-            }
         }
     }
 
@@ -929,6 +938,7 @@ impl Node {
         if ctx.is_dead() {
             return Ran::Dead;
         }
+        let _running = Running::enter(ctx);
         let mut done = 0usize;
         loop {
             if ctx.is_running() {
@@ -978,6 +988,7 @@ impl Node {
     /// 预算按进来时的积压量给：清理期间别人可能还在往里投（比如别的服务还在写
     /// 日志），无上限地跟下去就退不出来了。
     pub(crate) fn drain_service(&self, ctx: &Arc<ServiceContext>) {
+        let _running = Running::enter(ctx);
         // 每条消息都会开一个任务，所以留够「一条消息一次 poll」的份额，另外
         // 多给一点余量，好让 init 那种还没跑完的任务有机会收尾
         let mut budget = ctx.mailbox.len() * 2 + 16;
@@ -1296,7 +1307,74 @@ pub(crate) mod tests {
         let handle = node.new_service("null", "").expect("应创建成功").handle;
         node.report_endless(0x12, handle, 7);
         let ctx = Ctx::new(node.handles.grab(handle).expect("服务应当仍存活"));
-        assert!(ctx.take_endless());
-        assert!(!ctx.take_endless(), "读取后应自动清除");
+        assert!(ctx.node().take_endless(ctx.handle()).unwrap());
+        assert!(
+            !ctx.node().take_endless(ctx.handle()).unwrap(),
+            "读取后应自动清除"
+        );
+    }
+
+    /// 监控线程只拿 NodeRef 就能枚举 service；快照拥有数据且不会吊住已退出 service。
+    #[test]
+    fn service_stats_are_cross_thread_snapshots() {
+        let node = test_node();
+        let handle = node.new_service("null", "").expect("应创建成功").handle;
+        assert!(node.handles.register_name(handle, "alpha"));
+        assert!(node.handles.register_name(handle, "beta"));
+        let external = crate::NodeRef::new(node.clone());
+
+        let stats = std::thread::spawn(move || {
+            let node_stats = external.stats();
+            let services = external.services();
+            (node_stats, services)
+        })
+        .join()
+        .expect("跨线程观测不应 panic");
+
+        assert_eq!(stats.0.service_count, 1);
+        assert_eq!(stats.0.business_service_count, 1);
+        assert_eq!(stats.1.len(), 1);
+        let service = &stats.1[0];
+        assert_eq!(service.handle, handle);
+        assert_eq!(service.kind, "null");
+        assert_eq!(service.names, ["alpha", "beta"]);
+        assert_eq!(service.lifecycle, crate::ServiceLifecycle::Initializing);
+        assert_eq!(service.task_count, 1, "init 任务应已登记");
+
+        assert!(node.retire(handle));
+        let external = crate::NodeRef::new(node);
+        assert!(matches!(
+            external.service_stats(handle),
+            Err(Error::NoService(id)) if id == handle
+        ));
+        assert!(external.services().is_empty());
+    }
+
+    /// Ctx 上的 node 代理不碰 service 本地状态，可以从外部线程使用。
+    #[test]
+    fn ctx_node_proxies_work_across_threads() {
+        let node = test_node();
+        let owner = node.new_service("null", "").expect("应创建成功").handle;
+        let victim = node.new_service("null", "").expect("应创建成功").handle;
+        assert!(node.handles.register_name(victim, "victim"));
+        let ctx = Ctx::new(node.handles.grab(owner).expect("服务应当仍存活"));
+
+        let observed = std::thread::spawn(move || {
+            let values = (
+                ctx.query_name("victim"),
+                ctx.now(),
+                ctx.time(),
+                ctx.start_time(),
+            );
+            assert!(ctx.kill(victim));
+            ctx.abort();
+            values
+        })
+        .join()
+        .expect("node 代理不应触发所有权断言");
+
+        assert_eq!(observed, (Some(victim), 0, 0.0, 0));
+        assert!(node.handles.grab(victim).is_none());
+        assert!(node.handles.grab(owner).is_none());
     }
 }

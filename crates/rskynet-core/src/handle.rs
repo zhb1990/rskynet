@@ -135,6 +135,18 @@ impl HandleStorage {
             .collect()
     }
 
+    /// 给监控接口取一次拥有所有权的快照。名字按 handle 聚合，避免调用方为每个
+    /// service 重复扫描整张名字表。
+    pub(crate) fn snapshot(&self) -> (Vec<Arc<ServiceContext>>, BTreeMap<u32, Vec<String>>) {
+        let contexts = self.contexts();
+        let names = self.names.load();
+        let mut grouped = BTreeMap::<u32, Vec<String>>::new();
+        for (name, handle) in names.iter() {
+            grouped.entry(*handle).or_default().push(name.clone());
+        }
+        (contexts, grouped)
+    }
+
     pub(crate) fn find_name(&self, name: &str) -> Option<u32> {
         self.names.load().get(name).copied()
     }

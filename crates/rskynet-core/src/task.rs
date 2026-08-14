@@ -125,11 +125,10 @@ impl ArcWake for TaskWaker {
 /// 服务持有的任务集合。
 ///
 /// 这里用 [`SvcCell`] 而不是 `Mutex`：所有访问点都在「当前执行本服务的那个线程」
-/// 上，加锁只是白付代价。唯一的例外是用户从自己起的 OS 线程调 `Ctx::spawn`，
-/// 那条路走邮箱绕回来（见 [`crate::server::ServiceContext::spawn`]）。
+/// 上，加锁只是白付代价。外部线程不能直接调用 `Ctx::spawn`，只能通过邮箱投消息。
 pub(crate) struct TaskSet {
     slots: SvcCell<Slab<TaskSlot>>,
-    /// 任务数。只有持有者会改，但 `Ctx::task_count` 允许别的线程看一眼，
+    /// 任务数。只有持有者会改，但 `NodeRef::service_stats` 允许别的线程看一眼，
     /// 所以单独记一个原子量，免得为了读个数字就得去借 cell。
     count: AtomicUsize,
 }

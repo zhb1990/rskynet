@@ -286,7 +286,7 @@ fn an_empty_bootstrap_list_still_exits() {
     worker.join().unwrap();
 }
 
-/// 定时器也是个正常服务：能应答时间戳查询，而且读数与 ctx.now() 对得上
+/// 定时器也是个正常服务：能应答时间戳查询，而且读数与 node.now() 对得上
 #[test]
 fn the_timer_service_answers_timestamp_requests() {
     let stamp = Arc::new(Mutex::new(None));
