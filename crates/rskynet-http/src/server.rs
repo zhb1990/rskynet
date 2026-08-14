@@ -132,6 +132,26 @@ impl HttpServer {
         }
     }
 
+    /// 判断一条网络事件是否属于这个 HTTP 服务端。
+    ///
+    /// 判属只借用事件；返回 `true` 后可继续把事件按值交给 [`Self::on_socket`]。
+    /// `Accept` 必须根据原监听口判断，因为新连接此时尚未登记。
+    pub fn handles_socket(&self, event: &SocketEvent) -> bool {
+        let state = self.core.state.borrow();
+        match event {
+            SocketEvent::Accept { id, listen, .. } => {
+                state.listeners.contains_key(&TransportId::Plain(*listen))
+                    || state.connections.contains_key(&TransportId::Plain(*id))
+            }
+            SocketEvent::Udp { .. } => false,
+            event => {
+                let transport = TransportId::Plain(event.id());
+                state.listeners.contains_key(&transport)
+                    || state.connections.contains_key(&transport)
+            }
+        }
+    }
+
     pub async fn on_socket(&self, ctx: &Ctx, event: SocketEvent) -> Result<Vec<ServerRequest>> {
         match event {
             SocketEvent::Accept { id, listen, peer } => {
@@ -170,6 +190,26 @@ impl HttpServer {
     }
 
     #[cfg(feature = "tls")]
+    /// 判断一条 TLS 事件是否属于这个 HTTP 服务端。
+    ///
+    /// 判属只借用事件；返回 `true` 后可继续把事件按值交给 [`Self::on_tls`]。
+    /// 入站 `Connected` 事件优先根据 TLS 监听口判断。
+    pub fn handles_tls(&self, event: &TlsEvent) -> bool {
+        let state = self.core.state.borrow();
+        match event {
+            TlsEvent::Connected { id, listen, .. } => {
+                listen.is_some_and(|listen| state.listeners.contains_key(&TransportId::Tls(listen)))
+                    || state.connections.contains_key(&TransportId::Tls(*id))
+            }
+            event => {
+                let transport = TransportId::Tls(event.id());
+                state.listeners.contains_key(&transport)
+                    || state.connections.contains_key(&transport)
+            }
+        }
+    }
+
+    #[cfg(feature = "tls")]
     pub async fn on_tls(&self, ctx: &Ctx, event: TlsEvent) -> Result<Vec<ServerRequest>> {
         match event {
             TlsEvent::Connected {
@@ -203,6 +243,74 @@ impl HttpServer {
             }
             _ => Ok(Vec::new()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rskynet_net::SocketId;
+
+    #[test]
+    fn handles_only_owned_plain_events() {
+        let server = HttpServer::default();
+        let listener = SocketId(7);
+        server.insert_listener(TransportId::Plain(listener));
+        let peer = "127.0.0.1:12345".parse().unwrap();
+
+        assert!(server.handles_socket(&SocketEvent::Accept {
+            id: SocketId(8),
+            listen: listener,
+            peer,
+        }));
+        assert!(server.handles_socket(&SocketEvent::Close { id: listener }));
+        assert!(!server.handles_socket(&SocketEvent::Accept {
+            id: SocketId(9),
+            listen: SocketId(10),
+            peer,
+        }));
+        assert!(!server.handles_socket(&SocketEvent::Data {
+            id: SocketId(10),
+            data: Vec::new(),
+        }));
+        assert!(!server.handles_socket(&SocketEvent::Udp {
+            id: listener,
+            from: peer,
+            data: Vec::new(),
+        }));
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn handles_only_owned_tls_events() {
+        use rskynet_tls::TlsId;
+
+        let server = HttpServer::default();
+        let listener = TlsId(11);
+        server.insert_listener(TransportId::Tls(listener));
+        let peer = "127.0.0.1:12345".parse().unwrap();
+
+        assert!(server.handles_tls(&TlsEvent::Connected {
+            id: TlsId(12),
+            listen: Some(listener),
+            peer,
+            version: None,
+            cipher_suite: None,
+            alpn: None,
+        }));
+        assert!(server.handles_tls(&TlsEvent::Close { id: listener }));
+        assert!(!server.handles_tls(&TlsEvent::Connected {
+            id: TlsId(13),
+            listen: Some(TlsId(14)),
+            peer,
+            version: None,
+            cipher_suite: None,
+            alpn: None,
+        }));
+        assert!(!server.handles_tls(&TlsEvent::Data {
+            id: TlsId(14),
+            data: Vec::new(),
+        }));
     }
 }
 

@@ -82,6 +82,13 @@ impl WebSocketExample {
             return;
         }
 
+        if !self.server.handles_socket(&event) {
+            if !event.is_gone() {
+                rskynet::log!(ctx, "忽略未知 socket 事件：{event:?}");
+            }
+            return;
+        }
+
         let requests = match self.server.on_socket(&ctx, event).await {
             Ok(requests) => requests,
             Err(error) => {

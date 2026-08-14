@@ -60,6 +60,12 @@ impl HttpExample {
 
     #[msg(MsgType::SOCKET)]
     async fn on_socket(&self, ctx: Ctx, event: SocketEvent) {
+        if !self.server.handles_socket(&event) {
+            if !event.is_gone() {
+                rskynet::log!(ctx, "忽略不属于 HTTP 服务端的 socket 事件：{event:?}");
+            }
+            return;
+        }
         let requests = match self.server.on_socket(&ctx, event).await {
             Ok(requests) => requests,
             Err(error) => {

@@ -340,8 +340,10 @@ actor 把属于客户端的 transport 事件交回本地驱动器；同一 actor
 async fn on_socket(&self, ctx: Ctx, event: SocketEvent) {
     if self.websockets.handles_socket(event.id()) {
         let _ = self.websockets.on_socket(&ctx, event).await;
-    } else {
+    } else if self.http.handles_socket(&event) {
         let _ = self.http.on_socket(&ctx, event).await;
+    } else if !event.is_gone() {
+        rskynet::log!(ctx, "忽略未知 socket 事件：{event:?}");
     }
 }
 
@@ -349,11 +351,18 @@ async fn on_socket(&self, ctx: Ctx, event: SocketEvent) {
 async fn on_tls(&self, ctx: Ctx, event: TlsEvent) {
     if self.websockets.handles_tls(event.id()) {
         let _ = self.websockets.on_tls(&ctx, event).await;
-    } else {
+    } else if self.http.handles_tls(&event) {
         let _ = self.http.on_tls(&ctx, event).await;
+    } else if !matches!(event, TlsEvent::Close { .. } | TlsEvent::Error { .. }) {
+        rskynet::log!(ctx, "忽略未知 TLS 事件：{event:?}");
     }
 }
 ```
+
+`handles_socket` / `handles_tls` 只借用事件，不复制数据；确认归属后再把事件按值交给
+对应驱动器。连接可能在主动关闭时先解除登记，随后再收到迟到的 `Close` / `Error`，
+这类终止事件可安全忽略。同一 actor 还持有原始 TCP、UDP 或其他协议连接时，也应使用
+相同方式分流。
 
 `WebSocket` 及其 `WebSocketSender` 只能在创建连接的 actor 内使用。其他 actor 应创建
 自己的连接，或通过业务消息请求属主 actor 代发。

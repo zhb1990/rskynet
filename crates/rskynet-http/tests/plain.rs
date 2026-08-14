@@ -39,6 +39,10 @@ impl Api {
 
     #[msg(MsgType::SOCKET)]
     async fn on_socket(&self, ctx: Ctx, event: SocketEvent) {
+        if !self.http.handles_socket(&event) {
+            assert!(event.is_gone(), "HTTP 服务端未识别活动事件：{event:?}");
+            return;
+        }
         if matches!(event, SocketEvent::Accept { .. }) {
             *self.board.accepted.lock().unwrap() += 1;
         }

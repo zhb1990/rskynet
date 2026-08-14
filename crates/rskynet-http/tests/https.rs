@@ -46,6 +46,13 @@ impl Api {
 
     #[msg(MsgType::TLS)]
     async fn on_tls(&self, ctx: Ctx, event: TlsEvent) {
+        if !self.http.handles_tls(&event) {
+            assert!(
+                matches!(event, TlsEvent::Close { .. } | TlsEvent::Error { .. }),
+                "HTTPS 服务端未识别活动事件：{event:?}"
+            );
+            return;
+        }
         let Ok(requests) = self.http.on_tls(&ctx, event).await else {
             return;
         };

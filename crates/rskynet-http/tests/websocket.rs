@@ -40,6 +40,10 @@ impl Server {
 
     #[msg(MsgType::SOCKET)]
     async fn on_socket(&self, ctx: Ctx, event: SocketEvent) {
+        if !self.http.handles_socket(&event) {
+            assert!(event.is_gone(), "WebSocket 服务端未识别活动事件：{event:?}");
+            return;
+        }
         let Ok(requests) = self.http.on_socket(&ctx, event).await else {
             return;
         };
