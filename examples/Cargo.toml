@@ -9,5 +9,5 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-rskynet = { path = "../crates/rskynet", features = ["cluster"] }
+rskynet = { path = "../crates/rskynet", features = ["cluster", "websocket"] }
 prost = { workspace = true }

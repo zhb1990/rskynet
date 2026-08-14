@@ -618,7 +618,12 @@ $env:RSKYNET_KEEP_NATIVE_CRASH_TEST_DIR='1'
 ```bash
 cargo run -p rskynet-examples -- config/examples/ping_pong.toml
 cargo run -p rskynet-examples -- config/examples/echo_server.toml
+cargo run -p rskynet-examples -- config/examples/http.toml
+cargo run -p rskynet-examples -- config/examples/websocket.toml
 ```
+
+HTTP 与 WebSocket 示例会各自在随机本地端口启动服务端，由同一进程内的客户端完成
+一次 `POST /echo` 或文本帧回显，打印结果后自动退出。
 
 跨节点 ping/pong 要开两个终端，先启动 node 2 的 pong，再启动 node 1 的 ping：
 

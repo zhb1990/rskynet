@@ -1,0 +1,9 @@
+# 启动本地 WebSocket 服务端和客户端，完成一次文本回显后退出。
+thread = 2
+
+[net]
+
+[bootstrap]
+services = [
+    { name = "websocket-example" },
+]

@@ -1,0 +1,9 @@
+# 启动本地 HTTP 服务端和客户端，完成一次 POST /echo 后退出。
+thread = 2
+
+[http-client]
+
+[bootstrap]
+services = [
+    { name = "http-example" },
+]

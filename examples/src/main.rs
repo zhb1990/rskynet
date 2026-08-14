@@ -1,6 +1,8 @@
 mod cluster_ping_pong;
 mod echo;
+mod http;
 mod ping_pong;
+mod websocket;
 
 fn main() -> std::process::ExitCode {
     rskynet::main::run()
