@@ -395,6 +395,16 @@ pub(crate) struct Scheduler {
     /// 摊薄到可忽略），窃贼白跑一趟就把它清掉，于是错报最多浪费一次尝试。
     stealable: Box<[CachePad<AtomicU64>]>,
     quit: AtomicBool,
+    /// 测试钩子：让 worker 停在「登记 searching」之后，便于把 push 的竞态窗口
+    /// 放大成确定性用例。
+    #[cfg(test)]
+    pause_after_searching_inc: AtomicBool,
+    /// 测试钩子：让 push 停在「看到 searcher」之后、真正塞进 injector 之前。
+    #[cfg(test)]
+    pause_before_injector_push: AtomicBool,
+    /// 测试钩子：push 已经看到 searcher、正停在 injector 之前。
+    #[cfg(test)]
+    injector_push_paused: AtomicBool,
 }
 
 impl Scheduler {
@@ -424,6 +434,12 @@ impl Scheduler {
                 .map(|_| CachePad(AtomicU64::new(0)))
                 .collect(),
             quit: AtomicBool::new(false),
+            #[cfg(test)]
+            pause_after_searching_inc: AtomicBool::new(false),
+            #[cfg(test)]
+            pause_before_injector_push: AtomicBool::new(false),
+            #[cfg(test)]
+            injector_push_paused: AtomicBool::new(false),
         }
     }
 
@@ -473,7 +489,23 @@ impl Scheduler {
             // 省下一次挂起唤醒往返（Windows 上 1~10µs，乒乓型负载里全部开销都在这）。
             // 这里**不能**图快放自己的本地队列：BWoS 里 owner 正在写的那一块对窃贼
             // 是隐形的，那位扫一圈空手而归就去睡了，下一跳又得叫人。
+            #[cfg(test)]
+            {
+                self.injector_push_paused.store(true, Ordering::Release);
+                while self.pause_before_injector_push.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                self.injector_push_paused.store(false, Ordering::Release);
+            }
             self.injector.push(ctx);
+            // 复查一次：searcher 可能正好在我们看它与真正入队之间全部睡下。
+            // 这时 searching 已经减到 0，而睡下的人一定先登记了空闲位；
+            // 补叫一个，别让这件 injector 里的活陪着它一起睡过去。
+            if self.searching.load(Ordering::SeqCst) == 0 {
+                if let Some(id) = self.claim_idle() {
+                    self.slots[id].wake();
+                }
+            }
             return;
         }
         if let Some(id) = self.claim_idle() {
@@ -639,7 +671,12 @@ impl Scheduler {
     pub(crate) fn find_work_or_park(&self) -> Option<Arc<ServiceContext>> {
         let id = self.worker_id().expect("只有 worker 线程会来找活");
         // 找活的人已经够多了就别再添乱，直接去睡：真有活时投递方会点名叫我们
-        let rounds = if self.searching.fetch_add(1, Ordering::SeqCst) < self.max_searchers {
+        let searching = self.searching.fetch_add(1, Ordering::SeqCst);
+        #[cfg(test)]
+        while self.pause_after_searching_inc.load(Ordering::Acquire) {
+            std::hint::spin_loop();
+        }
+        let rounds = if searching < self.max_searchers {
             SPIN_ROUNDS
         } else {
             0
@@ -1116,5 +1153,159 @@ mod tests {
         sched.searching.fetch_sub(1, Ordering::SeqCst);
         sched.push(dummy_context_on(node.clone(), 2));
         assert_eq!(sched.sleeping(), 0, "这次该把睡着的 0 号摘出来叫醒了");
+    }
+
+    /// push 看到 searcher 后，那位却正好在 push 真正入队前睡下：
+    /// 这是「searcher 吸收唤醒」路径上最窄的竞态窗口。用测试钩子把窗口撑到
+    /// 确定性可复现，push 必须在 injector 入队后复查一遍，把刚睡下的人叫醒。
+    #[test]
+    fn a_searcher_that_parks_before_the_push_lands_is_woken_directly() {
+        let node = test_node_with(Config::default().with_thread(1));
+        let sched = &node.sched;
+
+        thread::scope(|scope| {
+            // 无论用例在哪一步失败，都要先把测试钩子解开并把睡着的 worker 叫醒，
+            // 否则 scoped thread 会陪着用例一起挂死。守卫必须放在 scope 闭包内，
+            // 这样 panic 时它会先于「等待所有线程结束」执行。
+            struct ReleaseHooks<'a>(&'a Scheduler);
+            impl Drop for ReleaseHooks<'_> {
+                fn drop(&mut self) {
+                    self.0
+                        .pause_after_searching_inc
+                        .store(false, Ordering::SeqCst);
+                    self.0
+                        .pause_before_injector_push
+                        .store(false, Ordering::SeqCst);
+                    for slot in &self.0.slots {
+                        slot.wake();
+                    }
+                }
+            }
+            let _release = ReleaseHooks(sched);
+            let wait = |flag: &AtomicBool, expected: bool| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while flag.load(Ordering::Acquire) != expected
+                    && std::time::Instant::now() < deadline
+                {
+                    std::hint::spin_loop();
+                }
+                flag.load(Ordering::Acquire) == expected
+            };
+
+            sched
+                .pause_after_searching_inc
+                .store(true, Ordering::SeqCst);
+            let worker = scope.spawn(|| {
+                let _worker = sched.register_worker(0);
+                sched.find_work_or_park();
+                sched.pop().is_some()
+            });
+
+            // worker 已经登记 searching，正被钩子停在扫描之前
+            {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while sched.searching.load(Ordering::SeqCst) == 0
+                    && std::time::Instant::now() < deadline
+                {
+                    std::hint::spin_loop();
+                }
+                assert_eq!(
+                    sched.searching.load(Ordering::SeqCst),
+                    1,
+                    "worker 应先登记 searching"
+                );
+            }
+
+            // 让 push 看到 searching 之后也停在 injector 之前
+            sched
+                .pause_before_injector_push
+                .store(true, Ordering::SeqCst);
+            let pusher = scope.spawn(|| sched.push(dummy_context_on(node.clone(), 7)));
+            assert!(
+                wait(&sched.injector_push_paused, true),
+                "push 应当看到 searcher 并停在 injector 之前"
+            );
+
+            // 放走 worker：它扫不到尚未入队的活，只能登记空闲并睡下
+            sched
+                .pause_after_searching_inc
+                .store(false, Ordering::SeqCst);
+            {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while sched.sleeping() == 0 && std::time::Instant::now() < deadline {
+                    std::hint::spin_loop();
+                }
+                assert_eq!(sched.sleeping(), 1, "worker 应当已经睡下");
+            }
+
+            // 现在放 push 入队。若复查逻辑缺失，worker 会带着这件活一直睡；
+            // 这里只短暂等待，之后用 poke 兜底，保证用例失败时也能收拾干净。
+            sched
+                .pause_before_injector_push
+                .store(false, Ordering::SeqCst);
+            pusher.join().unwrap();
+
+            let woken_directly = {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while sched.sleeping() != 0 && std::time::Instant::now() < deadline {
+                    std::hint::spin_loop();
+                }
+                sched.sleeping() == 0
+            };
+            if !woken_directly {
+                sched.poke();
+            }
+
+            let got_work = worker.join().unwrap();
+            assert!(
+                woken_directly,
+                "push 在 injector 入队后必须复查并叫醒刚睡下的 worker"
+            );
+            assert!(got_work, "worker 醒来后应当从 injector 拿到这件活");
+        });
+
+        assert_eq!(sched.len(), 0, "活被取走后 pending 计数要归零");
+    }
+
+    /// 多个 worker 边投递边取活：本地队列、injector 与窃取路径一起压，
+    /// 最终必须一件不丢、pending 归零。
+    #[test]
+    fn many_workers_pushing_and_popping_lose_nothing() {
+        const WORKERS: usize = 4;
+        const PER_WORKER: u32 = 2_000;
+        const TOTAL: usize = WORKERS * PER_WORKER as usize;
+
+        let node = test_node_with(Config::default().with_thread(WORKERS));
+        let sched = &node.sched;
+        let popped = AtomicUsize::new(0);
+
+        thread::scope(|scope| {
+            for id in 0..WORKERS {
+                let popped = &popped;
+                let node = node.clone();
+                scope.spawn(move || {
+                    let _worker = sched.register_worker(id);
+                    let base = id as u32 * PER_WORKER;
+                    for n in 0..PER_WORKER {
+                        sched.push(dummy_context_on(node.clone(), base + n));
+                    }
+                    // 不 park：所有 worker 一直扫到全部活取空为止，专测队列本身。
+                    // 给个宽限期，失败时别让 scoped thread 无限空转。
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while popped.load(Ordering::SeqCst) < TOTAL
+                        && std::time::Instant::now() < deadline
+                    {
+                        if sched.pop().is_some() {
+                            popped.fetch_add(1, Ordering::SeqCst);
+                        } else {
+                            std::hint::spin_loop();
+                        }
+                    }
+                });
+            }
+        });
+
+        assert_eq!(popped.load(Ordering::SeqCst), TOTAL, "一件都不能丢");
+        assert_eq!(sched.len(), 0, "取空后运行队列计数必须归零");
     }
 }
