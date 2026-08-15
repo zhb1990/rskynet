@@ -405,6 +405,18 @@ pub(crate) struct Scheduler {
     /// 测试钩子：push 已经看到 searcher、正停在 injector 之前。
     #[cfg(test)]
     injector_push_paused: AtomicBool,
+    /// 测试钩子：push 已确认没有 searcher 和空闲 worker，停在真正入队之前。
+    #[cfg(test)]
+    pause_before_place: AtomicBool,
+    /// 测试钩子：push 正停在「无人可唤醒」与真正入队之间。
+    #[cfg(test)]
+    place_paused: AtomicBool,
+    /// 测试钩子：worker 已完成睡前最后一次扫描，停在 park 之前。
+    #[cfg(test)]
+    pause_before_park: AtomicBool,
+    /// 测试钩子：worker 正停在最后一次扫描与 park 之间。
+    #[cfg(test)]
+    park_paused: AtomicBool,
 }
 
 impl Scheduler {
@@ -440,6 +452,14 @@ impl Scheduler {
             pause_before_injector_push: AtomicBool::new(false),
             #[cfg(test)]
             injector_push_paused: AtomicBool::new(false),
+            #[cfg(test)]
+            pause_before_place: AtomicBool::new(false),
+            #[cfg(test)]
+            place_paused: AtomicBool::new(false),
+            #[cfg(test)]
+            pause_before_park: AtomicBool::new(false),
+            #[cfg(test)]
+            park_paused: AtomicBool::new(false),
         }
     }
 
@@ -520,7 +540,26 @@ impl Scheduler {
             return;
         }
         // 大家都在忙，没人等着接活：进自己的本地队列，这条路最快
+        // worker 投到本地队列后自己仍在运行，稍后能亲自取走；只有外部/独占线程
+        // 投 injector 时，才可能出现「唯一能取活的 worker 正好在此刻睡下」。
+        let needs_wakeup_recheck = self.worker_id().is_none();
+        #[cfg(test)]
+        {
+            self.place_paused.store(true, Ordering::Release);
+            while self.pause_before_place.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+            self.place_paused.store(false, Ordering::Release);
+        }
         self.place(ctx);
+        // 上面的第一次检查与真正入队之间，可能恰好有 worker 从 searching 转成
+        // idle 并睡下。任务此刻已经对取活方可见，再按与睡眠侧相同的 SeqCst
+        // 顺序复查一次：仍有人在找就让它捞走，否则叫醒刚登记的空闲 worker。
+        if needs_wakeup_recheck && self.searching.load(Ordering::SeqCst) == 0 {
+            if let Some(id) = self.claim_idle() {
+                self.slots[id].wake();
+            }
+        }
     }
 
     /// 把服务安置进某条运行队列：worker 线程优先放自己的本地队列（无锁且缓存热），
@@ -704,6 +743,14 @@ impl Scheduler {
             return Some(ctx);
         }
         if !self.is_quit() {
+            #[cfg(test)]
+            {
+                self.park_paused.store(true, Ordering::Release);
+                while self.pause_before_park.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                self.park_paused.store(false, Ordering::Release);
+            }
             thread::park();
         }
         self.clear_idle(id);
@@ -1265,6 +1312,84 @@ mod tests {
         });
 
         assert_eq!(sched.len(), 0, "活被取走后 pending 计数要归零");
+    }
+
+    /// push 已确认「没有 searcher，也没有空闲 worker」之后，新 worker 才开始找活：
+    /// pending 已经加一，但任务尚未真正入队，worker 会扫描失败并睡下。随后 push
+    /// 入队时若不复查空闲位，就会留下「有活排队、唯一 worker 却睡着」的状态。
+    #[test]
+    fn a_worker_parking_between_wakeup_check_and_queue_insert_is_not_stranded() {
+        let node = test_node_with(Config::default().with_thread(1));
+        let sched = &node.sched;
+
+        sched.pause_before_place.store(true, Ordering::SeqCst);
+        sched.pause_before_park.store(true, Ordering::SeqCst);
+        thread::scope(|scope| {
+            struct ReleaseHook<'a>(&'a Scheduler);
+            impl Drop for ReleaseHook<'_> {
+                fn drop(&mut self) {
+                    self.0.pause_before_place.store(false, Ordering::SeqCst);
+                    self.0.pause_before_park.store(false, Ordering::SeqCst);
+                    self.0.poke();
+                }
+            }
+            let _release = ReleaseHook(sched);
+
+            let pusher = scope.spawn(|| sched.push(dummy_context_on(node.clone(), 7)));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !sched.place_paused.load(Ordering::Acquire)
+                && std::time::Instant::now() < deadline
+            {
+                std::hint::spin_loop();
+            }
+            assert!(
+                sched.place_paused.load(Ordering::Acquire),
+                "push 应停在唤醒检查结束、真正入队之前"
+            );
+
+            let worker = scope.spawn(|| {
+                let _worker = sched.register_worker(0);
+                let found_while_searching = sched.find_work_or_park().is_some();
+                let found_after_wakeup = sched.pop().map(|ctx| ctx.handle);
+                (found_while_searching, found_after_wakeup)
+            });
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !sched.park_paused.load(Ordering::Acquire) && std::time::Instant::now() < deadline
+            {
+                std::hint::spin_loop();
+            }
+            assert!(
+                sched.park_paused.load(Ordering::Acquire),
+                "worker 应完成睡前最后一次扫描并停在 park 之前"
+            );
+            assert_eq!(sched.sleeping(), 1, "worker 应已登记为空闲");
+
+            sched.pause_before_place.store(false, Ordering::SeqCst);
+            pusher.join().unwrap();
+            sched.pause_before_park.store(false, Ordering::SeqCst);
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+            while sched.sleeping() != 0 && std::time::Instant::now() < deadline {
+                std::hint::spin_loop();
+            }
+            let woken_by_push = sched.sleeping() == 0;
+            let pending_while_stranded = sched.len();
+
+            // 失败时用公开的定时器兜底路径收拾线程，避免测试挂死。
+            if !woken_by_push {
+                assert_eq!(pending_while_stranded, 1, "worker 睡着时任务仍在运行队列");
+                sched.poke();
+            }
+            let (found_while_searching, found_after_wakeup) = worker.join().unwrap();
+
+            assert!(!found_while_searching, "入队前不可能提前取到任务");
+            assert_eq!(found_after_wakeup, Some(7), "worker 唤醒后任务应可取");
+            assert!(
+                woken_by_push,
+                "push 入队后没有叫醒在唤醒检查之后才睡下的 worker"
+            );
+        });
     }
 
     /// 多个 worker 边投递边取活：本地队列、injector 与窃取路径一起压，
