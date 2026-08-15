@@ -14,7 +14,8 @@
 
 use std::cell::{Ref, RefCell, RefMut};
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::task::Waker;
 
@@ -34,29 +35,118 @@ use crate::server::ServiceContext;
 /// 注意不要跨 `await` 持有借用守卫，否则同一服务的另一个任务访问同一 cell 时会 panic。
 pub struct SvcCell<T> {
     inner: RefCell<T>,
+    /// `RefCell` 的借用计数不是原子的；公开的 `Sync` 实现必须先把跨线程访问挡在
+    /// 它外面。运行时正常路径不会争用，误从两条线程同时访问时则当场 panic。
+    borrowed: AtomicBool,
 }
 
-// 安全性：见本模块开头的安全契约。同一时刻只有一个线程能碰到某个服务的状态，
-// 因此把 RefCell 视作 Sync 是成立的；跨任务的借用冲突仍由 RefCell 在运行期捕获。
+// 安全性：所有共享访问都先独占 `borrowed`，并由返回的守卫持有到借用结束，因此
+// `RefCell` 的非原子借用计数和内部的 `T` 永远不会被两条线程同时触碰。T 只需 Send，
+// 因为守卫刻意不允许并发共享读。
 unsafe impl<T: Send> Sync for SvcCell<T> {}
+
+struct BorrowLease<'a>(&'a AtomicBool);
+
+impl Drop for BorrowLease<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// [`SvcCell`] 的只读借用守卫。
+pub struct SvcRef<'a, T> {
+    inner: Ref<'a, T>,
+    _lease: BorrowLease<'a>,
+}
+
+impl<T> Deref for SvcRef<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for SvcRef<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+impl<T: fmt::Display> fmt::Display for SvcRef<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+/// [`SvcCell`] 的可变借用守卫。
+pub struct SvcRefMut<'a, T> {
+    inner: RefMut<'a, T>,
+    _lease: BorrowLease<'a>,
+}
+
+impl<T> Deref for SvcRefMut<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<T> DerefMut for SvcRefMut<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for SvcRefMut<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+impl<T: fmt::Display> fmt::Display for SvcRefMut<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.inner.fmt(f)
+    }
+}
 
 impl<T> SvcCell<T> {
     pub const fn new(value: T) -> Self {
         Self {
             inner: RefCell::new(value),
+            borrowed: AtomicBool::new(false),
         }
     }
 
-    pub fn borrow(&self) -> Ref<'_, T> {
-        self.inner.borrow()
+    fn lease(&self) -> BorrowLease<'_> {
+        assert!(
+            self.borrowed
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok(),
+            "SvcCell 已被借用，不能重入或从多条线程同时访问"
+        );
+        BorrowLease(&self.borrowed)
     }
 
-    pub fn borrow_mut(&self) -> RefMut<'_, T> {
-        self.inner.borrow_mut()
+    pub fn borrow(&self) -> SvcRef<'_, T> {
+        let lease = self.lease();
+        SvcRef {
+            inner: self.inner.borrow(),
+            _lease: lease,
+        }
+    }
+
+    pub fn borrow_mut(&self) -> SvcRefMut<'_, T> {
+        let lease = self.lease();
+        SvcRefMut {
+            inner: self.inner.borrow_mut(),
+            _lease: lease,
+        }
     }
 
     pub fn replace(&self, value: T) -> T {
-        self.inner.replace(value)
+        std::mem::replace(&mut *self.borrow_mut(), value)
     }
 
     pub fn get_mut(&mut self) -> &mut T {
@@ -70,11 +160,11 @@ impl<T> SvcCell<T> {
 
 impl<T: Copy> SvcCell<T> {
     pub fn get(&self) -> T {
-        *self.inner.borrow()
+        *self.borrow()
     }
 
     pub fn set(&self, value: T) {
-        *self.inner.borrow_mut() = value;
+        *self.borrow_mut() = value;
     }
 }
 
@@ -86,7 +176,7 @@ impl<T: Default> Default for SvcCell<T> {
 
 impl<T: fmt::Debug> fmt::Debug for SvcCell<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.inner.fmt(f)
+        self.borrow().fmt(f)
     }
 }
 
@@ -245,6 +335,24 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>(_: &T) {}
         let cell = Arc::new(SvcCell::new(String::from("x")));
         assert_send_sync(&cell);
+    }
+
+    #[test]
+    fn concurrent_access_is_rejected_before_touching_refcell() {
+        let cell = Arc::new(SvcCell::new(1u32));
+        let held = cell.borrow_mut();
+        let other = cell.clone();
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let conflict = std::thread::spawn(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| other.borrow_mut())).is_err()
+        })
+        .join()
+        .expect("测试线程不应逃逸 panic");
+        std::panic::set_hook(previous);
+        assert!(conflict, "跨线程借用必须在访问 RefCell 之前被拒绝");
+        drop(held);
+        assert_eq!(*cell.borrow(), 1);
     }
 
     #[test]

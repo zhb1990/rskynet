@@ -49,11 +49,16 @@ impl SessionTable {
     /// 分配一个新的 session 并登记为等待中。
     pub(crate) fn alloc(&self) -> i32 {
         let mut inner = self.inner.borrow_mut();
-        inner.next = inner.next.checked_add(1).unwrap_or(1);
-        let session = inner.next;
-        inner.slots.insert(session, Slot::Waiting(None));
-        self.active.fetch_add(1, Ordering::Relaxed);
-        session
+        for _ in 0..i32::MAX {
+            inner.next = inner.next.checked_add(1).unwrap_or(1);
+            let session = inner.next;
+            if let std::collections::hash_map::Entry::Vacant(slot) = inner.slots.entry(session) {
+                slot.insert(Slot::Waiting(None));
+                self.active.fetch_add(1, Ordering::Relaxed);
+                return session;
+            }
+        }
+        panic!("session 空间已耗尽")
     }
 
     /// 回包到达。返回 false 表示没人在等（迟到或已放弃），消息应当丢弃。
@@ -137,6 +142,15 @@ mod tests {
         let table = SessionTable::new();
         table.inner.borrow_mut().next = i32::MAX;
         assert_eq!(table.alloc(), 1, "溢出后应回到 1 而不是变成负数");
+    }
+
+    #[test]
+    fn session_wrap_skips_ids_that_are_still_live() {
+        let table = SessionTable::new();
+        assert_eq!(table.alloc(), 1);
+        table.inner.borrow_mut().next = i32::MAX;
+        assert_eq!(table.alloc(), 2, "回绕不能覆盖仍在等待的 session 1");
+        assert_eq!(table.pending(), 2);
     }
 
     /// 回包到达时唤醒等待者，取走后表项即销毁

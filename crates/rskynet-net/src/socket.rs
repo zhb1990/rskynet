@@ -147,8 +147,8 @@ pub(crate) struct Socket {
     pub(crate) send_waiters: VecDeque<Pending>,
     /// 域名解析出的其余地址。当前连接失败时按顺序继续尝试。
     pub(crate) connect_fallbacks: VecDeque<SocketAddr>,
-    /// 建连超时；切换到解析出的后备地址时继续沿用。
-    pub(crate) connect_timeout_ms: Option<u64>,
+    /// 整次建连的绝对截止时刻；切换到解析出的后备地址时继续沿用。
+    pub(crate) connect_deadline_ms: Option<u64>,
     pub(crate) stat: Stat,
 }
 
@@ -168,7 +168,7 @@ impl Socket {
             pending: None,
             send_waiters: VecDeque::new(),
             connect_fallbacks: VecDeque::new(),
-            connect_timeout_ms: None,
+            connect_deadline_ms: None,
             stat: Stat::default(),
         }
     }

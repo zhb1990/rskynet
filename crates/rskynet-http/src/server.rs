@@ -555,20 +555,20 @@ impl ServerBodyHandle {
         self.ensure_continue(ctx).await?;
         let started = ctx.now();
         loop {
-            let (answer, resume) = {
+            let (answer, resume, remove) = {
                 let mut state = self.core.state.borrow_mut();
                 let connection = state
                     .connections
                     .get_mut(&self.transport)
                     .ok_or(HttpError::BodyClosed)?;
-                let answer = if let Some(chunk) = connection.chunks.pop_front() {
-                    Some(Ok(Some(chunk)))
+                let (answer, remove) = if let Some(chunk) = connection.chunks.pop_front() {
+                    (Some(Ok(Some(chunk))), false)
                 } else if let Some(reason) = connection.error.clone() {
-                    Some(Err(HttpError::Transport(reason)))
+                    (Some(Err(HttpError::Transport(reason))), true)
                 } else if connection.body_ended {
-                    Some(Ok(None))
+                    (Some(Ok(None)), false)
                 } else {
-                    None
+                    (None, false)
                 };
                 let buffered =
                     connection.input.len() + connection.chunks.iter().map(Vec::len).sum::<usize>();
@@ -576,10 +576,13 @@ impl ServerBodyHandle {
                 if resume {
                     connection.paused = false;
                 }
-                (answer, resume)
+                (answer, resume, remove)
             };
             if resume {
                 self.transport.resume(ctx).await?;
+            }
+            if remove {
+                self.core.remove_connection(self.transport);
             }
             if let Some(answer) = answer {
                 return answer;
@@ -839,7 +842,14 @@ impl ServerCore {
             };
             connection.input.extend_from_slice(&data);
         }
-        let requests = self.process(transport)?;
+        let requests = match self.process(transport) {
+            Ok(requests) => requests,
+            Err(error) => {
+                transport.shutdown(ctx);
+                self.remove_connection(transport);
+                return Err(error);
+            }
+        };
         let pause = {
             let mut state = self.state.borrow_mut();
             let Some(connection) = state.connections.get_mut(&transport) else {
@@ -976,7 +986,17 @@ impl ServerCore {
                 return;
             }
         }
-        if let Some(connection) = self.state.borrow_mut().connections.get_mut(&transport) {
+        let idle = self
+            .state
+            .borrow()
+            .connections
+            .get(&transport)
+            .is_some_and(|connection| {
+                matches!(connection.proto, Some(ServerProto::RecvRequest(_)))
+            });
+        if idle {
+            self.remove_connection(transport);
+        } else if let Some(connection) = self.state.borrow_mut().connections.get_mut(&transport) {
             connection.error = Some(error.unwrap_or_else(|| "连接已关闭".into()));
             connection.body_ended = true;
         }

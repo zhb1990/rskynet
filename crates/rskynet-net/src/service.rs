@@ -445,9 +445,9 @@ impl NetService {
             };
             let waiting = socket.pending.take();
             let fallbacks = std::mem::take(&mut socket.connect_fallbacks);
-            let timeout_ms = socket.connect_timeout_ms;
+            let deadline_ms = socket.connect_deadline_ms;
             match failed {
-                Some(err) => Err((waiting, fallbacks, timeout_ms, format!("连接失败：{err}"))),
+                Some(err) => Err((waiting, fallbacks, deadline_ms, format!("连接失败：{err}"))),
                 None => {
                     socket.state = State::Connected;
                     match socket.apply(&self.registry) {
@@ -468,14 +468,14 @@ impl NetService {
                     reply(ctx, waiting, Answer::Id(id));
                 }
             }
-            Err((waiting, fallbacks, timeout_ms, reason)) => {
+            Err((waiting, fallbacks, deadline_ms, reason)) => {
                 // 压根没连上过，属主不必收「连接断了」——发起方那句 await 已经知道了
                 self.close(ctx, id, Farewell::Silent);
                 if let Some(waiting) = waiting {
                     if fallbacks.is_empty() {
                         reply(ctx, waiting, Answer::Failed(reason));
                     } else if let Some(answer) =
-                        self.do_connect_candidates(ctx, fallbacks, waiting, timeout_ms)
+                        self.do_connect_candidates(ctx, fallbacks, waiting, deadline_ms)
                     {
                         reply(ctx, waiting, answer);
                     }
@@ -711,7 +711,8 @@ impl NetService {
         waiting: Pending,
         timeout_ms: Option<u64>,
     ) -> Option<Answer> {
-        self.do_connect_candidates(ctx, VecDeque::from([addr]), waiting, timeout_ms)
+        let deadline_ms = timeout_ms.map(|timeout| ctx.now().saturating_add(timeout));
+        self.do_connect_candidates(ctx, VecDeque::from([addr]), waiting, deadline_ms)
     }
 
     /// 逐个尝试解析出的地址。非阻塞 connect 已经发出后，余下地址记在槽位里；
@@ -721,8 +722,11 @@ impl NetService {
         ctx: &Ctx,
         mut addrs: VecDeque<SocketAddr>,
         waiting: Pending,
-        timeout_ms: Option<u64>,
+        deadline_ms: Option<u64>,
     ) -> Option<Answer> {
+        if deadline_ms.is_some_and(|deadline| ctx.now() >= deadline) {
+            return Some(Answer::Failed("TCP 连接超时".to_string()));
+        }
         let mut last_error = None;
         while let Some(addr) = addrs.pop_front() {
             let stream = match TcpStream::connect(addr) {
@@ -741,7 +745,7 @@ impl NetService {
                 };
                 socket.pending = Some(waiting);
                 socket.connect_fallbacks = addrs;
-                socket.connect_timeout_ms = timeout_ms;
+                socket.connect_deadline_ms = deadline_ms;
                 let id = socket.id;
                 socket
                     .apply(&self.registry)
@@ -750,10 +754,10 @@ impl NetService {
             };
             return match started {
                 Ok(id) => {
-                    if let Some(timeout_ms) = timeout_ms {
+                    if let Some(deadline_ms) = deadline_ms {
                         let wake = ctx.clone();
                         ctx.spawn(async move {
-                            wake.sleep_ms(timeout_ms).await;
+                            wake.sleep_ms(deadline_ms.saturating_sub(wake.now())).await;
                             let _ = wake.send(
                                 NAME,
                                 MsgType::USER,
@@ -1111,7 +1115,8 @@ impl NetService {
         match then {
             Deferred::Listen => Some(self.do_listen(addr, waiting.source)),
             Deferred::Connect { timeout_ms } => {
-                self.do_connect_candidates(ctx, addrs.into(), waiting, timeout_ms)
+                let deadline_ms = timeout_ms.map(|timeout| ctx.now().saturating_add(timeout));
+                self.do_connect_candidates(ctx, addrs.into(), waiting, deadline_ms)
             }
             Deferred::Udp => Some(self.do_udp(addr, waiting.source)),
             Deferred::UdpConnect { id } => Some(self.do_udp_connect(id, addr)),

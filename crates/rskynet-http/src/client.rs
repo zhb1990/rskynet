@@ -1128,7 +1128,7 @@ impl HttpClientService {
     fn cancel(&self, ctx: &Ctx, id: u64, reason: &str) {
         let (transport, waiters) = {
             let mut state = self.state.borrow_mut();
-            let Some(exchange) = state.exchanges.get_mut(&id) else {
+            let Some(mut exchange) = state.exchanges.remove(&id) else {
                 return;
             };
             exchange.error = Some(reason.into());

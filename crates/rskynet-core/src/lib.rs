@@ -67,7 +67,7 @@ pub use message::{Addr, Message, MsgType, Payload};
 pub use module::{AutoService, Registry};
 pub use payload::{FromPayload, IntoPayload};
 pub use start::{Builder, Config, start};
-pub use task::SvcCell;
+pub use task::{SvcCell, SvcRef, SvcRefMut};
 
 /// 服务方法的返回类型。从本 crate 导出，使用方不必再直接依赖 `futures`。
 pub use futures_util::future::BoxFuture;
