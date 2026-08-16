@@ -550,6 +550,15 @@ impl ServiceContext {
     }
 }
 
+/// 一轮调度的结果：下一轮要跑谁，以及本轮刚刚让渡的是谁。
+///
+/// `next` 是 worker 热路径唯一关心的；`yielded` 只给 shutdown 的 `drain`
+/// 用来按真正发生 [`Ran::Yielded`] 的服务累计预算，避免把让渡记到下一轮服务头上。
+pub(crate) struct DispatchStep {
+    pub(crate) next: Option<Arc<ServiceContext>>,
+    pub(crate) yielded: Option<crate::Handle>,
+}
+
 /// 一轮 [`Node::run_service`] 的结局。
 pub(crate) enum Ran {
     /// 邮箱与就绪队列都空了，服务已经放生（状态落回 `IDLE`），调用方不再持有它。
@@ -1035,15 +1044,40 @@ impl Node {
         &self,
         hold: Option<Arc<ServiceContext>>,
     ) -> Option<Arc<ServiceContext>> {
+        self.dispatch_step(hold).next
+    }
+
+    /// shutdown 排空专用：除了下一轮服务，还带回本轮真正发生 [`Ran::Yielded`]
+    /// 的那个 handle，好让 `drain` 把预算记到正确的服务头上。
+    pub(crate) fn dispatch_for_drain(&self, hold: Option<Arc<ServiceContext>>) -> DispatchStep {
+        self.dispatch_step(hold)
+    }
+
+    fn dispatch_step(&self, hold: Option<Arc<ServiceContext>>) -> DispatchStep {
         let ctx = match hold {
             Some(ctx) => ctx,
-            None => self.sched.pop()?,
+            None => match self.sched.pop() {
+                Some(ctx) => ctx,
+                None => {
+                    return DispatchStep {
+                        next: None,
+                        yielded: None,
+                    };
+                }
+            },
         };
+
+        let handle = ctx.handle;
+
         match self.run_service(&ctx, true) {
             Ran::Dead => {
                 self.destroy(ctx);
-                self.sched.pop()
+                DispatchStep {
+                    next: self.sched.pop(),
+                    yielded: None,
+                }
             }
+
             Ran::Idle => {
                 // 放生的那一瞬间可能正好有人在 kill 它：对方的 notify 撞上我们
                 // 的「落回 IDLE」，于是谁都不会再把它推进运行队列，销毁也就没人
@@ -1051,16 +1085,29 @@ impl Node {
                 if ctx.is_dead() && ctx.mailbox.notify() {
                     self.sched.push(ctx);
                 }
-                self.sched.pop()
-            }
-            // 让渡：运行队列里还有别的服务在等，就把自己交回去
-            Ran::Yielded => match self.sched.pop() {
-                Some(next) => {
-                    self.sched.push(ctx);
-                    Some(next)
+
+                DispatchStep {
+                    next: self.sched.pop(),
+                    yielded: None,
                 }
-                None => Some(ctx),
-            },
+            }
+
+            // 让渡：运行队列里还有别的服务在等，就把自己交回去。
+            // `yielded` 必须是刚刚跑过的这个服务，而不是下一轮拿到的那个。
+            Ran::Yielded => {
+                let next = match self.sched.pop() {
+                    Some(next) => {
+                        self.sched.push(ctx);
+                        Some(next)
+                    }
+                    None => Some(ctx),
+                };
+
+                DispatchStep {
+                    next,
+                    yielded: Some(handle),
+                }
+            }
         }
     }
 
@@ -1698,6 +1745,73 @@ pub(crate) mod tests {
         assert!(
             matches!(node.run_service(&ctx, true), Ran::Yielded),
             "收工信号该把它换下来，而不是在里面转到天荒地老"
+        );
+    }
+
+    /// `dispatch` 让渡时必须同时报出「刚刚 Yielded 的是谁」：预算要记到
+    /// `run_service` 的那个服务头上，而不能拿返回的下一轮服务代替。
+    #[test]
+    fn dispatch_reports_the_service_that_actually_yielded() {
+        #[derive(Default)]
+        struct InfiniteFutureService;
+
+        impl Service for InfiniteFutureService {
+            fn init(self: Arc<Self>, ctx: Ctx, _args: String) -> BoxFuture<'static, Result<()>> {
+                Box::pin(async move {
+                    ctx.spawn(async move {
+                        std::future::poll_fn(|cx| {
+                            cx.waker().wake_by_ref();
+                            std::task::Poll::Pending
+                        })
+                        .await
+                    });
+
+                    Ok(())
+                })
+            }
+
+            fn dispatch(self: Arc<Self>, _ctx: Ctx, _msg: Message) -> BoxFuture<'static, ()> {
+                Box::pin(async {})
+            }
+        }
+
+        #[derive(Default)]
+        struct IdleService;
+
+        impl Service for IdleService {
+            fn init(self: Arc<Self>, _ctx: Ctx, _args: String) -> BoxFuture<'static, Result<()>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn dispatch(self: Arc<Self>, _ctx: Ctx, _msg: Message) -> BoxFuture<'static, ()> {
+                Box::pin(async {})
+            }
+        }
+
+        let registry = Registry::new()
+            .with("infinite", InfiniteFutureService::default)
+            .with("idle", IdleService::default);
+
+        let node = Node::new(&Config::default(), registry, Arc::new(StubTimer));
+
+        let infinite = node.new_service("infinite", "").unwrap().handle;
+
+        let idle = node.new_service("idle", "").unwrap().handle;
+
+        node.sched.set_quit();
+
+        let step = node.dispatch_for_drain(None);
+
+        assert_eq!(
+            step.yielded,
+            Some(infinite),
+            "预算必须记到真正发生 Yielded 的服务"
+        );
+
+        assert_eq!(
+            step.next.as_ref().map(|ctx| ctx.handle),
+            Some(idle),
+            "下一轮服务可以是另一个服务，不能拿它代替 yielded 服务"
         );
     }
 

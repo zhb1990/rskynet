@@ -42,9 +42,9 @@ use std::mem::MaybeUninit;
 use std::ops::{Deref, DerefMut};
 use std::ptr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 块内槽位占用的低 bit 数。当前最大块长 16，留 8 bit 已经足够，
 /// 而且让「generation << SLOT_BITS | slot」继续装进一个 AtomicU64。
@@ -234,12 +234,20 @@ impl<T> Block<T> {
                 }
             }
         }
-        // 成功的那一下必须是 Acquire：CAS 成功是 thief 对「这块归我」的最终确认，
-        // 与 grant() 里发布新边界的 Release store 配对。owner 在 grant 之前写好的
-        // 槽位（put 的写入、尾部的 Release 推进）都先于那道 Release，而两次 grant
-        // 之间的 takeover / reclaim / reduce_generation 与其它 thief 的 CAS 都是
-        // 同一条 release sequence 上的成员，因此成功 CAS 之后对槽位的读取一定能
-        // 看到对应世代的数据。失败时没有读取，Relaxed 即可。
+        // 成功的 CAS 必须是 Acquire：它是 thief 对「当前 steal_tail
+        // 仍属于自己看到的这一代/这一位置」的最终确认。
+        //
+        // 当当前位模式来自本轮 grant() 的 Release store 时，成功的
+        // Acquire CAS 与这次发布同步，因此 grant 之前完成的槽位写入
+        // 对 thief 可见。
+        //
+        // 如果物理块已经被 reclaim 到下一 generation，则 generation
+        // 已参与 steal_tail 的比较值，旧 thief 的 CAS 必然失败，因此
+        // 不会读取新世代槽位。
+        //
+        // takeover / reclaim / reduce_generation 本身不需要组成 release
+        // sequence；每一轮真正向 thief 发布可偷边界的同步点都是 grant()。
+        // 失败时没有读取，Relaxed 即可。
         if self
             .steal_tail
             .compare_exchange(spos, spos + 1, Ordering::Acquire, Ordering::Relaxed)
@@ -643,6 +651,55 @@ mod tests {
         assert_eq!(stealer.steal_front(), Some(2));
         assert_eq!(stealer.steal_front(), Some(3));
         assert!(stealer.steal_front().is_none(), "第二块还在 owner 手里");
+    }
+
+    /// 走完整 `push_back → advance_put_index → 物理块回绕 → next_generation
+    /// → reclaim → grant → steal_front` 路径：逻辑 sequence 跨过一整圈物理块后
+    /// generation 必须前进，新世代经 grant 发布后 thief 读到的是新数据。
+    #[test]
+    fn queue_wrap_publishes_next_generation_via_grant() {
+        let (owner, stealer) = queue::<u32>(4, 4);
+
+        // 第 0 圈：填满并 grant 物理块 0，再把它偷空，好让回绕时 reclaim(1) 成立。
+        for i in 0..5 {
+            unsafe { owner.push_back(i) }.expect("不该满");
+        }
+        assert_eq!(
+            std::iter::from_fn(|| stealer.steal_front()).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+
+        // 填满块 1/2/3；16 触发
+        // push_back → advance_put_index → next_generation = 4 >> 2 = 1 → reclaim(1)。
+        for i in 5..17 {
+            unsafe { owner.push_back(i) }.expect("不该满");
+        }
+
+        // 第 0 代剩下的已 grant 块必须先偷空，物理块 1 才对 generation 1 可写。
+        assert_eq!(
+            std::iter::from_fn(|| stealer.steal_front()).collect::<Vec<_>>(),
+            (4..16).collect::<Vec<_>>(),
+            "回绕前已 grant 的第 0 代数据应按逻辑顺序被偷走"
+        );
+
+        // 填满 generation 1 的物理块 0，再跨块把它 grant 出去。
+        for i in 17..20 {
+            assert_eq!(
+                unsafe { owner.push_back(i) }.expect("不该满"),
+                Pushed::Local
+            );
+        }
+        assert_eq!(
+            unsafe { owner.push_back(20) }.expect("不该满"),
+            Pushed::Granted,
+            "回绕后的物理块必须经 grant 才对 thief 可见"
+        );
+
+        assert_eq!(
+            std::iter::from_fn(|| stealer.steal_front()).collect::<Vec<_>>(),
+            vec![16, 17, 18, 19],
+            "thief 必须读到 generation 1 的新数据，而不是已经偷走的第 0 代"
+        );
     }
 
     /// 旧 generation 的 thief 即使落后到物理块已经复用，也绝不能读到新世代数据。

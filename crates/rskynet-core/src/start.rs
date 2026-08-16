@@ -436,17 +436,18 @@ fn monitor_loop(node: &Node, monitors: &[Arc<Monitor>], stop: mpsc::Receiver<()>
     }
 }
 
-/// 收尾排空时，同一个服务累计让渡多少轮即视为「排不完」，强制摘除。
+/// 收尾排空时，同一个服务实际发生多少次 `Ran::Yielded` 后仍未结束，
+/// 即视为「排不完」，强制摘除。
 ///
-/// 一轮 `dispatch` 最多干 64 件活（收工信号下每满 64 件让渡一次，见
-/// `Node::run_service` 的 `YIELD_INTERVAL`），所以预算对应约 `DRAIN_BUDGET × 64`
-/// 次 poll。任意 Future 都无法从外部判断它最终会不会完成——自唤醒任务可能 poll
-/// 256 次后才 Ready，也可能永远 Pending——因此只能用预算来兜底，而不是看「一个
-/// 轮次前后状态有没有变化」：后者会把合法的慢任务误判成死循环提前杀掉。
+/// `Node::run_service` 每处理满 `YIELD_INTERVAL` 件活才检查一次让渡；
+/// shutdown 时 `Scheduler::should_yield()` 因 quit 恒为 true，因此一个持续
+/// runnable 的服务每约 `YIELD_INTERVAL` 件活产生一次 `Ran::Yielded`。
 ///
-/// 预算按**服务累计**而不是按「连续让渡」记：排空时多个死循环服务会轮流出现在
-/// dispatch 的结果里，谁都不会连续让渡，但各自的总轮数照样在涨；只记连续轮数
-/// 的话它们就互相掩护，谁也到不了预算，收尾流程被永久挂住。
+/// 所以单个服务最多获得约
+/// `DRAIN_BUDGET × YIELD_INTERVAL` 件活的收尾机会。
+///
+/// 预算按服务累计，而不是按连续让渡累计：多个无限 runnable 服务即使互相
+/// 交替，每个服务自己的 Yielded 次数仍会独立增长，无法互相掩护。
 const DRAIN_BUDGET: usize = 4096;
 
 /// 在当前线程上把运行队列里剩下的活干完，用于启动失败或退出时的清理。
@@ -456,36 +457,46 @@ const DRAIN_BUDGET: usize = 4096;
 /// 线程执行」那条不变量。
 fn drain(node: &Node) {
     let mut hold: Option<Arc<crate::server::ServiceContext>> = None;
-    // 每个服务各自累计的让渡轮数，见 DRAIN_BUDGET 的说明：预算必须挂在服务上，
-    // 否则两个死循环服务交替出现时互相掩护，谁都到不了预算。
+
+    // 每个服务实际发生 Ran::Yielded 的累计次数。
     let mut budgets: HashMap<crate::Handle, usize> = HashMap::new();
+
     loop {
-        hold = node.dispatch(hold);
-        let Some(ctx) = &hold else {
-            return;
-        };
-        let count = budgets.entry(ctx.handle).or_insert(0);
-        *count += 1;
-        if *count < DRAIN_BUDGET {
-            continue;
+        let step = node.dispatch_for_drain(hold.take());
+        hold = step.next;
+
+        if let Some(handle) = step.yielded {
+            let exhausted = {
+                let count = budgets.entry(handle).or_insert(0);
+                *count += 1;
+                *count >= DRAIN_BUDGET
+            };
+
+            if exhausted {
+                // 此 handle 已决定强制摘除，不再保留预算记录。
+                budgets.remove(&handle);
+
+                // 服务可能已在别的生命周期路径中被摘除；
+                // grab 不到就说明无需重复处理。
+                if let Some(ctx) = node.handles.grab(handle) {
+                    node.log(
+                        0,
+                        format!(
+                            "error: 服务 :{:08x} ({}) \
+                             在收尾排空中累计让渡 {DRAIN_BUDGET} 轮仍未结束\
+                             （任务数 {}，邮箱长度 {}），强制摘除",
+                            ctx.handle,
+                            ctx.kind,
+                            ctx.task_count(),
+                            ctx.mailbox.len(),
+                        ),
+                    );
+
+                    node.retire(handle);
+                }
+            }
         }
-        // 预算耗尽：该服务累计让渡了 DRAIN_BUDGET 轮还没收工。这通常是服务里
-        // 挂着一个自唤醒的无限 Future——它的可观测状态（消息数、任务数）可能
-        // 一直不变，也可能一直在变，所以不能靠「状态有没有变化」判断，只能靠
-        // 预算强制结束，否则收尾流程会被它永久挂住。
-        node.log(
-            0,
-            format!(
-                "error: 服务 :{:08x} ({}) 在收尾排空中累计让渡 {DRAIN_BUDGET} 轮仍未结束（任务数 {}，邮箱长度 {}），强制摘除",
-                ctx.handle,
-                ctx.kind,
-                ctx.task_count(),
-                ctx.mailbox.len(),
-            ),
-        );
-        node.retire(ctx.handle);
-        budgets.remove(&ctx.handle);
-        hold = node.dispatch(hold.take());
+
         if hold.is_none() {
             return;
         }
