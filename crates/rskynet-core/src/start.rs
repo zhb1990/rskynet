@@ -170,7 +170,7 @@ impl Config {
 /// # use rskynet_core::{Builder, Config, Registry, Timer};
 /// # struct MyTimer;
 /// # impl Timer for MyTimer {
-/// #     fn timeout(&self, _handle: u32, _session: i32, _delay_ms: u32) {}
+/// #     fn timeout(&self, _handle: u32, _session: u64, _delay_ms: u32) {}
 /// #     fn now(&self) -> u64 { 0 }
 /// #     fn wall_clock(&self) -> u64 { 0 }
 /// #     fn start_time(&self) -> u64 { 0 }
@@ -273,6 +273,7 @@ fn run(
 
     // 各 worker 共享同一个不可变引用，&Node 是 Copy 的，每个闭包各拿一份
     let shared: &Node = &node;
+    let mut boot_panic: Option<Box<dyn Any + Send + 'static>> = None;
     let (boot_result, panic) = thread::scope(|scope| {
         let (stop_monitor, stopped) = mpsc::channel();
         let observed = &monitors;
@@ -291,7 +292,20 @@ fn run(
             );
         }
         // worker 已经在跑，下面同步等待 init 时，服务仍能处理 RPC、timer 与 IO 回包。
-        let boot_result = boot(&node, &config, &startup_services);
+        //
+        // boot 跑在主线程上，panic 不能直接穿过 scope 闭包：那样 Rust 会先隐式
+        // join 所有 scoped worker，而此刻还没人叫 quit，join 会永久卡住。
+        // 先接住 panic、叫醒所有 worker，等收尾完成后再重抛。
+        let boot_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            boot(&node, &config, &startup_services)
+        })) {
+            Ok(result) => result,
+            Err(payload) => {
+                boot_panic = Some(payload);
+                node.quit();
+                Err(Error::Service("启动过程发生 panic".into()))
+            }
+        };
         if boot_result.is_ok() {
             node.mark_booted();
         } else {
@@ -314,11 +328,23 @@ fn run(
     });
 
     // worker 收工了，在主线程上把尾收完
-    let panic = panic.or(shutdown(&node));
+    let shutdown_panic = shutdown(&node);
+    let panic = boot_panic.take().or(panic).or(shutdown_panic);
     if let Some(payload) = panic {
         std::panic::resume_unwind(payload);
     }
     boot_result
+}
+
+/// 给系统服务绑定约定名字。名字已被别的 handle 占用时启动失败；
+/// 若服务自己在 init 里已经注册过同一个名字，则视为成功。
+fn bind_system_name(node: &Arc<Node>, handle: u32, name: &str) -> Result<()> {
+    if node.handles.register_name(handle, name) || node.handles.find_name(name) == Some(handle) {
+        return Ok(());
+    }
+    Err(Error::Service(format!(
+        "系统服务 `{name}` 无法注册到 :{handle:08x}"
+    )))
 }
 
 /// 按配置依次拉起基础服务、可选启动项与 bootstrap。
@@ -329,7 +355,7 @@ fn boot(node: &Arc<Node>, config: &Config, startup_services: &[(String, String)]
         let logger = node.new_service(&kind, "")?;
         logger.init.wait()?;
         node.set_logger(logger.handle);
-        node.handles.register_name(logger.handle, service::LOGGER);
+        bind_system_name(node, logger.handle, service::LOGGER)?;
         // logger 不计入「服务数归零就退出」的判断，并且留到最后才送走，
         // 这样关停过程中产生的日志仍然写得出来
         node.reserve(logger.handle);
@@ -341,7 +367,7 @@ fn boot(node: &Arc<Node>, config: &Config, startup_services: &[(String, String)]
     if !kind.trim().is_empty() {
         let signal = node.new_service(&kind, "")?;
         signal.init.wait()?;
-        node.handles.register_name(signal.handle, service::SIGNAL);
+        bind_system_name(node, signal.handle, service::SIGNAL)?;
         node.reserve(signal.handle);
     }
 
@@ -352,7 +378,7 @@ fn boot(node: &Arc<Node>, config: &Config, startup_services: &[(String, String)]
     if !kind.trim().is_empty() {
         let timer = node.new_service(&kind, "")?;
         timer.init.wait()?;
-        node.handles.register_name(timer.handle, service::TIMER);
+        bind_system_name(node, timer.handle, service::TIMER)?;
         node.reserve(timer.handle);
     }
 
@@ -444,9 +470,47 @@ fn monitor_loop(node: &Node, monitors: &[Arc<Monitor>], stop: mpsc::Receiver<()>
 fn drain(node: &Node) {
     let mut hold = None;
     loop {
+        // 收工之后 `run_service` 每 64 件活就会因为 quit 让渡一次；对一个
+        // 自唤醒任务来说，dispatch 会永远返回同一个 service。记录本轮前后的
+        // 可观测进度，确认「没有别人在排队、且同一 service 没有处理任何消息、
+        // 任务数也没变化」时，就主动摘除它，避免收尾流程被一个自唤醒任务挂死。
+        let before = hold
+            .as_ref()
+            .map(|ctx: &Arc<crate::server::ServiceContext>| {
+                (
+                    ctx.handle,
+                    ctx.message_count(),
+                    ctx.mailbox.len(),
+                    ctx.task_count(),
+                )
+            });
         hold = node.dispatch(hold);
         if hold.is_none() {
             return;
+        }
+        let after = hold
+            .as_ref()
+            .map(|ctx: &Arc<crate::server::ServiceContext>| {
+                (
+                    ctx.handle,
+                    ctx.message_count(),
+                    ctx.mailbox.len(),
+                    ctx.task_count(),
+                )
+            });
+        let stalled = node.sched.is_quit()
+            && node.sched.len() == 0
+            && match (before, after) {
+                (Some(before), Some(after)) => before == after,
+                _ => false,
+            };
+        if stalled {
+            let ctx = hold.take().expect("上面已经确认仍持有 service");
+            node.retire(ctx.handle);
+            hold = node.dispatch(Some(ctx));
+            if hold.is_none() {
+                return;
+            }
         }
     }
 }
@@ -454,6 +518,130 @@ fn drain(node: &Node) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::BoxFuture;
+    use crate::context::{Ctx, Service};
+    use crate::message::Message;
+
+    /// init 里直接 panic 的服务：旧实现会让 `Builder::run` 永久卡在
+    /// `InitTicket::wait()`，现在应当被隔离成 `Error::Init`。
+    #[derive(Default)]
+    struct PanicInit;
+
+    impl Service for PanicInit {
+        fn init(self: Arc<Self>, _ctx: Ctx, _args: String) -> BoxFuture<'static, Result<()>> {
+            Box::pin(async { panic!("boom in init") })
+        }
+
+        fn dispatch(self: Arc<Self>, _ctx: Ctx, _msg: Message) -> BoxFuture<'static, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    /// 保留服务里挂一个自唤醒任务，用于验证 shutdown 的 drain 不会无限循环。
+    #[derive(Default)]
+    struct SelfWakeLogger;
+
+    impl Service for SelfWakeLogger {
+        fn init(self: Arc<Self>, ctx: Ctx, _args: String) -> BoxFuture<'static, Result<()>> {
+            Box::pin(async move {
+                ctx.spawn(async move {
+                    std::future::poll_fn(|cx| {
+                        cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    })
+                    .await
+                });
+                Ok(())
+            })
+        }
+
+        fn dispatch(self: Arc<Self>, _ctx: Ctx, _msg: Message) -> BoxFuture<'static, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    /// bootstrap 在 init 里 abort 全部业务服务，让节点快速进入 shutdown。
+    #[derive(Default)]
+    struct AbortBootstrap;
+
+    impl Service for AbortBootstrap {
+        fn init(self: Arc<Self>, ctx: Ctx, _args: String) -> BoxFuture<'static, Result<()>> {
+            Box::pin(async move {
+                ctx.abort();
+                Ok(())
+            })
+        }
+
+        fn dispatch(self: Arc<Self>, _ctx: Ctx, _msg: Message) -> BoxFuture<'static, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    #[test]
+    fn init_panic_is_contained_and_reported() {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = {
+            let mut registry = Registry::new();
+            registry.register("panic-init", PanicInit::default);
+            let config = Config::from_toml_str(
+                r#"
+                thread = 1
+
+                [logger]
+                name = "panic-init"
+
+                [signal]
+                name = ""
+
+                [timer]
+                name = ""
+
+                [bootstrap]
+                name = ""
+                "#,
+            )
+            .expect("配置应解析成功");
+            start(config, registry, Arc::new(crate::server::tests::StubTimer))
+        };
+        std::panic::set_hook(previous);
+
+        match result {
+            Err(Error::Init { kind, reason }) => {
+                assert_eq!(kind, "panic-init");
+                assert!(reason.contains("panic"), "原因应包含 panic：{reason}");
+            }
+            other => panic!("init panic 应当变成 Init 错误，实际是 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shutdown_drain_terminates_self_waking_reserved_service() {
+        let mut registry = Registry::new();
+        registry.register("self-wake-logger", SelfWakeLogger::default);
+        registry.register("bootstrap", AbortBootstrap::default);
+        let config = Config::from_toml_str(
+            r#"
+            thread = 1
+
+            [logger]
+            name = "self-wake-logger"
+
+            [signal]
+            name = ""
+
+            [timer]
+            name = ""
+            "#,
+        )
+        .expect("配置应解析成功");
+
+        let result = start(config, registry, Arc::new(crate::server::tests::StubTimer));
+        match result {
+            Err(Error::Init { kind, .. }) if kind == "bootstrap" => {}
+            other => panic!("abort 的 bootstrap 应当以 Init 错误结束，实际是 {other:?}"),
+        }
+    }
 
     #[test]
     fn monitor_stop_interrupts_the_wait_immediately() {

@@ -106,7 +106,7 @@ impl State {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Pending {
     pub(crate) source: u32,
-    pub(crate) session: i32,
+    pub(crate) session: u64,
 }
 
 impl Pending {

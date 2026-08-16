@@ -34,7 +34,7 @@ type Journal = Arc<Mutex<Vec<String>>>;
 struct StoppedClock;
 
 impl Timer for StoppedClock {
-    fn timeout(&self, _handle: u32, _session: i32, _delay_ms: u32) {}
+    fn timeout(&self, _handle: u32, _session: u64, _delay_ms: u32) {}
     fn now(&self) -> u64 {
         0
     }

@@ -37,7 +37,7 @@ use crate::module::Registry;
 use crate::mq::{Mailbox, Ready, Scheduler, Work};
 use crate::session::SessionTable;
 use crate::start::Config;
-use crate::task::TaskSet;
+use crate::task::{TaskId, TaskSet};
 
 /// 一次访问最多干多少件活，就回头看一眼运行队列里有没有别人在等。
 ///
@@ -272,6 +272,26 @@ impl ServiceContext {
         }
     }
 
+    /// 用户代码 panic 后的服务级善后：初始化票据必须完成，服务必须被摘除，
+    /// 所有还在等待的请求都要收到错误，随后由持有它的 worker/独占线程销毁。
+    ///
+    /// 调用方必须正持有本服务（`Running` 作用域内），这样 `Node::retire` 才会
+    /// 顺带执行 `fail_inflight`。
+    pub(crate) fn fail_after_panic(&self) {
+        if self.lifecycle.load(Ordering::Acquire) == lifecycle::INITIALIZING {
+            self.finish_init(Err("服务初始化期间 panic".into()));
+        } else {
+            self.lifecycle.store(lifecycle::FAILED, Ordering::Release);
+        }
+        self.node.log(
+            self.handle,
+            format!("error: 服务 `{}` 的用户代码 panic，已终止该服务", self.kind),
+        );
+        if !self.node.retire(self.handle) {
+            self.fail_inflight();
+        }
+    }
+
     fn take_pending(&self) -> Option<Message> {
         let mut pending = self.pending_messages.borrow_mut();
         let queue = pending.as_mut()?;
@@ -317,18 +337,20 @@ impl ServiceContext {
         }
         match &self.exclusive {
             None => self.node.sched.push(self.clone()),
-            Some(service) => {
-                self.unpark();
-                service.interrupt();
-            }
+            Some(_) => self.interrupt(),
         }
     }
 
     /// 无条件把独占线程从阻塞里敲出来，普通服务无事可做。节点收工时用它。
+    ///
+    /// `Exclusive::interrupt` 可能在任意投递线程上执行；它的 panic 不能让投递方
+    /// 线程死掉，所以这里吞掉并只做尽力唤醒。
     pub(crate) fn interrupt(&self) {
         if let Some(service) = &self.exclusive {
             self.unpark();
-            service.interrupt();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                service.interrupt();
+            }));
         }
     }
 
@@ -353,7 +375,7 @@ impl ServiceContext {
     }
 
     /// 唤醒服务内的某个任务，与消息投递走同一条「交给执行者」的路径。
-    pub(crate) fn wake_task(self: &Arc<Self>, task: usize) {
+    pub(crate) fn wake_task(self: &Arc<Self>, task: TaskId) {
         let queued = self.mailbox.push_ready(Ready::Task(task));
         self.wake(queued);
     }
@@ -370,9 +392,9 @@ impl ServiceContext {
     fn install_task(
         self: &Arc<Self>,
         future: BoxFuture<'static, ()>,
-        request: Option<(u32, i32)>,
+        request: Option<(u32, u64)>,
         source: u32,
-    ) -> usize {
+    ) -> TaskId {
         let task = self.tasks.insert(&self.me, future, request, source);
         self.wake_task(task);
         task
@@ -436,14 +458,49 @@ impl ServiceContext {
         let (source, session) = (msg.source, msg.session);
         let request = (session != 0 && source != 0).then_some((source, session));
         let ctx = Ctx::new(self.clone());
-        self.install_task(self.service.clone().dispatch(ctx, msg), request, source);
+        // `Service::dispatch` 是同步构造 future 的，手写实现可以在这里 panic。
+        // 在消息进入任务集之前单独隔离，保证当前请求方仍能收到错误回包。
+        let future = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.service.clone().dispatch(ctx.clone(), msg)
+        })) {
+            Ok(future) => future,
+            Err(_) => {
+                if let Some((source, session)) = request {
+                    let _ = self.node.send_raw(
+                        self.handle,
+                        source,
+                        MsgType::ERROR,
+                        session,
+                        Payload::None,
+                    );
+                }
+                self.fail_after_panic();
+                return;
+            }
+        };
+        self.install_task(future, request, source);
+    }
+
+    /// 执行一件用户代码可能 panic 的活。
+    ///
+    /// panic 被隔离在服务边界内：服务会转为 FAILED、初始化票据会完成、
+    /// in-flight 请求会收到错误，随后服务被摘除并交给当前线程销毁。
+    /// 调用方必须已经处于本服务的 `Running` 作用域。
+    fn run_work(self: &Arc<Self>, work: Work) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match work {
+            Work::Ready(Ready::Task(task)) => self.poll_task(task),
+            Work::Message(msg) => self.handle_message(msg),
+        }));
+        if result.is_err() {
+            self.fail_after_panic();
+        }
     }
 
     /// poll 一个就绪任务。
     ///
     /// Future 在 poll 期间被移出槽位，这样任务在 poll 中再 `spawn` 新任务也不会
     /// 撞上嵌套借用。
-    fn poll_task(&self, task: usize) {
+    fn poll_task(&self, task: TaskId) {
         let Some((mut future, waker, source)) = self.tasks.take(task) else {
             // 任务已完成，唤醒迟到了；Future 契约允许这种无害的多余唤醒
             return;
@@ -454,22 +511,36 @@ impl ServiceContext {
         let _monitored = crate::monitor::Running::enter(source, self.handle);
         let mut cx = std::task::Context::from_waker(&waker);
         let started = self.node.profile().then(std::time::Instant::now);
-        let result = future.as_mut().poll(&mut cx);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            future.as_mut().poll(&mut cx)
+        }));
         if let Some(started) = started {
             self.cpu_cost
                 .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         match result {
             // 任务正常跑完，它手上那个请求也就算办完了，不必再回错误
-            std::task::Poll::Ready(()) => self.tasks.remove(task),
-            std::task::Poll::Pending => self.tasks.restore(task, future),
-        }
-    }
-
-    /// 处理就绪队列里的一件活。
-    fn run_ready(self: &Arc<Self>, ready: Ready) {
-        match ready {
-            Ready::Task(task) => self.poll_task(task),
+            Ok(std::task::Poll::Ready(())) => self.tasks.remove(task),
+            Ok(std::task::Poll::Pending) => self.tasks.restore(task, future),
+            Err(_) => {
+                // 先把当前任务正在服务的请求摘出来并回错误；否则 remove 之后
+                // fail_inflight 就再也看不到这个请求了。
+                if let Some((source, session)) = self.tasks.remove_with_request(task) {
+                    let _ = self.node.send_raw(
+                        self.handle,
+                        source,
+                        MsgType::ERROR,
+                        session,
+                        Payload::None,
+                    );
+                }
+                // Future 的析构可能还会碰 session 表 / SvcCell，同样包一层，
+                // 避免一个坏掉的 Drop 把 worker 带崩。
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    drop(future);
+                }));
+                self.fail_after_panic();
+            }
         }
     }
 
@@ -684,7 +755,7 @@ impl Node {
         source: u32,
         dest: u32,
         mtype: MsgType,
-        session: i32,
+        session: u64,
         payload: Payload,
     ) -> Result<()> {
         let ctx = self.handles.grab(dest).ok_or(Error::NoService(dest))?;
@@ -697,6 +768,9 @@ impl Node {
     /// 初始化被当成服务自己的第一个任务：共享服务交给 worker，独占服务交给专属
     /// 线程。调用者只拿到等待票据，绝不在自己的线程上 poll 用户的 `init`。
     pub(crate) fn new_service(self: &Arc<Self>, kind: &str, args: &str) -> Result<NewService> {
+        if self.sched.is_quit() {
+            return Err(Error::Service("节点已经收工，不能再启动新服务".into()));
+        }
         let factory = self
             .modules
             .get(kind)
@@ -959,7 +1033,10 @@ impl Node {
         loop {
             if ctx.is_running() {
                 if let Some(msg) = ctx.take_pending() {
-                    ctx.handle_message(msg);
+                    ctx.run_work(Work::Message(msg));
+                    if ctx.is_dead() {
+                        return Ran::Dead;
+                    }
                     done += 1;
                     if preemptible && done >= YIELD_INTERVAL && self.sched.should_yield() {
                         return Ran::Yielded;
@@ -970,8 +1047,8 @@ impl Node {
             match ctx.mailbox.take_work() {
                 // 邮箱和就绪队列都空了，状态已落回 IDLE，服务就此放生
                 None => return Ran::Idle,
-                Some(Work::Ready(ready)) => ctx.run_ready(ready),
-                Some(Work::Message(msg)) => {
+                Some(work @ Work::Ready(_)) => ctx.run_work(work),
+                Some(work @ Work::Message(_)) => {
                     let overload = ctx.mailbox.take_overload();
                     if overload > 0 {
                         self.log(
@@ -979,7 +1056,7 @@ impl Node {
                             format!("error: 消息队列可能过载，长度 {overload}"),
                         );
                     }
-                    ctx.handle_message(msg);
+                    ctx.run_work(work);
                 }
             }
             if ctx.is_dead() {
@@ -1005,15 +1082,20 @@ impl Node {
     /// 日志），无上限地跟下去就退不出来了。
     pub(crate) fn drain_service(&self, ctx: &Arc<ServiceContext>) {
         let _running = Running::enter(ctx);
-        // 每条消息都会开一个任务，所以留够「一条消息一次 poll」的份额，另外
-        // 多给一点余量，好让 init 那种还没跑完的任务有机会收尾
-        let mut budget = ctx.mailbox.len() * 2 + 16;
+        // 每条消息都会开一个任务，所以留够「一条消息一次 poll」的份额；
+        // 已有任务也各自需要至少一次 poll。再给一点余量，好让 init 那种
+        // 还没跑完的任务有机会收尾。
+        let mut budget = ctx
+            .mailbox
+            .len()
+            .saturating_mul(2)
+            .saturating_add(ctx.task_count().saturating_mul(2))
+            .saturating_add(16);
         while budget > 0 {
             budget -= 1;
             match ctx.mailbox.take_work() {
                 None => return,
-                Some(Work::Ready(ready)) => ctx.run_ready(ready),
-                Some(Work::Message(msg)) => ctx.handle_message(msg),
+                Some(work) => ctx.run_work(work),
             }
         }
     }
@@ -1022,7 +1104,7 @@ impl Node {
     ///
     /// 零延迟不必惊动时间来源：直接回包，语义上等价于「本刻度就到期」，
     /// 也让 `ctx.yield_now()` 这条最常走的路少绕一圈。
-    pub(crate) fn timeout(&self, handle: u32, delay_ms: u32, session: i32) {
+    pub(crate) fn timeout(&self, handle: u32, delay_ms: u32, session: u64) {
         if delay_ms == 0 {
             let _ = self.send_raw(0, handle, MsgType::RESPONSE, session, Payload::None);
         } else {
@@ -1075,7 +1157,7 @@ pub(crate) mod tests {
     pub(crate) struct StubTimer;
 
     impl Timer for StubTimer {
-        fn timeout(&self, _handle: u32, _session: i32, _delay_ms: u32) {}
+        fn timeout(&self, _handle: u32, _session: u64, _delay_ms: u32) {}
 
         fn now(&self) -> u64 {
             0
@@ -1152,6 +1234,18 @@ pub(crate) mod tests {
         let node = test_node();
         let err = node.new_service("并不存在", "").expect_err("应失败");
         assert!(matches!(err, Error::UnknownService(_)));
+        assert_eq!(node.total(), 0);
+    }
+
+    /// 节点收工后不能再创建服务，否则 init ticket 永远不会被 worker 完成
+    #[test]
+    fn new_service_is_rejected_after_quit() {
+        let node = test_node();
+        node.sched.set_quit();
+        let err = node
+            .new_service("null", "")
+            .expect_err("收工后应拒绝创建服务");
+        assert!(matches!(err, Error::Service(_)));
         assert_eq!(node.total(), 0);
     }
 
@@ -1265,6 +1359,45 @@ pub(crate) mod tests {
             matches!(node.run_service(&ctx, true), Ran::Yielded),
             "收工信号该把它换下来，而不是在里面转到天荒地老"
         );
+    }
+
+    /// `Service::dispatch` 的同步构造路径 panic 也不能打死 worker。
+    #[test]
+    fn a_panicking_dispatch_is_contained() {
+        #[derive(Default)]
+        struct PanicDispatch;
+
+        impl Service for PanicDispatch {
+            fn dispatch(self: Arc<Self>, _ctx: Ctx, _msg: Message) -> BoxFuture<'static, ()> {
+                panic!("boom in dispatch")
+            }
+        }
+
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        {
+            let registry = Registry::new().with("panic-dispatch", PanicDispatch::default);
+            let node = Node::new(&Config::default(), registry, Arc::new(StubTimer));
+            let handle = node
+                .new_service("panic-dispatch", "")
+                .expect("应创建成功")
+                .handle;
+
+            // 先跑完 init，让服务进入 RUNNING
+            let ctx = node.sched.pop().expect("新服务应当排在运行队列里");
+            assert!(matches!(node.run_service(&ctx, true), Ran::Idle));
+
+            node.send_raw(0, handle, MsgType::USER, 0, Payload::None)
+                .expect("服务仍应存活");
+            let ctx = node.sched.pop().expect("消息应把服务重新排进队列");
+            assert!(
+                matches!(node.run_service(&ctx, true), Ran::Dead),
+                "dispatch panic 应被隔离并摘除服务"
+            );
+            assert!(node.dispatch(Some(ctx)).is_none());
+            assert_eq!(node.total(), 0, "服务应被正常销毁");
+        }
+        std::panic::set_hook(previous);
     }
 
     /// 独占服务不进运行队列，它自带一条线程；摘除之后那条线程要自己收工

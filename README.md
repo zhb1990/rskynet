@@ -697,7 +697,7 @@ ping 完成 10 次 Protobuf request/reply 后会请求 pong 关闭，两个示�
 
 ```rust
 pub trait Timer: Send + Sync + 'static {
-    fn timeout(&self, handle: u32, session: i32, delay_ms: u32);
+    fn timeout(&self, handle: u32, session: u64, delay_ms: u32);
     fn now(&self) -> u64;
     fn wall_clock(&self) -> u64;
     fn start_time(&self) -> u64;

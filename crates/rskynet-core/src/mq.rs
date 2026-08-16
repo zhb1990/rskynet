@@ -47,6 +47,7 @@ use std::thread::{self, Thread};
 use crate::bwos::{self, CachePad, Owner, Stealer};
 use crate::message::Message;
 use crate::server::ServiceContext;
+use crate::task::TaskId;
 use arc_swap::ArcSwapOption;
 use crossbeam_queue::SegQueue;
 
@@ -56,7 +57,7 @@ pub(crate) const OVERLOAD_THRESHOLD: usize = 1024;
 /// 就绪队列里的一件活。
 pub(crate) enum Ready {
     /// 服务内某个任务被唤醒了，去 poll 它。
-    Task(usize),
+    Task(TaskId),
 }
 
 /// 一次调度取到的活儿：要么是一条新消息，要么是就绪队列里的一件活。
@@ -174,8 +175,7 @@ impl Mailbox {
                 Err(state::NOTIFIED) => self.state.store(state::RUNNING, Ordering::Release),
                 Err(other) => {
                     // 走到这里说明有人在服务不属于自己的时候调了 take_work
-                    debug_assert!(false, "取活时的邮箱状态不该是 {other}");
-                    return None;
+                    panic!("取活时的邮箱状态不该是 {other}");
                 }
             }
         }
@@ -227,8 +227,7 @@ impl Mailbox {
                 false
             }
             Err(other) => {
-                debug_assert!(false, "放生时的邮箱状态不该是 {other}");
-                true
+                panic!("放生时的邮箱状态不该是 {other}");
             }
         }
     }
@@ -493,7 +492,7 @@ impl Scheduler {
     pub(crate) fn push(&self, ctx: Arc<ServiceContext>) {
         // 独占服务的执行者是它自己那条线程，进了运行队列就等于允许两条线程同时
         // 执行同一个服务——那条不变量是 SvcCell 的立身之本，这里守一道
-        debug_assert!(!ctx.is_exclusive(), "独占服务不该进运行队列");
+        assert!(!ctx.is_exclusive(), "独占服务不该进运行队列");
         // 顺序要紧：先宣告「我在队列里」再真的入队。反过来的话，别的 worker 可能
         // 已经把它取走并置成 RUNNING，我们这一记 store 就把它标成了「在队列里，
         // 实际谁也没拿着」，这个服务从此不会再被唤醒。
@@ -864,7 +863,7 @@ mod tests {
     use crate::server::tests::{dummy_context_on, test_node_with};
     use crate::start::Config;
 
-    fn message(session: i32) -> Message {
+    fn message(session: u64) -> Message {
         Message::new(1, session, MsgType::USER, Payload::None)
     }
 
@@ -931,9 +930,13 @@ mod tests {
     fn ready_tasks_come_before_messages() {
         let mailbox = running_mailbox();
         mailbox.push_message(message(1));
-        mailbox.push_ready(Ready::Task(7));
+        let task = TaskId {
+            index: 7,
+            generation: 1,
+        };
+        mailbox.push_ready(Ready::Task(task));
         match mailbox.take_work() {
-            Some(Work::Ready(Ready::Task(id))) => assert_eq!(id, 7),
+            Some(Work::Ready(Ready::Task(id))) => assert_eq!(id, task),
             other => panic!("应先取到就绪任务，实际是 {:?}", other.is_some()),
         }
         assert!(matches!(mailbox.take_work(), Some(Work::Message(_))));
@@ -944,7 +947,7 @@ mod tests {
     fn overload_threshold_doubles() {
         let mailbox = running_mailbox();
         for i in 0..(OVERLOAD_THRESHOLD * 2 + 2) {
-            mailbox.push_message(message(i as i32));
+            mailbox.push_message(message(i as u64));
         }
         // 弹出一条后剩余长度超过 1024，触发一次报警，阈值抬到 2048
         mailbox.take_work();
@@ -958,7 +961,7 @@ mod tests {
         while mailbox.take_work().is_some() {}
         mailbox.mark_running();
         for i in 0..(OVERLOAD_THRESHOLD + 2) {
-            mailbox.push_message(message(i as i32));
+            mailbox.push_message(message(i as u64));
         }
         mailbox.take_work();
         assert_eq!(mailbox.take_overload(), OVERLOAD_THRESHOLD + 1);
@@ -970,7 +973,10 @@ mod tests {
         let mailbox = running_mailbox();
         mailbox.push_message(message(1));
         mailbox.push_message(message(2));
-        mailbox.push_ready(Ready::Task(3));
+        mailbox.push_ready(Ready::Task(TaskId {
+            index: 3,
+            generation: 1,
+        }));
         let left = mailbox.drain();
         assert_eq!(left.len(), 2);
         assert_eq!(mailbox.len(), 0, "长度计数要跟着清干净");
@@ -981,7 +987,7 @@ mod tests {
     #[test]
     fn concurrent_push_and_take_lose_nothing() {
         const SENDERS: usize = 4;
-        const PER_SENDER: i32 = 5_000;
+        const PER_SENDER: usize = 5_000;
 
         let mailbox = Mailbox::new();
         // 用一个布尔量冒充运行队列：true 表示这个服务正排在里面等人来取
@@ -992,14 +998,14 @@ mod tests {
             for _ in 0..SENDERS {
                 scope.spawn(|| {
                     for i in 0..PER_SENDER {
-                        if mailbox.push_message(message(i)) {
+                        if mailbox.push_message(message(i as u64)) {
                             queued.store(true, Ordering::Release);
                         }
                     }
                 });
             }
 
-            let total = SENDERS * PER_SENDER as usize;
+            let total = SENDERS * PER_SENDER;
             while taken < total {
                 // 取走服务这一步与真实的 Scheduler::pop 一致：先出队，再置 RUNNING
                 if !queued.swap(false, Ordering::AcqRel) {
@@ -1013,7 +1019,7 @@ mod tests {
             }
         });
 
-        assert_eq!(taken, SENDERS * PER_SENDER as usize, "一条都不该丢");
+        assert_eq!(taken, SENDERS * PER_SENDER, "一条都不该丢");
         assert_eq!(mailbox.len(), 0);
     }
 

@@ -152,8 +152,19 @@ impl HandleStorage {
     }
 
     /// 注册本地名字。与 C 版一致，名字已被占用时返回 false（不覆盖）。
+    ///
+    /// 只允许给仍活着的 handle 起名：`alloc` 锁同时序列化了 `retire`，因此这里
+    /// 检查槽位后，直到名字表更新完成都不会有并发摘除。
     pub(crate) fn register_name(&self, handle: u32, name: &str) -> bool {
         let _writer = self.alloc.lock();
+        let slots = self.slots.load();
+        let hash = (handle as usize) & (slots.len() - 1);
+        if !slots[hash]
+            .load_full()
+            .is_some_and(|ctx| ctx.handle == handle)
+        {
+            return false;
+        }
         let names = self.names.load();
         if names.contains_key(name) {
             return false;
@@ -218,5 +229,15 @@ mod tests {
         assert!(storage.retire(handle).is_none());
         assert!(storage.grab(handle).is_none());
         assert_eq!(storage.find_name("logger"), None);
+    }
+
+    /// 已摘除的 handle 不能再注册名字，避免产生永远指向死服务的 ghost name
+    #[test]
+    fn dead_handle_cannot_register_names() {
+        let storage = HandleStorage::new();
+        let handle = storage.register_with(dummy_context).handle;
+        assert!(storage.retire(handle).is_some());
+        assert!(!storage.register_name(handle, "ghost"));
+        assert_eq!(storage.find_name("ghost"), None);
     }
 }

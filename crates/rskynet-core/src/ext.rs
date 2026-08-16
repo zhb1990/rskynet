@@ -87,7 +87,7 @@ impl NodeRef {
         source: u32,
         dest: u32,
         mtype: MsgType,
-        session: i32,
+        session: u64,
         payload: Payload,
     ) -> Result<()> {
         self.node.send_raw(source, dest, mtype, session, payload)
@@ -282,11 +282,11 @@ pub struct ReplyToken {
     node: Arc<Node>,
     dest: u32,
     /// 回过话就置 0，兼作「已完成」标记，好让析构时不再补发。
-    session: i32,
+    session: u64,
 }
 
 impl ReplyToken {
-    pub(crate) fn new(node: Arc<Node>, dest: u32, session: i32) -> Self {
+    pub(crate) fn new(node: Arc<Node>, dest: u32, session: u64) -> Self {
         Self {
             node,
             dest,

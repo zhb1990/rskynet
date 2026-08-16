@@ -118,6 +118,27 @@ pub(crate) fn exclusive_loop(ctx: Arc<ServiceContext>, service: Arc<dyn Exclusiv
     // 必须在任何一次挂起之前登记，见 [`Idler`] 的说明
     ctx.bind_thread();
     let node = ctx.node.clone();
+
+    // idle / dispatch / drain / destroy 中的 panic 都收在这里。with_ownership
+    // 把整个善后路径都罩在「本服务持有者」作用域内，`fail_after_panic` 才能
+    // 当场给 in-flight 请求回错误。
+    ctx.with_ownership(|| {
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            exclusive_loop_inner(&ctx, &service, &node);
+        }));
+        if panic.is_err() {
+            ctx.fail_after_panic();
+            ctx.mailbox.mark_running();
+            node.destroy(&ctx);
+        }
+    });
+}
+
+fn exclusive_loop_inner(
+    ctx: &Arc<ServiceContext>,
+    service: &Arc<dyn Exclusive>,
+    node: &crate::server::Node,
+) {
     let idler = Idler::new(ctx.clone());
     let cx = Ctx::new(ctx.clone());
 
@@ -126,7 +147,7 @@ pub(crate) fn exclusive_loop(ctx: Arc<ServiceContext>, service: Arc<dyn Exclusiv
         // 要么已经把状态推成 QUEUED（那也是给本线程看的），要么随后压进来的活
         // 会把状态推成 NOTIFIED，被 take_work 的重扫接住
         ctx.mailbox.mark_running();
-        if node.run_service(&ctx, false).is_dead() || ctx.is_dead() {
+        if node.run_service(ctx, false).is_dead() || ctx.is_dead() {
             break;
         }
         ctx.with_ownership(|| service.idle(&cx, &idler));
@@ -136,7 +157,7 @@ pub(crate) fn exclusive_loop(ctx: Arc<ServiceContext>, service: Arc<dyn Exclusiv
     // worker 完全一样的销毁流程。`mark_running` 是因为排空那一步会把状态放回
     // IDLE，而销毁的最后一步要从 RUNNING 放生
     ctx.mailbox.mark_running();
-    node.drain_service(&ctx);
+    node.drain_service(ctx);
     ctx.mailbox.mark_running();
-    node.destroy(&ctx);
+    node.destroy(ctx);
 }

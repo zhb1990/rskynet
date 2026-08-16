@@ -19,7 +19,7 @@ const TIME_LEVEL_MASK: u32 = TIME_LEVEL as u32 - 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TimerEvent {
     pub(crate) handle: u32,
-    pub(crate) session: i32,
+    pub(crate) session: u64,
     pub(crate) expire: u32,
 }
 
@@ -128,7 +128,7 @@ mod tests {
     }
 
     /// 挂一个 ticks 个刻度之后到期的定时器
-    fn arm(wheel: &mut Wheel, session: i32, ticks: u32) {
+    fn arm(wheel: &mut Wheel, session: u64, ticks: u32) {
         let expire = wheel.time.wrapping_add(ticks);
         wheel.add(TimerEvent {
             handle: 1,

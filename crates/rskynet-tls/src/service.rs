@@ -18,7 +18,7 @@ use crate::identity::ServerTlsConfig;
 #[derive(Clone, Copy)]
 struct Pending {
     source: u32,
-    session: i32,
+    session: u64,
 }
 
 struct Listener {

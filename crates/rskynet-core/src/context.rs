@@ -113,20 +113,17 @@ impl Ctx {
         self.inner.assert_ownership();
         let dest = self.resolve(dest)?;
         let session = self.inner.sessions.alloc();
-        if let Err(err) = self
-            .inner
-            .node
-            .send_raw(self.handle(), dest, mtype, session, payload)
-        {
-            self.inner.sessions.abandon(session);
-            return Err(err);
-        }
-        Call {
+        let call = Call {
             ctx: &self.inner,
             session,
             finished: false,
-        }
-        .await
+        };
+        // 先建 Call 再发送：发送失败或 send_raw 意外 panic 时，Call 的 Drop
+        // 都会注销 session，不会在表里留下孤儿。
+        self.inner
+            .node
+            .send_raw(self.handle(), dest, mtype, session, payload)?;
+        call.await
     }
 
     /// `call` 的 `MsgType::USER` 快捷写法。
@@ -158,17 +155,18 @@ impl Ctx {
     {
         self.inner.assert_ownership();
         let session = self.inner.sessions.alloc();
+        let call = Call {
+            ctx: &self.inner,
+            session,
+            finished: false,
+        };
+        // Call 在 f 之前建立：f panic 时 Drop 会注销 session。
         f(ReplyToken::new(
             self.inner.node.clone(),
             self.handle(),
             session,
         ));
-        Call {
-            ctx: &self.inner,
-            session,
-            finished: false,
-        }
-        .await
+        call.await
     }
 
     /// 应答一条请求，对照 `skynet.ret`。
@@ -222,13 +220,14 @@ impl Ctx {
     pub async fn sleep(&self, millis: u32) {
         self.inner.assert_ownership();
         let session = self.inner.sessions.alloc();
-        self.inner.node.timeout(self.handle(), millis, session);
-        let _ = Call {
+        let call = Call {
             ctx: &self.inner,
             session,
             finished: false,
-        }
-        .await;
+        };
+        // Timer::timeout 由外部实现，panic 时同样不能留下孤儿 session。
+        self.inner.node.timeout(self.handle(), millis, session);
+        let _ = call.await;
     }
 
     /// 按毫秒挂起，超过 `u32` 可表达范围时饱和到最大值。
@@ -319,11 +318,11 @@ impl std::fmt::Debug for Ctx {
 /// 等一个 session 的回包。
 ///
 /// 对照 skynet 里 `session_id_coroutine[session] = co` 之后的那次 `coroutine.yield`。
-/// 被取消（外层任务提前销毁）时在 Drop 里注销 session，迟到的回包会被直接丢弃，
-/// 对应 skynet 把表项置成 `false` 的做法。
+/// 被取消（外层任务提前销毁）时在 Drop 里直接注销 session；session 是 u64
+/// 单调编号，迟到回包只会查无此号并被丢弃。
 struct Call<'a> {
     ctx: &'a ServiceContext,
-    session: i32,
+    session: u64,
     finished: bool,
 }
 

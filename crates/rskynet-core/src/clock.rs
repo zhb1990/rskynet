@@ -16,7 +16,7 @@ pub trait Timer: Send + Sync + 'static {
     /// 到期时由实现方给 `handle` 投一条 `RESPONSE`（`session` 与请求配对），
     /// 走 [`crate::NodeRef::send`] 那条路。`delay_ms` 为 0 的情形内核直接回包，
     /// 不会走到这里。
-    fn timeout(&self, handle: u32, session: i32, delay_ms: u32);
+    fn timeout(&self, handle: u32, session: u64, delay_ms: u32);
 
     /// 节点启动至今的毫秒数，对照 `skynet_now`。
     fn now(&self) -> u64;

@@ -15,7 +15,7 @@
 use std::cell::{Ref, RefCell, RefMut};
 use std::fmt;
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::task::Waker;
 
@@ -180,17 +180,28 @@ impl<T: fmt::Debug> fmt::Debug for SvcCell<T> {
     }
 }
 
+/// 服务内任务的身份：slab 槽位号加一个单调 generation。
+///
+/// 槽位号在任务删除后会被 slab 复用；generation 让扣在外部很久的旧 Waker
+/// 只能唤醒它出生时的那个任务，不会误唤醒后来复用同一槽位的新任务。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TaskId {
+    pub(crate) index: usize,
+    pub(crate) generation: u64,
+}
+
 /// 服务内的一个任务，相当于 skynet 里的一个协程。
 struct TaskSlot {
     /// poll 期间会被取走，避免任务在 poll 中再 spawn 新任务时形成嵌套借用。
     future: Option<BoxFuture<'static, ()>>,
     waker: Waker,
+    generation: u64,
     /// 这个任务正在处理谁的请求：(请求方, session)。
     ///
     /// 服务半途退出时要给这些请求方回一个错误，否则对方的 `call` 永远挂着；
     /// 对照 `lualib/skynet.lua` 里 `skynet.exit` 遍历 `session_coroutine_id` 的那段。
     /// 记在任务槽里而不是另开一张表，是因为它的生命周期与任务严丝合缝。
-    request: Option<(u32, i32)>,
+    request: Option<(u32, u64)>,
     /// 最初开出这个任务的消息来源，给 worker monitor 报告死循环用。
     source: u32,
 }
@@ -201,7 +212,7 @@ struct TaskSlot {
 /// 不该因此吊住整个服务的生命周期。
 struct TaskWaker {
     ctx: Weak<ServiceContext>,
-    task: usize,
+    task: TaskId,
 }
 
 impl ArcWake for TaskWaker {
@@ -218,6 +229,8 @@ impl ArcWake for TaskWaker {
 /// 上，加锁只是白付代价。外部线程不能直接调用 `Ctx::spawn`，只能通过邮箱投消息。
 pub(crate) struct TaskSet {
     slots: SvcCell<Slab<TaskSlot>>,
+    /// 任务 generation 来源。只有持有者会改，原子量只是为了凑 Sync。
+    next_generation: AtomicU64,
     /// 任务数。只有持有者会改，但 `NodeRef::service_stats` 允许别的线程看一眼，
     /// 所以单独记一个原子量，免得为了读个数字就得去借 cell。
     count: AtomicUsize,
@@ -227,6 +240,7 @@ impl TaskSet {
     pub(crate) fn new() -> Self {
         Self {
             slots: SvcCell::new(Slab::new()),
+            next_generation: AtomicU64::new(0),
             count: AtomicUsize::new(0),
         }
     }
@@ -236,12 +250,16 @@ impl TaskSet {
         &self,
         owner: &Weak<ServiceContext>,
         future: BoxFuture<'static, ()>,
-        request: Option<(u32, i32)>,
+        request: Option<(u32, u64)>,
         source: u32,
-    ) -> usize {
+    ) -> TaskId {
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
         let mut slots = self.slots.borrow_mut();
         let entry = slots.vacant_entry();
-        let task = entry.key();
+        let task = TaskId {
+            index: entry.key(),
+            generation,
+        };
         let waker = waker(Arc::new(TaskWaker {
             ctx: owner.clone(),
             task,
@@ -249,6 +267,7 @@ impl TaskSet {
         entry.insert(TaskSlot {
             future: Some(future),
             waker,
+            generation,
             request,
             source,
         });
@@ -256,27 +275,52 @@ impl TaskSet {
         task
     }
 
-    /// 取出任务准备 poll。任务已完成或正被 poll 时返回 `None`。
-    pub(crate) fn take(&self, task: usize) -> Option<(BoxFuture<'static, ()>, Waker, u32)> {
+    /// 取出任务准备 poll。任务已完成、generation 不匹配或正被 poll 时返回 `None`。
+    pub(crate) fn take(&self, task: TaskId) -> Option<(BoxFuture<'static, ()>, Waker, u32)> {
         let mut slots = self.slots.borrow_mut();
-        let slot = slots.get_mut(task)?;
+        let slot = slots.get_mut(task.index)?;
+        if slot.generation != task.generation {
+            return None;
+        }
         let future = slot.future.take()?;
         Some((future, slot.waker.clone(), slot.source))
     }
 
     /// poll 返回 `Pending`，把 Future 放回原槽位。
-    pub(crate) fn restore(&self, task: usize, future: BoxFuture<'static, ()>) {
-        if let Some(slot) = self.slots.borrow_mut().get_mut(task) {
-            slot.future = Some(future);
+    pub(crate) fn restore(&self, task: TaskId, future: BoxFuture<'static, ()>) {
+        let mut slots = self.slots.borrow_mut();
+        let Some(slot) = slots.get_mut(task.index) else {
+            drop(future);
+            return;
+        };
+        if slot.generation != task.generation {
+            drop(future);
+            return;
         }
+        slot.future = Some(future);
     }
 
-    pub(crate) fn remove(&self, task: usize) {
+    pub(crate) fn remove(&self, task: TaskId) {
+        let _ = self.remove_with_request(task);
+    }
+
+    /// 删除任务并返回它仍在处理的请求。panic 善后路径用它给当前请求方回错误。
+    pub(crate) fn remove_with_request(&self, task: TaskId) -> Option<(u32, u64)> {
         let mut slots = self.slots.borrow_mut();
-        if slots.contains(task) {
-            slots.remove(task);
+        if !slots
+            .get(task.index)
+            .is_some_and(|slot| slot.generation == task.generation)
+        {
+            return None;
         }
+        let request = slots
+            .get_mut(task.index)
+            .expect("刚刚确认过槽位存在")
+            .request
+            .take();
+        slots.remove(task.index);
         self.count.store(slots.len(), Ordering::Relaxed);
+        request
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -284,7 +328,7 @@ impl TaskSet {
     }
 
     /// 摘走所有「正在处理中的请求」，摘过就不会再报一遍。
-    pub(crate) fn take_requests(&self) -> Vec<(u32, i32)> {
+    pub(crate) fn take_requests(&self) -> Vec<(u32, u64)> {
         self.slots
             .borrow_mut()
             .iter_mut()
@@ -362,5 +406,25 @@ mod tests {
         let task = tasks.insert(&owner, Box::pin(async {}), None, 0x1234);
         let (_, _, source) = tasks.take(task).expect("任务应当存在");
         assert_eq!(source, 0x1234);
+    }
+
+    #[test]
+    fn stale_task_id_cannot_wake_a_reused_slot() {
+        let tasks = TaskSet::new();
+        let owner = Weak::<ServiceContext>::new();
+
+        let first = tasks.insert(&owner, Box::pin(async {}), None, 0);
+        let _ = tasks.take(first).expect("第一个任务应当存在");
+        tasks.remove(first);
+
+        let second = tasks.insert(&owner, Box::pin(async {}), None, 0);
+        assert_eq!(first.index, second.index, "slab 确实复用了槽位");
+        assert_ne!(first.generation, second.generation, "generation 必须变化");
+
+        assert!(
+            tasks.take(first).is_none(),
+            "旧 id 不能取走复用槽位上的新任务"
+        );
+        assert!(tasks.take(second).is_some(), "新 id 应当正常取到自己的任务");
     }
 }

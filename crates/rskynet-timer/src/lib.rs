@@ -116,7 +116,7 @@ impl WheelTimer {
 impl Timer for WheelTimer {
     /// 只是排进队列，真正插轮子由定时器服务在下一个 tick 做。到期时刻按当前刻度
     /// 算好带上，所以延后插入不会让定时器变长。
-    fn timeout(&self, handle: u32, session: i32, delay_ms: u32) {
+    fn timeout(&self, handle: u32, session: u64, delay_ms: u32) {
         // 时间轮内部仍是 10ms 一格。先算绝对毫秒截止时间再向上取整，避免在当前
         // 刻度已经走过一部分时把延迟截短。
         let deadline_ms = self.now().saturating_add(u64::from(delay_ms));

@@ -34,7 +34,7 @@ enum Command {
     ContinueTimeout(u64),
     WaitTimeout {
         id: u64,
-        session: i32,
+        session: u64,
         body: bool,
     },
     IdleTimeout {
@@ -109,7 +109,7 @@ impl Origin {
 #[derive(Debug, Clone, Copy)]
 struct Pending {
     source: u32,
-    session: i32,
+    session: u64,
 }
 
 enum Proto {
@@ -747,7 +747,7 @@ impl HttpClientService {
         }
     }
 
-    fn arm_wait_timeout(&self, ctx: &Ctx, id: u64, session: i32, body: bool, timeout: u64) {
+    fn arm_wait_timeout(&self, ctx: &Ctx, id: u64, session: u64, body: bool, timeout: u64) {
         let wake = ctx.clone();
         ctx.spawn(async move {
             wake.sleep_ms(timeout).await;
@@ -759,7 +759,7 @@ impl HttpClientService {
         });
     }
 
-    fn wait_timeout(&self, ctx: &Ctx, id: u64, session: i32, body: bool) {
+    fn wait_timeout(&self, ctx: &Ctx, id: u64, session: u64, body: bool) {
         let pending = {
             let mut state = self.state.borrow_mut();
             let Some(exchange) = state.exchanges.get_mut(&id) else {

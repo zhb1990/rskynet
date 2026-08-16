@@ -157,13 +157,13 @@ pub struct Message {
     /// 发送方 handle，0 表示来自内核（定时器等）。
     pub source: u32,
     /// 会话号。请求方分配的正数，应答时原样带回；0 表示不需要应答。
-    pub session: i32,
+    pub session: u64,
     pub mtype: MsgType,
     pub payload: Payload,
 }
 
 impl Message {
-    pub fn new(source: u32, session: i32, mtype: MsgType, payload: Payload) -> Self {
+    pub fn new(source: u32, session: u64, mtype: MsgType, payload: Payload) -> Self {
         Self {
             source,
             session,

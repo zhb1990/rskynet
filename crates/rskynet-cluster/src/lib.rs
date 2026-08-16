@@ -488,7 +488,7 @@ impl std::fmt::Display for ServiceKey {
 
 struct Pending {
     source: u32,
-    session: i32,
+    session: u64,
     node: NodeId,
     response_type: u32,
 }
