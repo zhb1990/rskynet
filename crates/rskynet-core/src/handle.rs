@@ -1,6 +1,6 @@
 //! handle 注册表与本地名字表，对照 `skynet-src/skynet_handle.c`。
 //!
-//! handle 是纯本地的 `u32` 序号，不编入节点信息。跨节点寻址由
+//! handle 是纯本地的单调递增 `u64` 序号，不编入节点信息。跨节点寻址由
 //! `rskynet-cluster` 的独立地址类型承担。槽位数组按 2 的幂倍增，
 //! 用 `handle & (slot_size - 1)` 直接定位，与 C 版一致。
 //!
@@ -98,7 +98,10 @@ impl HandleStorage {
     fn grow(&self) {
         let old = self.slots.load();
         let new_size = old.len() * 2;
-        assert!(new_size <= u32::MAX as usize, "服务数量超出 handle 空间");
+        // 上限约束的是**槽位数组**的长度，不是 handle 身份空间：handle 本身是
+        // u64 单调序列，永不复用；这里只是防止数组长度失去控制（每个槽还挂着
+        // 一个 ArcSwapOption）。
+        assert!(new_size <= u32::MAX as usize, "服务数量超出槽位数组容量上限");
         let new_slots = empty_slots(new_size);
         for ctx in old.iter().filter_map(|slot| slot.load_full()) {
             let hash = (ctx.handle as usize) & (new_size - 1);

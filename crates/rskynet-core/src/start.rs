@@ -435,55 +435,55 @@ fn monitor_loop(node: &Node, monitors: &[Arc<Monitor>], stop: mpsc::Receiver<()>
     }
 }
 
+/// 收尾排空时，同一个服务最多连续让渡多少轮；超过即视为「排不完」，强制摘除。
+///
+/// 一轮 `dispatch` 最多干 64 件活（收工信号下每满 64 件让渡一次，见
+/// `Node::run_service` 的 `YIELD_INTERVAL`），所以预算对应约 `DRAIN_BUDGET × 64`
+/// 次 poll。任意 Future 都无法从外部判断它最终会不会完成——自唤醒任务可能 poll
+/// 256 次后才 Ready，也可能永远 Pending——因此只能用预算来兜底，而不是看「一个
+/// 轮次前后状态有没有变化」：后者会把合法的慢任务误判成死循环提前杀掉。
+const DRAIN_BUDGET: usize = 4096;
+
 /// 在当前线程上把运行队列里剩下的活干完，用于启动失败或退出时的清理。
 ///
 /// 主线程没有本地队列，只取 injector——此时 worker 都已收工并把本地队列倒进去了。
 /// 独占服务从不进运行队列，所以这里碰不到它们，也就不会破坏「一个服务只由一条
 /// 线程执行」那条不变量。
 fn drain(node: &Node) {
-    let mut hold = None;
+    let mut hold: Option<Arc<crate::server::ServiceContext>> = None;
+    // 同一个服务连续被 dispatch 交还的轮数。换了一个服务就清零，让每个服务都
+    // 各自拿到完整的预算；别的服务还在排队时，dispatch 本来就会交替返回它们。
+    let mut rounds_on_hold = 0usize;
     loop {
-        // 收工之后 `run_service` 每 64 件活就会因为 quit 让渡一次；对一个
-        // 自唤醒任务来说，dispatch 会永远返回同一个 service。记录本轮前后的
-        // 可观测进度，确认「没有别人在排队、且同一 service 没有处理任何消息、
-        // 任务数也没变化」时，就主动摘除它，避免收尾流程被一个自唤醒任务挂死。
-        let before = hold
-            .as_ref()
-            .map(|ctx: &Arc<crate::server::ServiceContext>| {
-                (
-                    ctx.handle,
-                    ctx.message_count(),
-                    ctx.mailbox.len(),
-                    ctx.task_count(),
-                )
-            });
+        let prev_handle = hold.as_ref().map(|ctx| ctx.handle);
         hold = node.dispatch(hold);
+        let Some(ctx) = &hold else {
+            return;
+        };
+        if prev_handle != Some(ctx.handle) {
+            rounds_on_hold = 0;
+            continue;
+        }
+        rounds_on_hold += 1;
+        if rounds_on_hold < DRAIN_BUDGET {
+            continue;
+        }
+        // 预算耗尽：同一个服务连续让渡了 DRAIN_BUDGET 轮还没收工。这通常是邮箱里
+        // 挂着一个自唤醒的无限 Future——它的可观测状态（消息数、任务数）可能一直
+        // 不变，也可能一直在变，所以不能靠「状态有没有变化」判断，只能靠预算强制
+        // 结束，否则收尾流程会被它永久挂住。
+        node.log(
+            0,
+            format!(
+                "error: 服务 :{:08x} 在收尾排空中超过 {DRAIN_BUDGET} 轮仍未结束，强制摘除",
+                ctx.handle
+            ),
+        );
+        node.retire(ctx.handle);
+        hold = node.dispatch(hold.take());
+        rounds_on_hold = 0;
         if hold.is_none() {
             return;
-        }
-        let after = hold
-            .as_ref()
-            .map(|ctx: &Arc<crate::server::ServiceContext>| {
-                (
-                    ctx.handle,
-                    ctx.message_count(),
-                    ctx.mailbox.len(),
-                    ctx.task_count(),
-                )
-            });
-        let stalled = node.sched.is_quit()
-            && node.sched.len() == 0
-            && match (before, after) {
-                (Some(before), Some(after)) => before == after,
-                _ => false,
-            };
-        if stalled {
-            let ctx = hold.take().expect("上面已经确认仍持有 service");
-            node.retire(ctx.handle);
-            hold = node.dispatch(Some(ctx));
-            if hold.is_none() {
-                return;
-            }
         }
     }
 }
@@ -494,6 +494,12 @@ mod tests {
     use crate::BoxFuture;
     use crate::context::{Ctx, Service};
     use crate::message::Message;
+    use crate::server::tests::StubTimer;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// [`drain_lets_a_long_future_finish`] 的 poll 计数：慢任务每 poll 一次加一，
+    /// 用来验证排空流程把它完整跑完而不是提前摘除。
+    static SLOW_FUTURE_POLLS: AtomicUsize = AtomicUsize::new(0);
 
     /// init 返回 Err 的服务：这是正常错误路径，必须仍然能干净关停。
     #[derive(Default)]
@@ -610,6 +616,107 @@ mod tests {
             Err(Error::Init { kind, .. }) if kind == "bootstrap" => {}
             other => panic!("abort 的 bootstrap 应当以 Init 错误结束，实际是 {other:?}"),
         }
+    }
+
+    /// 收尾排空时，一个需要多次 poll 才能完成的自唤醒任务不能被误判为死循环。
+    ///
+    /// 旧实现比较「一个排空轮次前后的消息数 / 邮箱长度 / 任务数」，全部不变就把
+    /// 服务摘除——自唤醒任务恰恰在 poll 之间不留下任何可观测变化，于是这种合法
+    /// 任务（比如重试循环）会在完成之前被提前杀掉。新实现只看排空预算：
+    /// 256 次 poll 远在预算之内，应当完整跑完。
+    #[test]
+    fn drain_lets_a_long_future_finish() {
+        const NEEDED: usize = 256;
+
+        #[derive(Default)]
+        struct SlowFutureService;
+
+        impl Service for SlowFutureService {
+            fn init(self: Arc<Self>, ctx: Ctx, _args: String) -> BoxFuture<'static, Result<()>> {
+                Box::pin(async move {
+                    ctx.spawn(async move {
+                        std::future::poll_fn(|cx| {
+                            let polls = SLOW_FUTURE_POLLS.fetch_add(1, Ordering::Relaxed) + 1;
+                            cx.waker().wake_by_ref();
+                            if polls >= NEEDED {
+                                std::task::Poll::Ready(())
+                            } else {
+                                std::task::Poll::Pending
+                            }
+                        })
+                        .await
+                    });
+                    Ok(())
+                })
+            }
+
+            fn dispatch(self: Arc<Self>, _ctx: Ctx, _msg: Message) -> BoxFuture<'static, ()> {
+                Box::pin(async {})
+            }
+        }
+
+        SLOW_FUTURE_POLLS.store(0, Ordering::Relaxed);
+        let registry = Registry::new().with("slow-future", SlowFutureService::default);
+        let node = Node::new(&Config::default(), registry, Arc::new(StubTimer));
+        let handle = node
+            .new_service("slow-future", "")
+            .expect("应创建成功")
+            .handle;
+        node.sched.set_quit();
+
+        // 排空必须把慢任务 poll 到完成，而不是提前摘除服务
+        drain(&node);
+        assert_eq!(
+            SLOW_FUTURE_POLLS.load(Ordering::Relaxed),
+            NEEDED,
+            "慢任务应完整跑完"
+        );
+        assert!(
+            node.handles.grab(handle).is_some(),
+            "慢任务仍在跑的服务不应被排空流程摘除"
+        );
+    }
+
+    /// 收尾排空遇到自唤醒的无限 Future：预算耗尽后必须强制摘除，而不是永远转下去。
+    #[test]
+    fn drain_force_retires_an_infinite_future_after_the_budget() {
+        #[derive(Default)]
+        struct InfiniteFutureService;
+
+        impl Service for InfiniteFutureService {
+            fn init(self: Arc<Self>, ctx: Ctx, _args: String) -> BoxFuture<'static, Result<()>> {
+                Box::pin(async move {
+                    ctx.spawn(async move {
+                        std::future::poll_fn(|cx| {
+                            cx.waker().wake_by_ref();
+                            std::task::Poll::Pending
+                        })
+                        .await
+                    });
+                    Ok(())
+                })
+            }
+
+            fn dispatch(self: Arc<Self>, _ctx: Ctx, _msg: Message) -> BoxFuture<'static, ()> {
+                Box::pin(async {})
+            }
+        }
+
+        let registry = Registry::new().with("infinite-future", InfiniteFutureService::default);
+        let node = Node::new(&Config::default(), registry, Arc::new(StubTimer));
+        let handle = node
+            .new_service("infinite-future", "")
+            .expect("应创建成功")
+            .handle;
+        node.sched.set_quit();
+
+        drain(&node);
+
+        assert!(
+            node.handles.grab(handle).is_none(),
+            "无限 Future 的服务应在预算耗尽后被强制摘除"
+        );
+        assert_eq!(node.total(), 0, "摘除后应由 dispatch 完成销毁记账");
     }
 
     #[test]

@@ -15,7 +15,9 @@
 //! 全局计数器（`last_block` / `start_block`）直接存**逻辑 block sequence**：
 //! 从 0 开始单调递增的 u64，永不回绕。物理块下标是 `sequence & mask`，
 //! 块 generation 是 `sequence >> block_shift`；因此块被复用时 generation 必然变化，
-//! 旧 thief 拿着的旧 sequence 不可能再读到新世代数据。
+//! 旧 thief 拿着的旧 sequence 不可能再读到新世代数据。generation 最终编码进
+//! 块内状态的高 56 bit，所以它不能越过 `2^56 - 1`——每前进一步都由
+//! [`LifoQueue::next_sequence`] 检查这条上限，越界直接 fail-fast，禁止回绕。
 //!
 //! 块内状态（`head` / `steal_tail`）仍是单个 64 位原子量：
 //!
@@ -41,6 +43,8 @@ use std::ops::{Deref, DerefMut};
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 /// 块内槽位占用的低 bit 数。当前最大块长 16，留 8 bit 已经足够，
 /// 而且让「generation << SLOT_BITS | slot」继续装进一个 AtomicU64。
@@ -50,6 +54,26 @@ const SLOT_MASK: u64 = (1 << SLOT_BITS) - 1;
 /// 第 0 代的「上一代」哨兵：未使用块的初始 generation 取最大值，
 /// 让第 0 代的 `is_writable` 一开始就成立。generation 只占高 56 bit。
 const PREV_GEN_0: u64 = (1 << (64 - SLOT_BITS)) - 1;
+
+/// 块内状态里 generation 可表达的最大值（高 56 bit 全 1）。
+///
+/// 逻辑 block sequence 的 generation 是 `sequence >> block_shift`，它最终要编码进
+/// 块内状态的高 56 bit（低 8 bit 留给槽位），所以不能越过这个上限。越过即意味着
+/// 编码回绕：旧世代的位置模式会被新世代原样复用，`is_writable` 的「停在上一代」
+/// 判断也随之失效——这是块协议不可恢复的破坏，必须在 [`LifoQueue::next_sequence`]
+/// 里 fail-fast，而不是等回绕真正发生。
+const MAX_GENERATION: u64 = (1 << (64 - SLOT_BITS)) - 1;
+
+/// 测试钩子：置位后，`Block::steal` 里所有目标块（地址匹配
+/// [`STEAL_PAUSE_TARGET`]）的 thief 都会在读走 `steal_tail` 之后、CAS 之前停下。
+#[cfg(test)]
+static STEAL_PAUSE: AtomicBool = AtomicBool::new(false);
+/// 测试钩子：受 [`STEAL_PAUSE`] 影响的块地址，0 表示不暂停任何块。
+#[cfg(test)]
+static STEAL_PAUSE_TARGET: AtomicUsize = AtomicUsize::new(0);
+/// 测试钩子：某个 thief 已经停在 [`STEAL_PAUSE`] 的窗口里。
+#[cfg(test)]
+static PAUSED_THIEF: AtomicBool = AtomicBool::new(false);
 
 /// 每条本地队列的块数，必须是 2 的幂且不小于 2。
 pub(crate) const NUM_BLOCKS: usize = 64;
@@ -93,6 +117,7 @@ pub(crate) enum Pushed {
 }
 
 /// 一次窃取的结果。
+#[derive(Debug)]
 enum Steal<T> {
     Taken(T),
     /// 本块暂时没有可偷的（owner 还在往里写），不必再往后找。
@@ -196,9 +221,28 @@ impl<T> Block<T> {
         if sidx == back {
             return Steal::Empty;
         }
+        #[cfg(test)]
+        {
+            // 测试钩子：让 thief 停在「已经确认本块可偷、还没 CAS」的窗口里，
+            // 便于把「owner 在 CAS 前把整块换了个世代」的竞态放大成确定性用例。
+            if STEAL_PAUSE.load(Ordering::Acquire)
+                && self as *const Self as usize == STEAL_PAUSE_TARGET.load(Ordering::Relaxed)
+            {
+                PAUSED_THIEF.store(true, Ordering::Release);
+                while STEAL_PAUSE.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+            }
+        }
+        // 成功的那一下必须是 Acquire：CAS 成功是 thief 对「这块归我」的最终确认，
+        // 与 grant() 里发布新边界的 Release store 配对。owner 在 grant 之前写好的
+        // 槽位（put 的写入、尾部的 Release 推进）都先于那道 Release，而两次 grant
+        // 之间的 takeover / reclaim / reduce_generation 与其它 thief 的 CAS 都是
+        // 同一条 release sequence 上的成员，因此成功 CAS 之后对槽位的读取一定能
+        // 看到对应世代的数据。失败时没有读取，Relaxed 即可。
         if self
             .steal_tail
-            .compare_exchange(spos, spos + 1, Ordering::Relaxed, Ordering::Relaxed)
+            .compare_exchange(spos, spos + 1, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
             return Steal::Conflict;
@@ -321,10 +365,20 @@ impl<T> LifoQueue<T> {
     }
 
     /// 逻辑 sequence 只增不减。u64 耗尽属于进程级故障，直接 fail-fast。
+    ///
+    /// 先查 u64 溢出，再查 generation 编码上限（见 [`MAX_GENERATION`]）：
+    /// 两者都不可恢复，一律 panic。禁止任何形式的回绕——`wrapping_add` 或
+    /// `& MASK` 都会让旧世代位模式复活，ABA 防线随之失效。
     fn next_sequence(&self, sequence: u64) -> u64 {
-        sequence
+        let next = sequence
             .checked_add(1)
-            .expect("BWoS block sequence 耗尽（u64 单调序列走到头）")
+            .expect("BWoS block sequence 耗尽（u64 单调序列走到头）");
+        let generation = next >> self.block_shift;
+        assert!(
+            generation <= MAX_GENERATION,
+            "BWoS generation 溢出：块内 64 位编码装不下第 {generation} 代"
+        );
+        next
     }
 
     /// 逻辑 sequence 只增不减；owner 往回走不会越过 0。
@@ -621,6 +675,95 @@ mod tests {
         assert!(matches!(block.steal(1), Steal::Taken(taken) if taken == 11));
         assert!(matches!(block.steal(1), Steal::Taken(taken) if taken == 12));
         assert!(matches!(block.steal(1), Steal::Taken(taken) if taken == 13));
+    }
+
+    /// 旧 thief 停在「已读 `steal_tail`、还没 CAS」的窗口里时，owner 把整块收回、
+    /// 掏空、重填、再交出去——收尾时 `steal_tail` 恰好回到与旧值**位模式相同**
+    /// 的值（同世代内退回再重填，边界值会原样重现）。恢复后的 CAS 因此会命中，
+    /// 而它读到的必须是**重填后**的槽位数据：成功 CAS 的 Acquire 语义正是这条
+    /// 可见性保证的落点，relaxed CAS 会让这次读取与 owner 的写入失去同步。
+    #[test]
+    fn a_stale_thief_cas_reads_the_refilled_data() {
+        let block = Block::<u64>::new(4);
+
+        // 第 0 代第一轮：写满、grant，主线程偷走 0 号，让 steal_tail 停在 slot 1。
+        block.reclaim(0);
+        for value in 0..4 {
+            unsafe { block.put(value) }.expect("不该满");
+        }
+        block.grant();
+        assert!(matches!(block.steal(0), Steal::Taken(0)));
+
+        STEAL_PAUSE_TARGET.store(&block as *const Block<u64> as usize, Ordering::Release);
+        STEAL_PAUSE.store(true, Ordering::Release);
+
+        let stolen = thread::scope(|scope| {
+            // 无论用例在哪一步失败，都要先放行窃贼再让 scope 等它结束，
+            // 否则它会带着 STEAL_PAUSE 一直转下去，scope 的 join 就等死了。
+            struct ReleasePause;
+            impl Drop for ReleasePause {
+                fn drop(&mut self) {
+                    STEAL_PAUSE.store(false, Ordering::Release);
+                    STEAL_PAUSE_TARGET.store(0, Ordering::Release);
+                }
+            }
+            let _release = ReleasePause;
+
+            // thread::scope 保证所有线程在 block 析构前收工，这里按地址访问是安全的。
+            let raw = &block as *const Block<u64> as usize;
+            let handle = scope.spawn(move || unsafe { &*(raw as *const Block<u64>) }.steal(0));
+
+            // 等窃贼读走 steal_tail = (0<<8)|1 并停在 CAS 之前。
+            while !PAUSED_THIEF.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+
+            // owner 在这段窗口里把整块收回来、掏空、重填、再交出去：
+            // 收尾时 steal_tail 又变回 (0<<8)|1，与窃贼手里的旧值完全一致。
+            block.takeover();
+            for _ in 0..3 {
+                unsafe { block.get() }.expect("应能取回三个元素");
+            }
+            for value in 10..13 {
+                unsafe { block.put(value) }.expect("不该满");
+            }
+            block.grant();
+
+            // 先放行窃贼，再 join。
+            drop(_release);
+            handle.join().expect("窃贼线程不应 panic")
+        });
+
+        assert!(
+            matches!(stolen, Steal::Taken(10)),
+            "stale CAS 必须读到重填后的数据，实际是 {stolen:?}"
+        );
+    }
+
+    /// generation 编码上限：越过 `(1 << 56) - 1` 必须 fail-fast，而不是回绕。
+    ///
+    /// 回绕会让旧世代的位置模式复活——`is_writable` 的「停在上一代」判断随之
+    /// 失效，ABA 防线整体崩塌，所以这里守的是编码不变量本身。
+    #[test]
+    fn next_sequence_fails_fast_on_generation_overflow() {
+        // 4 块队列的 block_shift = 2：generation = sequence >> 2，
+        // 最大 generation = (1<<56)-1，即 sequence 最大到 (1<<58)-1。
+        let (owner, _stealer) = queue::<u64>(4, 4);
+        let queue = &owner.queue;
+        let max_ok = (1u64 << 58) - 1;
+        assert_eq!(
+            queue.next_sequence(max_ok - 1),
+            max_ok,
+            "最大 generation 内仍应前进"
+        );
+
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            queue.next_sequence(max_ok);
+        }));
+        std::panic::set_hook(previous);
+        assert!(result.is_err(), "越过最大 generation 必须 fail-fast");
     }
 
     /// owner 与多个窃贼并发跑，元素必须不丢不重
