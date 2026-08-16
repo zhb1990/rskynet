@@ -190,11 +190,29 @@ pub(crate) struct TaskId {
     pub(crate) generation: u64,
 }
 
+/// 任务 waker 的投递信号：同一时间最多只允许一个 pending 的 ready entry。
+///
+/// 任务刚创建时就会立即入一次 ready 队列，所以初始值为 true；消费方在
+/// [`TaskSet::take`] 真正拿走那个 entry 时清回 false。poll 期间的 self-wake
+/// 仍然有效，但连续 1000 次 `wake_by_ref()` 最多留下一个等待中的 ready entry。
+struct TaskSignal {
+    queued: AtomicBool,
+}
+
+impl TaskSignal {
+    fn queued() -> Self {
+        Self {
+            queued: AtomicBool::new(true),
+        }
+    }
+}
+
 /// 服务内的一个任务，相当于 skynet 里的一个协程。
 struct TaskSlot {
     /// poll 期间会被取走，避免任务在 poll 中再 spawn 新任务时形成嵌套借用。
     future: Option<BoxFuture<'static, ()>>,
     waker: Waker,
+    signal: Arc<TaskSignal>,
     generation: u64,
     /// 这个任务正在处理谁的请求：(请求方, session)。
     ///
@@ -213,10 +231,20 @@ struct TaskSlot {
 struct TaskWaker {
     ctx: Weak<ServiceContext>,
     task: TaskId,
+    signal: Arc<TaskSignal>,
 }
 
 impl ArcWake for TaskWaker {
     fn wake_by_ref(arc_self: &Arc<Self>) {
+        if arc_self
+            .signal
+            .queued
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
         if let Some(ctx) = arc_self.ctx.upgrade() {
             ctx.wake_task(arc_self.task);
         }
@@ -260,13 +288,16 @@ impl TaskSet {
             index: entry.key(),
             generation,
         };
+        let signal = Arc::new(TaskSignal::queued());
         let waker = waker(Arc::new(TaskWaker {
             ctx: owner.clone(),
             task,
+            signal: signal.clone(),
         }));
         entry.insert(TaskSlot {
             future: Some(future),
             waker,
+            signal,
             generation,
             request,
             source,
@@ -283,6 +314,10 @@ impl TaskSet {
             return None;
         }
         let future = slot.future.take()?;
+
+        // 这个 ready entry 已经被消费；poll 期间的再次 wake 会重新把信号置位。
+        slot.signal.queued.store(false, Ordering::Release);
+
         Some((future, slot.waker.clone(), slot.source))
     }
 

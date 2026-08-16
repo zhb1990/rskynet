@@ -580,6 +580,13 @@ pub(crate) struct Node {
     /// 时间来源，启动方注入，实现在内核之外，见 [`crate::Timer`]。
     pub(crate) timer: Arc<dyn Timer>,
     modules: Registry,
+    /// 串行化「允许新服务进入节点」与「节点进入 quit」。
+    ///
+    /// `launch` 要一直持有到服务真正 publish 给执行者为止；`quit`、
+    /// `mark_booted` 与最后一个普通服务的 `destroy` 则在同一把锁里完成
+    /// 「读服务数 / 置收工标记」。锁只在这些低频生命周期路径上使用，
+    /// 不参与任何消息热路径。
+    lifecycle_gate: Mutex<()>,
     /// 独占服务的线程句柄，节点收尾时按它逐个 join。
     ///
     /// 不能用 `thread::scope` 那种 scoped 线程：独占服务可以在运行期被 `launch`，
@@ -601,6 +608,13 @@ pub(crate) struct Node {
     /// 参数，成段的配置只能从这里来。
     config: Config,
     profile: bool,
+    /// 测试钩子：让 launch 停在「已通过 admission、还没 publish」的窗口里，
+    /// 用来把 lifecycle gate 的线性化关系放大成确定性用例。
+    #[cfg(test)]
+    pause_before_publish: AtomicBool,
+    /// 测试钩子：launch 正停在 publish 之前。
+    #[cfg(test)]
+    publish_paused: AtomicBool,
 }
 
 impl Node {
@@ -610,12 +624,17 @@ impl Node {
             handles: HandleStorage::new(),
             timer,
             modules,
+            lifecycle_gate: Mutex::new(()),
             exclusives: Mutex::new(HashMap::new()),
             total: AtomicI64::new(0),
             booted: AtomicBool::new(false),
             logger: AtomicU32::new(0),
             config: config.clone(),
             profile: config.profile,
+            #[cfg(test)]
+            pause_before_publish: AtomicBool::new(false),
+            #[cfg(test)]
+            publish_paused: AtomicBool::new(false),
         })
     }
 
@@ -625,9 +644,20 @@ impl Node {
 
     /// 系统服务都拉起来了，见 [`Node::is_booted`]。
     pub(crate) fn mark_booted(&self) {
-        self.booted.store(true, Ordering::Release);
-        if self.total() == 0 {
-            self.quit();
+        let changed = {
+            let _gate = self.lifecycle_gate.lock();
+
+            self.booted.store(true, Ordering::Release);
+
+            if self.total.load(Ordering::Acquire) == 0 {
+                self.set_quit_locked()
+            } else {
+                false
+            }
+        };
+
+        if changed {
+            self.interrupt_all();
         }
     }
 
@@ -711,9 +741,7 @@ impl Node {
         args: &str,
         reserved: bool,
     ) -> Result<NewService> {
-        if self.sched.is_quit() {
-            return Err(Error::Service("节点已经收工，不能再启动新服务".into()));
-        }
+        // 不影响节点状态的准备工作放在 gate 外：查 factory、构造服务实例。
         let factory = self
             .modules
             .get(kind)
@@ -721,6 +749,14 @@ impl Node {
         let instance = factory();
         let service = instance.service.clone();
         let exclusive = instance.exclusive.clone();
+
+        // 从 admission 一直持有 gate 到服务真正 publish 给执行者：
+        // 要么已经进入运行队列，要么独占线程已经起好。此后 quit 才有可能拿锁。
+        let gate = self.lifecycle_gate.lock();
+
+        if self.sched.is_quit() {
+            return Err(Error::Service("节点已经收工，不能再启动新服务".into()));
+        }
 
         let init = InitTicket::new(kind);
         let init_for_ctx = init.clone();
@@ -782,12 +818,26 @@ impl Node {
         });
 
         self.log(handle, format!("LAUNCH {kind} {args}"));
+
+        #[cfg(test)]
+        {
+            self.publish_paused.store(true, Ordering::Release);
+            while self.pause_before_publish.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+            self.publish_paused.store(false, Ordering::Release);
+        }
+
         match exclusive {
             // in_global 自创建起就是置位的，这里补上真正的入队，服务开始接受调度
             None => self.sched.push(ctx),
             // 独占服务的执行者是它自己那条线程，起来就接管
             Some(service) => self.spawn_exclusive(ctx, service),
         }
+
+        // 到这里 service 已经真正交给执行者，gate 才能放。
+        drop(gate);
+
         Ok(NewService { handle, init })
     }
 
@@ -839,15 +889,38 @@ impl Node {
         join_all(all)
     }
 
+    /// 在 lifecycle gate 内真正置上收工标记。调用方必须已经持有
+    /// [`Node::lifecycle_gate`]；已收工时返回 false。
+    fn set_quit_locked(&self) -> bool {
+        if self.sched.is_quit() {
+            false
+        } else {
+            self.sched.set_quit();
+            true
+        }
+    }
+
+    /// 叫醒所有独占线程。用户的 [`crate::Exclusive::interrupt`] 可能阻塞或再次
+    /// 进入生命周期接口，因此一律放在 lifecycle gate 之外执行。
+    fn interrupt_all(&self) {
+        for ctx in self.handles.contexts() {
+            ctx.interrupt();
+        }
+    }
+
     /// 宣布节点收工：叫醒所有 worker，也把独占线程从阻塞里敲出来。
     ///
     /// 对照 C 版的 `CHECK_ABORT`。独占线程那一下不是非有不可（它们真正的退出
     /// 条件是自己被摘除，而摘除自带唤醒），但让 `idle` 里那些盯着 `is_quit` 的
     /// 服务早一点看到收工信号总是好的。
     pub(crate) fn quit(&self) {
-        self.sched.set_quit();
-        for ctx in self.handles.contexts() {
-            ctx.interrupt();
+        let changed = {
+            let _gate = self.lifecycle_gate.lock();
+            self.set_quit_locked()
+        };
+
+        if changed {
+            self.interrupt_all();
         }
     }
 
@@ -915,16 +988,25 @@ impl Node {
     pub(crate) fn destroy(&self, ctx: Arc<ServiceContext>) {
         ctx.cleanup();
 
-        if !ctx.destroyed.swap(true, Ordering::AcqRel) {
-            self.log(ctx.handle, format!("KILL {}", ctx.kind));
+        if ctx.destroyed.swap(true, Ordering::AcqRel) {
+            return;
+        }
 
-            if !ctx.is_reserved()
-                && self.total.fetch_sub(1, Ordering::AcqRel) <= 1
-                && self.is_booted()
-            {
-                // 最后一个普通服务也走了，通知所有线程收工
-                self.quit();
-            }
+        self.log(ctx.handle, format!("KILL {}", ctx.kind));
+
+        let changed = if ctx.is_reserved() {
+            false
+        } else {
+            let _gate = self.lifecycle_gate.lock();
+
+            let previous = self.total.fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(previous > 0);
+
+            previous == 1 && self.booted.load(Ordering::Acquire) && self.set_quit_locked()
+        };
+
+        if changed {
+            self.interrupt_all();
         }
     }
 
@@ -1218,6 +1300,88 @@ pub(crate) mod tests {
             .expect_err("收工后应拒绝创建服务");
         assert!(matches!(err, Error::Service(_)));
         assert_eq!(node.total(), 0);
+    }
+
+    /// launch 已通过 admission、但还没 publish 时，quit 必须排队；
+    /// publish 完成之后 quit 才生效，且此后的 launch 全部失败。
+    #[test]
+    fn launch_vs_quit_is_linearized() {
+        let node = test_node();
+        node.pause_before_publish.store(true, Ordering::SeqCst);
+
+        std::thread::scope(|scope| {
+            // 无论用例在哪一步失败，都要先松开 publish 钩子，否则 launch 线程
+            // 会一直占着 lifecycle gate，scope 等待它结束时就会挂死。
+            struct ReleasePublish<'a>(&'a Node);
+            impl Drop for ReleasePublish<'_> {
+                fn drop(&mut self) {
+                    self.0.pause_before_publish.store(false, Ordering::SeqCst);
+                }
+            }
+            let _release = ReleasePublish(&node);
+
+            let launcher = scope.spawn({
+                let node = node.clone();
+                move || node.new_service("null", "").map(|service| service.handle)
+            });
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !node.publish_paused.load(Ordering::Acquire)
+                && std::time::Instant::now() < deadline
+            {
+                std::hint::spin_loop();
+            }
+            assert!(
+                node.publish_paused.load(Ordering::Acquire),
+                "launch 应停在 admission 之后、publish 之前"
+            );
+            assert_eq!(
+                node.total(),
+                1,
+                "launch 已通过 admission：publish 前 total 已入账"
+            );
+
+            let quitter_started = Arc::new(AtomicBool::new(false));
+            let quitter = scope.spawn({
+                let node = node.clone();
+                let quitter_started = quitter_started.clone();
+                move || {
+                    quitter_started.store(true, Ordering::Release);
+                    node.quit();
+                }
+            });
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !quitter_started.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                std::hint::spin_loop();
+            }
+            assert!(quitter_started.load(Ordering::Acquire), "quit 线程应已启动");
+
+            // quitter 已经站在 gate 前面；只要 launch 还没 publish，收工标记就不能生效
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            assert!(!node.sched.is_quit(), "quit 不得越过尚未 publish 的 launch");
+
+            node.pause_before_publish.store(false, Ordering::SeqCst);
+
+            let handle = launcher
+                .join()
+                .expect("launch 线程不应 panic")
+                .expect("launch 应创建成功");
+            quitter.join().expect("quit 线程不应 panic");
+
+            assert!(
+                node.handles.grab(handle).is_some(),
+                "launch 应先于 quit 完成 publish"
+            );
+            assert!(node.sched.is_quit(), "publish 之后 quit 必须生效");
+
+            let err = node
+                .new_service("null", "")
+                .expect_err("收工后新的 launch 应失败");
+            assert!(matches!(err, Error::Service(_)));
+        });
+
+        assert_eq!(node.total(), 1, "已 publish 的服务仍应记在 total 上");
     }
 
     /// 摘除服务后地址即刻失效，服务计数归零并通知 worker 收工
@@ -1540,6 +1704,9 @@ pub(crate) mod tests {
         let victim = node
             .handles
             .register_with(|handle| dummy_context_on(node.clone(), handle));
+        // 手工注册的 dummy 上下文绕过了 new_service 的记账，这里补上，
+        // 让 destroy 看到的 total 与真实 launch 一致。
+        node.total.fetch_add(1, Ordering::AcqRel);
 
         victim.lifecycle.store(lifecycle::FAILED, Ordering::Release);
         *victim.pending_messages.borrow_mut() = None;

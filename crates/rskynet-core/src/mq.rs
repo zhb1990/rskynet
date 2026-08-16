@@ -54,6 +54,13 @@ use crossbeam_queue::SegQueue;
 /// 过载报警的初始阈值，对照 C 版 `MQ_OVERLOAD`。
 pub(crate) const OVERLOAD_THRESHOLD: usize = 1024;
 
+/// 就绪任务最多连续领先多少轮，之后即使有新消息也必须让消息先走。
+///
+/// 正常情况下仍然保持「ready 优先」：被唤醒的协程要一路跑到下一次 yield。
+/// 这个上限只防一个 self-waking Future 永久霸占取活入口，让同服务里已经
+/// 到达的消息一直排不上号。
+const READY_BURST: usize = 64;
+
 /// 就绪队列里的一件活。
 pub(crate) enum Ready {
     /// 服务内某个任务被唤醒了，去 poll 它。
@@ -84,6 +91,8 @@ pub(crate) struct Mailbox {
     /// 下面两个只有「当前持有本服务的那个 worker」会碰，天然无竞争。
     overload: AtomicUsize,
     overload_threshold: AtomicUsize,
+    /// ready 已经连续领先的轮数，用来给消息提供有限公平性。
+    ready_streak: AtomicUsize,
 }
 
 impl Mailbox {
@@ -101,6 +110,7 @@ impl Mailbox {
             state: AtomicU8::new(state::QUEUED),
             overload: AtomicUsize::new(0),
             overload_threshold: AtomicUsize::new(OVERLOAD_THRESHOLD),
+            ready_streak: AtomicUsize::new(0),
         }
     }
 
@@ -148,13 +158,28 @@ impl Mailbox {
     /// 后续的投递方会负责把服务重新推进运行队列。
     ///
     /// 就绪任务优先于新消息：对应 skynet 里被 resume 的协程会一路跑到下一次
-    /// yield，之后才轮到下一条消息。
+    /// yield，之后才轮到下一条消息。但优先不是无上限的：ready 连续领先
+    /// [`READY_BURST`] 轮之后，只要消息队列非空，就强制让一条消息先走。
     pub(crate) fn take_work(&self) -> Option<Work> {
         loop {
+            let streak = self.ready_streak.load(Ordering::Relaxed);
+
+            // ready 已经连续跑了一批：给已经在等的消息一个插队名额。
+            if streak >= READY_BURST {
+                if let Some(msg) = self.queue.pop() {
+                    self.ready_streak.store(0, Ordering::Relaxed);
+                    self.check_overload();
+                    return Some(Work::Message(msg));
+                }
+            }
+
             if let Some(ready) = self.ready.pop() {
+                self.ready_streak
+                    .store((streak + 1).min(READY_BURST), Ordering::Relaxed);
                 return Some(Work::Ready(ready));
             }
             if let Some(msg) = self.queue.pop() {
+                self.ready_streak.store(0, Ordering::Relaxed);
                 self.check_overload();
                 return Some(Work::Message(msg));
             }
@@ -636,6 +661,9 @@ impl Scheduler {
     ///
     /// 偷不到不代表对方真闲着——对方正在写的那一块本来就偷不动，所以这里失败即
     /// 收手，回去看 injector、自旋、然后睡，比固执地扫满一圈划算。
+    ///
+    /// 位图按「先消费 hint、再 steal」处理：旧 thief 的一次失败 steal 绝不能
+    /// 清掉 owner 在这之后发布的新 hint（见 [`Scheduler::take_stealable`]）。
     fn steal(&self, id: usize) -> Option<Arc<ServiceContext>> {
         let count = self.stealers.len();
         if count < 2 {
@@ -648,13 +676,19 @@ impl Scheduler {
             if victim == id || !self.is_stealable(victim) {
                 continue;
             }
+            // 真正消费 hint。别的 thief 已经抢先消费时不要碰这个 victim。
+            if !self.take_stealable(victim) {
+                continue;
+            }
             if let Some(ctx) = self.stealers[victim].steal_front() {
+                // steal_front 无法告诉我们这是不是最后一件，所以重新发布 hint；
+                // 最坏只是多一次 false positive。
+                self.mark_stealable(victim);
+
                 self.pending.fetch_sub(1, Ordering::Relaxed);
                 return Some(ctx);
             }
-            // 白跑一趟：把提示位清掉，别的窃贼就不必再来一遍。
-            // owner 下次跨块会重新置位，所以清早了也不会漏活
-            self.clear_stealable(victim);
+            // 失败时不再 clear：hint 在 steal 之前已经被消费掉了。
             attempts += 1;
             if attempts >= STEAL_ATTEMPTS {
                 break;
@@ -669,6 +703,17 @@ impl Scheduler {
 
     fn mark_stealable(&self, id: usize) {
         self.stealable[id / 64].fetch_or(1 << (id % 64), Ordering::Release);
+    }
+
+    /// 消费一个 stealable hint。返回 true 表示「hint 归我，去偷吧」。
+    ///
+    /// 用 Acquire 读取并清位，与 owner 的 `mark_stealable(..., Release)` 配对，
+    /// 建立「发布新 hint -> 消费 hint」的清晰关系。不需要 AcqRel：
+    /// clear-before-new-mark 不丢失依赖的是同一个 atomic 的 modification order。
+    fn take_stealable(&self, id: usize) -> bool {
+        let bit = 1u64 << (id % 64);
+
+        self.stealable[id / 64].fetch_and(!bit, Ordering::Acquire) & bit != 0
     }
 
     fn clear_stealable(&self, id: usize) {
@@ -942,6 +987,36 @@ mod tests {
         assert!(matches!(mailbox.take_work(), Some(Work::Message(_))));
     }
 
+    /// ready 优先有上界：消息已经在等时，连续取满 READY_BURST 个 ready 之后，
+    /// 下一次必须让消息先走，self-waking task 不能把消息永久饿住。
+    #[test]
+    fn message_is_not_starved_by_ready_tasks() {
+        let mailbox = running_mailbox();
+        let task = TaskId {
+            index: 3,
+            generation: 1,
+        };
+        for _ in 0..=READY_BURST {
+            mailbox.push_ready(Ready::Task(task));
+        }
+        mailbox.push_message(message(1));
+
+        for _ in 0..READY_BURST {
+            assert!(
+                matches!(mailbox.take_work(), Some(Work::Ready(Ready::Task(id))) if id == task),
+                "前 {READY_BURST} 次仍应保持 ready 优先"
+            );
+        }
+        assert!(
+            matches!(mailbox.take_work(), Some(Work::Message(msg)) if msg.session == 1),
+            "ready 连跑 {READY_BURST} 轮后必须轮到消息"
+        );
+        assert!(
+            matches!(mailbox.take_work(), Some(Work::Ready(Ready::Task(id))) if id == task),
+            "消息插队后剩下的 ready 仍应可取"
+        );
+    }
+
     /// 报警一次之后阈值翻倍，免得持续过载时把日志刷爆
     #[test]
     fn overload_threshold_doubles() {
@@ -1093,6 +1168,40 @@ mod tests {
                 assert!(!sched.is_stealable(0));
             });
         });
+    }
+
+    /// 旧 thief 的一次失败 steal 不能清掉 owner 在那之后发布的新 hint。
+    ///
+    /// 协议是 claim-before-steal：先 `take_stealable` 消费 hint，偷失败时不再
+    /// clear。于是 `clear -> owner mark(new work) -> thief steal fail` 之后
+    /// 最终位仍然为 1，而不是被旧失败擦成 0。
+    #[test]
+    fn new_stealable_hint_survives_failed_old_steal() {
+        let node = test_node_with(Config::default().with_thread(2));
+        let sched = &node.sched;
+
+        // victim 有可偷 hint
+        sched.mark_stealable(0);
+        assert!(sched.is_stealable(0));
+
+        // thief 消费掉 hint，却还没真的动手偷
+        assert!(sched.take_stealable(0), "hint 应归这个 thief");
+        assert!(!sched.is_stealable(0), "hint 已被消费");
+
+        // owner 此刻发布了新 hint
+        sched.mark_stealable(0);
+        assert!(sched.is_stealable(0), "新 hint 应立即可见");
+
+        // 旧 thief 的 steal 失败；失败路径绝不能再 clear
+        assert!(
+            sched.stealers[0].steal_front().is_none(),
+            "victim 队列确实没有可偷的活"
+        );
+
+        assert!(
+            sched.is_stealable(0),
+            "新 hint 必须活下来，不能被失败的旧 steal 清掉"
+        );
     }
 
     /// 本地队列写满之后要溢出到 injector，一件活都不能丢

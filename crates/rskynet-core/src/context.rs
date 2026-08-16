@@ -13,7 +13,7 @@ use std::task::{Context, Poll};
 
 use futures_util::future::BoxFuture;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::ext::{NodeRef, ReplyToken};
 use crate::message::{Addr, Message, MsgType, Payload};
 use crate::server::ServiceContext;
@@ -111,6 +111,16 @@ impl Ctx {
         payload: Payload,
     ) -> Result<Payload> {
         self.inner.assert_ownership();
+
+        // 应答类型会直接唤醒收方等待中的 session，根本不进 dispatch；
+        // 把它当请求发出去，session 数值碰撞时可能串到别人的回包上。
+        // 因此必须在分配 session 之前拒绝。
+        if mtype.is_reply() {
+            return Err(Error::service(format!(
+                "call 不能使用应答消息类型 {mtype:?}"
+            )));
+        }
+
         let dest = self.resolve(dest)?;
         let session = self.inner.sessions.alloc();
         let call = Call {
@@ -350,5 +360,53 @@ impl Drop for Call<'_> {
             self.ctx.assert_ownership();
             self.ctx.sessions.abandon(self.session);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::tests::{dummy_context_on, test_node};
+    use futures_util::task::noop_waker;
+
+    /// `call` 只能发请求类型：RESPONSE / ERROR 会在收端直接命中 session 表，
+    /// 不能带着新分配的 session 冒充业务请求。
+    #[test]
+    fn call_rejects_reply_message_types() {
+        let node = test_node();
+        let ctx = node
+            .handles
+            .register_with(|handle| dummy_context_on(node.clone(), handle));
+        let cx = Ctx::new(ctx.clone());
+
+        ctx.with_ownership(|| {
+            for mtype in [MsgType::RESPONSE, MsgType::ERROR] {
+                let future = cx.call(ctx.handle, mtype, Payload::None);
+                let error = futures_util::FutureExt::now_or_never(future)
+                    .expect("拒绝应同步完成，不需要等待")
+                    .expect_err("应答类型必须被拒绝");
+                assert!(matches!(error, Error::Service(_)));
+            }
+
+            // USER 不受影响：应该正常分配 session 并把消息发出去
+            let mut future = Box::pin(cx.call(ctx.handle, MsgType::USER, Payload::None));
+            let waker = noop_waker();
+            let mut task_cx = Context::from_waker(&waker);
+            assert!(future.as_mut().poll(&mut task_cx).is_pending());
+
+            let sent = ctx.mailbox.drain();
+            assert_eq!(sent.len(), 1, "USER call 应已发出消息");
+            let msg = &sent[0];
+            assert_eq!(msg.mtype, MsgType::USER);
+            assert_ne!(msg.session, 0, "call 应分配 session");
+
+            // 回包到达后，call 应正常返回
+            ctx.sessions
+                .complete(msg.session, Ok(Payload::text("pong")));
+            match future.as_mut().poll(&mut task_cx) {
+                Poll::Ready(Ok(payload)) => assert_eq!(payload.as_str(), Some("pong")),
+                other => panic!("USER call 应正常收到回包，实际 {other:?}"),
+            }
+        });
     }
 }
