@@ -204,8 +204,8 @@ cargo run -p rskynet-examples -- config/examples/ping_pong.toml
 它会演示三件事：`call` 的同步写法、`spawn` 的服务内并发、`sleep` 走定时器。输出大致是：
 
 ```
-[     0.006] [:00000006] 1000 个来回耗时 6.76ms，平均单程 3.38µs
-[     0.040] [:00000006] 三个请求的完成顺序是 ["睡10毫秒", "睡20毫秒", "睡30毫秒"]，总耗时 39ms
+[     0.015] [:00000006] 1000 个来回耗时 13.654041ms，平均单程 6.827µs
+[     0.060] [:00000006] 三个请求的完成顺序是 ["睡10毫秒", "睡20毫秒", "睡30毫秒"]，总耗时 44.763625ms
 ```
 
 第二行是重点：三个请求分别要睡 30/10/20 毫秒，总耗时接近最慢的 30ms 而不是三者之和，说明它们在对端是**并发**处理的；完成顺序也按实际睡眠时长排列，而不是发出顺序。时间轮内部仍是 10ms 一格，实际唤醒可能因刻度对齐和线程调度略晚，但不会提前。
@@ -233,7 +233,7 @@ cargo run -p rskynet-examples -- config/examples/ping_pong.toml
 | `socket.close(id)` / `socket.shutdown(id)` | `net::close(&ctx, id).await` / `net::shutdown(&ctx, id)` |
 | `socket.udp(...)` / `socket.sendto(...)` | `net::udp(&ctx, bind).await` / `net::udp_send(&ctx, id, to, data)` |
 
-寻址方式也照搬：`":0100000a"` 是十六进制 handle，`".name"` 是本地名字，直接传 `u32` 则是 handle。
+寻址方式也照搬：`":0100000a"` 是十六进制 handle，`".name"` 是本地名字，直接传 `Handle`（`u64`）则是 handle。handle 在节点生命周期内单调递增、永不复用；销毁只释放物理槽位。
 
 节点级观测也统一走 `NodeRef`：`node.stats()` 返回 service 总数、业务 service 数、
 运行队列长度与 uptime；`node.services()` / `service_stats(addr)` 返回每个 service 的
@@ -473,7 +473,7 @@ async fn pong(
 | `message.rs` | `skynet_mq.h` | `Message` / `MsgType` / `Payload` |
 | `mq.rs` | `skynet_mq.c` | 每服务邮箱与四态状态机、运行队列（每 worker 一条 + injector）、唤醒与窃取、过载检测 |
 | `bwos.rs` | 无对应 | BWoS 块式工作窃取队列，移植自 stdexec 的 `bwos_lifo_queue.hpp` |
-| `handle.rs` | `skynet_handle.c` | 本地 `u32` handle 分配、槽位倍增、本地名字表 |
+| `handle.rs` | `skynet_handle.c` | 本地 `u64` handle 分配（单调递增、永不复用）、槽位倍增、本地名字表 |
 | `server.rs` | `skynet_server.c` | `ServiceContext`、`Node`、消息分发主循环、服务生命周期 |
 | `clock.rs` | 无对应 | `Timer` 抽象：内核只认它，实现由启动方注入 |
 | `module.rs` | `skynet_module.c` | 服务类型注册表（静态注册取代 `dlopen`） |
@@ -536,20 +536,20 @@ struct Counter { hits: SvcCell<u64> }
 
 ## 性能
 
-AMD64 Windows，22 逻辑核。「加锁版」是同一台机器上、同一份代码去掉这轮无锁改造的版本（邮箱 `Mutex` + injector `Mutex` + `Condvar` 唤醒 + handle 表 `RwLock`），两栏交替测量，各跑五轮取中位数：
+Apple M1 Max，10 核，macOS arm64，rustc 1.97.1。release 为 workspace 默认 thin LTO。各场景单独进程，五轮取中位数：
 
-| 场景 | 加锁版 | 无锁版 |
-| --- | --- | --- |
-| 多服务调度吞吐（4 worker，64 个服务 × 64 个令牌接力） | 约 327 万次/秒 | 约 455 万次/秒 |
-| **worker 远多于负载**（16 worker，4 个服务 × 4 个令牌接力） | 约 51 万次/秒 | 约 228 万次/秒 |
-| 单服务消息吞吐（2 worker，一百万条消息） | 约 246 万条/秒 | 约 246 万条/秒 |
-| `call` 一个来回（4 worker，debug 构建） | 约 6µs | 约 6µs |
+| 场景 | 吞吐 / 延迟 |
+| --- | --- |
+| 多服务调度吞吐（4 worker，64 个服务 × 64 个令牌接力） | 约 611 万次/秒 |
+| **worker 远多于负载**（16 worker，4 个服务 × 4 个令牌接力） | 约 262 万次/秒 |
+| 单服务消息吞吐（2 worker，一百万条消息） | 约 389 万条/秒 |
+| `call` 一个来回（4 worker，debug 构建，ping_pong 1000 轮） | 约 14µs |
 
-第二行是这轮改造的主要目标，也是收益最大的一处（4.4 倍）：原先 16 个 worker 抢一把 `Condvar`、轮流被无谓唤醒又空手而归，吞吐反而只有四线程时的六分之一；现在靠自旋接住迟到的投递、靠 `searching` 不叫第二个人起来、靠 handoff 把活直接递到手上，这条退化基本填平了。
+第二行量的是唤醒与窃取，不是队列本身：16 个 worker 只有 4 个服务可跑，大部分线程在「睡下、被叫醒、发现没自己的份、再睡」之间打转。skynet 那种全局队列加 `Condvar` 在这个场景下会被唤醒风暴压垮；这里靠自旋接住迟到的投递、靠 `searching` 不叫第二个人起来、靠 handoff 把活直接递到手上。
 
-第三行看不出差别：单服务吞吐压的是「一个 worker 反复取自己邮箱里的消息」，本来就没有竞争，换成无锁队列只是把无竞争的加解锁换成无竞争的 CAS，同一个量级。它的意义在于**确认没有回退**——邮箱那套状态机比原先的布尔量多了几次 CAS，值得盯一眼。
+第三行压的是「一个 worker 反复取自己邮箱里的消息」，本来就没有竞争。它的意义在于**确认没有回退**——邮箱那套状态机比原先的布尔量多了几次 CAS，值得盯一眼。
 
-这台机器的读数有 ±10% 的抖动（睿频与散热），所以上面的数字都是交替测五轮取中位数，单轮读数不必细究。
+本机读数有抖动（大小核调度与散热），所以上面的数字都是单独进程测五轮取中位数，单轮读数不必细究。
 
 压测跑法：
 
@@ -654,6 +654,12 @@ fn on_term(ctx: &rskynet::Ctx) {
 `<pid>-<毫秒时间戳>.log` 与 `.dmp`，文本报告也会打印到 stderr。
 原生访问违规测试默认跳过；需要手动验证时运行：
 
+```bash
+RSKYNET_RUN_NATIVE_CRASH_TEST=1 cargo test -p rskynet-signal --test native-crash
+```
+
+Windows 上等价写法：
+
 ```powershell
 $env:RSKYNET_RUN_NATIVE_CRASH_TEST='1'
 cargo test -p rskynet-signal --test native-crash
@@ -663,11 +669,7 @@ cargo test -p rskynet-signal --test native-crash
 `<workspace>/crash/rskynet-native-crash-<pid>-<时间戳>/crash/`，不受运行测试时
 当前目录影响。测试成功后自动删除；
 测试失败时保留，便于检查 `.log`、`.dmp` 与 `child.stderr`。
-如需在测试成功后也保留目录，额外设置：
-
-```powershell
-$env:RSKYNET_KEEP_NATIVE_CRASH_TEST_DIR='1'
-```
+如需在测试成功后也保留目录，额外设置 `RSKYNET_KEEP_NATIVE_CRASH_TEST_DIR=1`（Windows 上为 `$env:RSKYNET_KEEP_NATIVE_CRASH_TEST_DIR='1'`）。
 
 保留时测试输出会打印临时目录的完整路径；只有变量值严格等于 `1` 才会生效。
 
@@ -704,7 +706,7 @@ ping 完成 10 次 Protobuf request/reply 后会请求 pong 关闭，两个示�
 
 ```rust
 pub trait Timer: Send + Sync + 'static {
-    fn timeout(&self, handle: u32, session: u64, delay_ms: u32);
+    fn timeout(&self, handle: Handle, session: u64, delay_ms: u32);
     fn now(&self) -> u64;
     fn wall_clock(&self) -> u64;
     fn start_time(&self) -> u64;
