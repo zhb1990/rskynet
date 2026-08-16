@@ -117,21 +117,47 @@ impl std::fmt::Debug for Idler {
 pub(crate) fn exclusive_loop(ctx: Arc<ServiceContext>, service: Arc<dyn Exclusive>) {
     // 必须在任何一次挂起之前登记，见 [`Idler`] 的说明
     ctx.bind_thread();
+    let handle = ctx.handle;
+    let kind = ctx.kind.clone();
     let node = ctx.node.clone();
 
     // idle / dispatch / drain / destroy 中的 panic 都收在这里。with_ownership
     // 把整个善后路径都罩在「本服务持有者」作用域内，`fail_after_panic` 才能
     // 当场给 in-flight 请求回错误。
-    ctx.with_ownership(|| {
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            exclusive_loop_inner(&ctx, &service, &node);
-        }));
-        if panic.is_err() {
-            ctx.fail_after_panic();
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.with_ownership(|| {
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                exclusive_loop_inner(&ctx, &service, &node);
+            }));
+            if panic.is_err() {
+                ctx.fail_after_panic();
+                ctx.mailbox.mark_running();
+                node.destroy(ctx.clone());
+            }
+        });
+    }));
+
+    // 上面那条恢复路径若仍意外失败，这里做最后一次无 panic 销毁尝试。
+    // 恢复路径成功后 destroyed 已经置位且邮箱已放生，不能再清一遍。
+    if panic.is_err() && !ctx.is_destroyed() {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             ctx.mailbox.mark_running();
-            node.destroy(&ctx);
-        }
-    });
+            node.destroy(ctx.clone());
+        }));
+    }
+
+    // `ctx` 与 `service` 的最后一个 Arc 可能在这条线程上释放；service 对象的
+    // Drop 是用户代码，同样收住，不能让独占线程在最后一步逃逸 panic。
+    let drop_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop(service);
+        drop(ctx);
+    }));
+    if drop_panic.is_err() {
+        node.log(
+            handle,
+            format!("error: 独占服务 `{kind}` 最终析构时发生 panic，线程已正常收工"),
+        );
+    }
 }
 
 fn exclusive_loop_inner(
@@ -159,5 +185,5 @@ fn exclusive_loop_inner(
     ctx.mailbox.mark_running();
     node.drain_service(ctx);
     ctx.mailbox.mark_running();
-    node.destroy(ctx);
+    node.destroy(ctx.clone());
 }

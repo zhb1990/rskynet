@@ -240,6 +240,10 @@ impl ServiceContext {
         self.dead.load(Ordering::Acquire)
     }
 
+    pub(crate) fn is_destroyed(&self) -> bool {
+        self.destroyed.load(Ordering::Acquire)
+    }
+
     pub(crate) fn is_reserved(&self) -> bool {
         self.reserved.load(Ordering::Acquire)
     }
@@ -576,24 +580,16 @@ impl ServiceContext {
         let _running = Running::enter(self);
         loop {
             self.fail_inflight();
-            // 先丢任务再清 session 表：任务里的 `Call` 析构时还会来注销 session
-            let tasks = self.tasks.drain();
-            drop(tasks);
+            // 先丢任务再清 session 表：任务里的 `Call` 析构时还会来注销 session。
+            // 每个 Future / 消息 / Payload 的析构都单独隔离，既不让单个坏析构
+            // 打穿销毁流程，也避免 Vec 整体析构时多个 Drop panic 造成 double panic。
+            for task in self.tasks.drain() {
+                drop_catching_panic(task);
+            }
             self.sessions.clear();
             // 邮箱里没来得及处理的请求同样要回个错误
             for msg in self.mailbox.drain() {
-                if msg.needs_reply() && msg.source != 0 && !msg.mtype.is_reply() {
-                    let _ = self.node.send_raw(
-                        self.handle,
-                        msg.source,
-                        MsgType::ERROR,
-                        msg.session,
-                        Payload::None,
-                    );
-                }
-            }
-            if let Some(pending) = self.pending_messages.borrow_mut().take() {
-                for msg in pending {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     if msg.needs_reply() && msg.source != 0 && !msg.mtype.is_reply() {
                         let _ = self.node.send_raw(
                             self.handle,
@@ -603,6 +599,23 @@ impl ServiceContext {
                             Payload::None,
                         );
                     }
+                    drop(msg);
+                }));
+            }
+            if let Some(pending) = self.pending_messages.borrow_mut().take() {
+                for msg in pending {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        if msg.needs_reply() && msg.source != 0 && !msg.mtype.is_reply() {
+                            let _ = self.node.send_raw(
+                                self.handle,
+                                msg.source,
+                                MsgType::ERROR,
+                                msg.session,
+                                Payload::None,
+                            );
+                        }
+                        drop(msg);
+                    }));
                 }
             }
             if self.lifecycle.load(Ordering::Acquire) == lifecycle::INITIALIZING {
@@ -613,6 +626,11 @@ impl ServiceContext {
             }
         }
     }
+}
+
+/// 析构一个可能执行用户 `Drop` 的值，并把 panic 就地吞掉。
+fn drop_catching_panic<T>(value: T) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value)));
 }
 
 /// 一轮 [`Node::run_service`] 的结局。
@@ -963,19 +981,45 @@ impl Node {
     }
 
     /// 真正释放服务资源，只会由持有该服务的 worker 调用。
-    pub(crate) fn destroy(&self, ctx: &Arc<ServiceContext>) {
+    ///
+    /// 这里收下 `Arc` 而不是借用：cleanup 与最终一次 `Arc` 析构都可能执行用户
+    /// `Drop`，所以两层都包进 `catch_unwind`。`destroyed` / `total` / `quit` 的
+    /// 记账不能依赖任何用户析构函数正常返回。
+    pub(crate) fn destroy(&self, ctx: Arc<ServiceContext>) {
+        let handle = ctx.handle;
+        let kind = ctx.kind.clone();
+
         // cleanup 幂等：清理之后迟到的消息会把服务再推一次全局队列，在这里被再清一遍
-        ctx.cleanup();
-        if ctx.destroyed.swap(true, Ordering::AcqRel) {
-            return;
+        let cleanup_panic =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.cleanup())).is_err();
+
+        let claimed = !ctx.destroyed.swap(true, Ordering::AcqRel);
+        if claimed {
+            self.log(handle, format!("KILL {kind}"));
+            if cleanup_panic {
+                self.log(
+                    handle,
+                    format!("error: 服务 `{kind}` 销毁清理时发生 panic，已继续收尾"),
+                );
+            }
+            if !ctx.is_reserved()
+                && self.total.fetch_sub(1, Ordering::AcqRel) <= 1
+                && self.is_booted()
+            {
+                // 最后一个服务也走了，通知所有线程收工
+                self.quit();
+            }
         }
-        self.log(ctx.handle, format!("KILL {}", ctx.kind));
-        if ctx.is_reserved() {
-            return;
-        }
-        if self.total.fetch_sub(1, Ordering::AcqRel) <= 1 && self.is_booted() {
-            // 最后一个服务也走了，通知所有线程收工
-            self.quit();
+
+        // 最后一个 ServiceContext 引用可能在这里释放，service 对象的 Drop 也是
+        // 用户代码；同样只记录，不让它把 worker / 收尾线程打穿。
+        let drop_panic =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(ctx))).is_err();
+        if drop_panic {
+            self.log(
+                handle,
+                format!("error: 服务 `{kind}` 最终析构时发生 panic，已继续收尾"),
+            );
         }
     }
 
@@ -992,7 +1036,7 @@ impl Node {
         };
         match self.run_service(&ctx, true) {
             Ran::Dead => {
-                self.destroy(&ctx);
+                self.destroy(ctx);
                 self.sched.pop()
             }
             Ran::Idle => {
@@ -1092,6 +1136,13 @@ impl Node {
             .saturating_add(ctx.task_count().saturating_mul(2))
             .saturating_add(16);
         while budget > 0 {
+            // 这里只负责给仍 RUNNING 的服务排空收尾。若排空期间用户代码 panic，
+            // 服务已进入 FAILED，继续取消息只会触发 handle_message 里
+            // `pending_messages` 的 expect 并丢掉排队请求；交给 destroy/cleanup
+            // 统一回错误才是正确路径。
+            if !ctx.is_running() {
+                return;
+            }
             budget -= 1;
             match ctx.mailbox.take_work() {
                 None => return,
@@ -1529,5 +1580,84 @@ pub(crate) mod tests {
         assert_eq!(observed, (Some(victim), 0, 0, 0));
         assert!(node.handles.grab(victim).is_none());
         assert!(node.handles.grab(owner).is_none());
+    }
+
+    struct PanicDropPayload;
+
+    impl Drop for PanicDropPayload {
+        fn drop(&mut self) {
+            panic!("panic in Payload::drop");
+        }
+    }
+
+    /// cleanup 里多个用户 Payload 的析构 panic 都要逐个隔离。
+    #[test]
+    fn cleanup_contains_payload_drop_panics() {
+        let node = test_node();
+        let ctx = dummy_context_on(node.clone(), 7);
+        ctx.mailbox.mark_running();
+        ctx.mailbox.push_message(Message::new(
+            0,
+            0,
+            MsgType::USER,
+            Payload::of(PanicDropPayload),
+        ));
+        let session = ctx.sessions.alloc();
+        assert!(
+            ctx.sessions
+                .complete(session, Ok(Payload::of(PanicDropPayload)))
+        );
+
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| node.destroy(ctx)));
+        std::panic::set_hook(previous);
+
+        assert!(
+            result.is_ok(),
+            "destroy 必须吞掉 cleanup 中的用户析构 panic"
+        );
+    }
+
+    /// FAILED 服务不应再被 drain_service 逐条吞消息；应留给 destroy/cleanup 回错误。
+    #[test]
+    fn failed_service_messages_are_replied_by_cleanup_not_dropped_by_drain() {
+        let node = test_node();
+        let source = node
+            .handles
+            .register_with(|handle| dummy_context_on(node.clone(), handle))
+            .handle;
+        let victim = node
+            .handles
+            .register_with(|handle| dummy_context_on(node.clone(), handle));
+
+        victim.lifecycle.store(lifecycle::FAILED, Ordering::Release);
+        *victim.pending_messages.borrow_mut() = None;
+        victim.mailbox.mark_running();
+        victim
+            .mailbox
+            .push_message(Message::new(source, 41, MsgType::USER, Payload::None));
+        victim
+            .mailbox
+            .push_message(Message::new(source, 42, MsgType::USER, Payload::None));
+        assert!(node.retire(victim.handle));
+
+        node.drain_service(&victim);
+        assert_eq!(
+            victim.mailbox.len(),
+            2,
+            "FAILED 服务的排空应交给 cleanup，drain_service 不应再取消息"
+        );
+
+        node.destroy(victim);
+
+        let source_ctx = node.handles.grab(source).expect("source 服务应仍存活");
+        let errors = source_ctx.mailbox.drain();
+        let sessions: Vec<u64> = errors
+            .iter()
+            .filter(|msg| msg.mtype == MsgType::ERROR)
+            .map(|msg| msg.session)
+            .collect();
+        assert_eq!(sessions, vec![41, 42], "排队的两个请求都应收到错误回包");
     }
 }
