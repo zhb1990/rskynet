@@ -1,19 +1,31 @@
 //! Scheduler lost-wakeup 协议的抽象状态机。
 //!
-//! 只模拟 `work` / `searching` / `idle` / `wake_token`，不模拟 `thread::park`、
-//! `SegQueue`、BWoS、`ArcSwap`。
-//!
-//! 对应 `mq.rs` 在 `e6a049c` 的路径：
+//! 对应当前 [`crate::mq`] 的 lost-wakeup 协议。只模拟
+//! `work` / `searching` / `idle` / `wake` token / 每 worker 一个 `Notify`，
+//! 不模拟 `thread::park`、`SegQueue`、BWoS、`ArcSwap`。
 //!
 //! | 模型 | `Scheduler` |
 //! |---|---|
 //! | `work.fetch_add` + `fence(SeqCst)` + 读 `searching` | `pending.fetch_add` + `fence(SeqCst)` + `searching.load` |
-//! | `searching==0` 时 claim idle + `wake=true` | `claim_idle` + `Thread::unpark` |
-//! | 发布后再读 `searching.load(SeqCst)==0` 则补 wake | injector / place 后的复查 |
-//! | worker：`searching++`，扫 work，`idle=true`，`searching--`，`fence`，再扫，否则睡 | `find_work_or_park` |
+//! | `searching==0` 时 claim idle + `wake` bit + `Notify` | `claim_idle` + `Thread::unpark` |
+//! | 发布后再读 `searching.load(SeqCst)==0` 则补叫 | injector / place 后的复查 |
+//! | worker：`searching++`，扫 work，`idle`，`searching--`，`fence`，再扫，否则 `Notify::wait` | `find_work_or_park` |
+//!
+//! 三层加 quit：
+//!
+//! ```text
+//! idle bitmap   = 谁已声明「准备睡」
+//! wake bitmap   = 协议产生的逻辑工作 token
+//! Notify[id]    = 该 worker 的 OS park/unpark 模拟
+//! quit          = 退出条件；只能 unblock，不能制造 work token
+//! ```
+//!
+//! `Notify` 只负责阻塞；`wait()` 会探索 spurious wakeup，因此返回后必须先看
+//! 自己的 wake bit，绝不能直接 `take()`。shutdown 对每个 worker 无条件
+//! `notify()`，对齐 `set_quit()`，但不改 wake bitmap。
 //!
 //! 核心不变量：`work 已发布 ⇒ worker 能看见 work OR 持有 wake token`。
-//! 禁止 `work && sleeping && !wake && searching==0`。
+//! 真正 lost-wakeup 时 worker 会在 `Notify::wait` 上阻塞，Loom 报 deadlock。
 //!
 //! Loom 把普通 `SeqCst` 访问按较弱的 `AcqRel` 处理；`fence(SeqCst)` 是支持的，
 //! 但本模型全绿不是形式化证明。真实协议仍靠
@@ -24,7 +36,8 @@
 
 #![cfg(all(test, loom))]
 
-use crate::sync::{AtomicU64, AtomicUsize, Ordering, fence, thread};
+use crate::sync::{Arc, AtomicBool, AtomicU64, AtomicUsize, Ordering, fence, thread};
+use loom::sync::Notify;
 
 struct WakeModel {
     work: AtomicUsize,
@@ -32,16 +45,20 @@ struct WakeModel {
     idle: AtomicU64,
     wake: AtomicU64,
     sleeping: AtomicU64,
+    quit: AtomicBool,
+    notifies: Vec<Notify>,
 }
 
 impl WakeModel {
-    fn new() -> Self {
+    fn new(workers: usize) -> Self {
         Self {
             work: AtomicUsize::new(0),
             searching: AtomicUsize::new(0),
             idle: AtomicU64::new(0),
             wake: AtomicU64::new(0),
             sleeping: AtomicU64::new(0),
+            quit: AtomicBool::new(false),
+            notifies: (0..workers).map(|_| Notify::new()).collect(),
         }
     }
 
@@ -65,7 +82,8 @@ impl WakeModel {
     fn wake_idle(&self) -> bool {
         let mut bits = self.idle.load(Ordering::Relaxed);
         while bits != 0 {
-            let bit = 1u64 << bits.trailing_zeros();
+            let id = bits.trailing_zeros() as usize;
+            let bit = 1u64 << id;
             match self.idle.compare_exchange_weak(
                 bits,
                 bits & !bit,
@@ -73,13 +91,28 @@ impl WakeModel {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    self.wake.fetch_or(bit, Ordering::Release);
+                    self.notify_worker(id);
                     return true;
                 }
                 Err(actual) => bits = actual,
             }
         }
         false
+    }
+
+    /// 工作唤醒：必须先写 protocol token，再 Notify。
+    fn notify_worker(&self, id: usize) {
+        let bit = 1u64 << id;
+        self.wake.fetch_or(bit, Ordering::Release);
+        self.notifies[id].notify();
+    }
+
+    /// 对齐 `set_quit`：先置 quit，再对每个 worker unpark。不改 wake bitmap。
+    fn notify_all_for_shutdown(&self) {
+        self.quit.store(true, Ordering::Release);
+        for notify in &self.notifies {
+            notify.notify();
+        }
     }
 
     fn take(&self) -> bool {
@@ -91,95 +124,115 @@ impl WakeModel {
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => return true,
+                Ok(_) => {
+                    // 最后一件被取走：叫醒所有 waiter 复查 quit / 空队列。
+                    // 不改 wake bitmap。quit 尚未置位时，他们会再 wait，等 shutdown。
+                    if current == 1 {
+                        for notify in &self.notifies {
+                            notify.notify();
+                        }
+                    }
+                    return true;
+                }
                 Err(actual) => current = actual,
             }
         }
         false
     }
 
-    fn worker(&self, id: usize) -> bool {
-        let bit = 1u64 << id;
-        self.searching.fetch_add(1, Ordering::SeqCst);
-        if self.take() {
-            self.searching.fetch_sub(1, Ordering::Relaxed);
-            return true;
-        }
-        self.idle.fetch_or(bit, Ordering::SeqCst);
-        self.searching.fetch_sub(1, Ordering::SeqCst);
-        fence(Ordering::SeqCst);
-        if self.take() {
-            self.idle.fetch_and(!bit, Ordering::Relaxed);
-            return true;
-        }
-        let woken = self.wake.fetch_and(!bit, Ordering::AcqRel) & bit != 0;
-        if woken {
-            self.idle.fetch_and(!bit, Ordering::Relaxed);
-            return self.take();
-        }
-        self.sleeping.fetch_or(bit, Ordering::Release);
-        false
+    fn should_exit(&self) -> bool {
+        self.quit.load(Ordering::Acquire) && self.work.load(Ordering::Relaxed) == 0
     }
 
-    fn assert_no_lost_wakeup(&self, got: bool) {
-        let work = self.work.load(Ordering::SeqCst);
-        let sleeping = self.sleeping.load(Ordering::SeqCst);
-        let wake = self.wake.load(Ordering::SeqCst);
-        let searching = self.searching.load(Ordering::SeqCst);
-        assert!(
-            !(work > 0 && sleeping != 0 && wake == 0 && searching == 0),
-            "lost wakeup: work={work} sleeping={sleeping} wake={wake} searching={searching} got={got}"
-        );
-        assert!(
-            got || work == 0 || wake != 0 || sleeping != 0,
-            "work vanished without a consumer or wake token"
-        );
+    fn worker(&self, id: usize) -> bool {
+        let bit = 1u64 << id;
+        loop {
+            if self.should_exit() {
+                return false;
+            }
+
+            self.searching.fetch_add(1, Ordering::SeqCst);
+            if self.take() {
+                self.searching.fetch_sub(1, Ordering::Relaxed);
+                return true;
+            }
+            self.idle.fetch_or(bit, Ordering::SeqCst);
+            self.searching.fetch_sub(1, Ordering::SeqCst);
+            fence(Ordering::SeqCst);
+            if self.take() {
+                self.idle.fetch_and(!bit, Ordering::Relaxed);
+                return true;
+            }
+
+            self.sleeping.fetch_or(bit, Ordering::Release);
+            loop {
+                if self.should_exit() {
+                    self.sleeping.fetch_and(!bit, Ordering::Relaxed);
+                    self.idle.fetch_and(!bit, Ordering::Relaxed);
+                    return false;
+                }
+                self.notifies[id].wait();
+                let has_token = self.wake.fetch_and(!bit, Ordering::AcqRel) & bit != 0;
+                if has_token {
+                    self.sleeping.fetch_and(!bit, Ordering::Relaxed);
+                    self.idle.fetch_and(!bit, Ordering::Relaxed);
+                    if self.take() {
+                        return true;
+                    }
+                    if self.should_exit() {
+                        return false;
+                    }
+                    // token 只表示有资格再找活；take 失败则重新走协议
+                    break;
+                }
+                if self.should_exit() {
+                    self.sleeping.fetch_and(!bit, Ordering::Relaxed);
+                    self.idle.fetch_and(!bit, Ordering::Relaxed);
+                    return false;
+                }
+            }
+        }
     }
+}
+
+fn check(workers: usize) {
+    let mut builder = loom::model::Builder::new();
+    builder.preemption_bound = Some(2);
+    builder.max_threads = 6;
+    builder.check(move || {
+        let model = Arc::new(WakeModel::new(workers));
+        let producer = {
+            let model = model.clone();
+            thread::spawn(move || model.publish())
+        };
+        let handles: Vec<_> = (0..workers)
+            .map(|id| {
+                let model = model.clone();
+                thread::spawn(move || model.worker(id))
+            })
+            .collect();
+
+        producer.join().unwrap();
+        model.notify_all_for_shutdown();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        assert_eq!(
+            model.work.load(Ordering::SeqCst),
+            0,
+            "published work must be consumed"
+        );
+    });
 }
 
 /// 1 producer × 1 worker：覆盖 searcher 吸收唤醒，以及复查补叫。
 #[test]
 fn one_producer_one_worker_never_strands_work() {
-    let mut builder = loom::model::Builder::new();
-    builder.preemption_bound = Some(2);
-    builder.check(|| {
-        let model = std::sync::Arc::new(WakeModel::new());
-        let producer = {
-            let model = model.clone();
-            thread::spawn(move || model.publish())
-        };
-        let worker = {
-            let model = model.clone();
-            thread::spawn(move || model.worker(0))
-        };
-        producer.join().unwrap();
-        let got = worker.join().unwrap();
-        model.assert_no_lost_wakeup(got);
-    });
+    check(1);
 }
 
-/// 1 producer × 2 worker：一个在找、一个可能已闲，work 不得和双睡一起出现。
+/// 1 producer × 2 worker：一人取走后另一人因 quit 退出；无 token 不得偷吃。
 #[test]
 fn one_producer_two_workers_never_strands_work() {
-    let mut builder = loom::model::Builder::new();
-    builder.preemption_bound = Some(2);
-    builder.check(|| {
-        let model = std::sync::Arc::new(WakeModel::new());
-        let producer = {
-            let model = model.clone();
-            thread::spawn(move || model.publish())
-        };
-        let w0 = {
-            let model = model.clone();
-            thread::spawn(move || model.worker(0))
-        };
-        let w1 = {
-            let model = model.clone();
-            thread::spawn(move || model.worker(1))
-        };
-        producer.join().unwrap();
-        let got0 = w0.join().unwrap();
-        let got1 = w1.join().unwrap();
-        model.assert_no_lost_wakeup(got0 || got1);
-    });
+    check(2);
 }

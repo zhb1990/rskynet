@@ -1,13 +1,26 @@
 //! 并发原语门面。默认 std；`RUSTFLAGS='--cfg loom'` 切到 loom。
 //!
-//! 只有需要被 Loom 建模的模块（[`crate::bwos`]、[`crate::handoff`]）走这里。
-//! Scheduler 本体继续用 std，避免把 `SegQueue` / `ArcSwap` / `park` 卷进模型。
+//! 需要被 Loom 建模的底层模块和 `loom_*` 抽象模型走这里；
+//! Scheduler 本体仍使用 std，不整体 Loom 化。
 //!
 //! ```text
-//! RUSTFLAGS="--cfg loom" cargo test -p rskynet-core --lib loom_ -- --test-threads=1
+//! Loom（必须过滤 loom_，否则其它单测会在 loom::model 外碰到 loom 原子量）：
 //!
-//! RUSTFLAGS="-Zsanitizer=thread" RUSTDOCFLAGS="-Zsanitizer=thread" \
-//!   cargo +nightly test -Zbuild-std --target aarch64-apple-darwin -p rskynet-core
+//!   RUSTFLAGS="--cfg loom" cargo test -p rskynet-core --lib loom_ -- --test-threads=1
+//!
+//! TSAN（nightly + rust-src；仅 Apple Silicon / aarch64-apple-darwin。
+//! `-Zsanitizer` / `-Zbuild-std` 未稳定，不是 crate MSRV。
+//! 仓库 panic=abort，必须独立目录且测试用 unwind）：
+//!
+//!   rustup component add rust-src --toolchain nightly-aarch64-apple-darwin
+//!
+//!   CARGO_TARGET_DIR=target/tsan \
+//!   CARGO_INCREMENTAL=0 \
+//!   CARGO_PROFILE_DEV_PANIC=unwind \
+//!   CARGO_PROFILE_RELEASE_PANIC=unwind \
+//!   RUSTFLAGS="-Zsanitizer=thread" \
+//!   RUSTDOCFLAGS="-Zsanitizer=thread" \
+//!     cargo +nightly test -Zbuild-std --target aarch64-apple-darwin -p rskynet-core
 //! ```
 //!
 //! ThreadSanitizer 不支持 `atomic::fence`。lost-wakeup 协议依赖 `fence(SeqCst)`，

@@ -1544,33 +1544,52 @@ mod tests {
         assert_eq!(sched.len(), 0, "取空后运行队列计数必须归零");
     }
 
-    /// 高频 park / unpark：worker 真正走 `find_work_or_park`，补 Loom 状态机
-    /// 故意不模拟 `thread::park` 的缺口。TSAN 下跑它可以抓普通 data race；
-    /// 抓不了 `fence(SeqCst)` 相关的 lost-wakeup，所以不能替代钩子测试。
+    /// 高频 park / unpark：一次只投一件，等全部 worker 重新登记 idle 再投下一件。
+    /// worker 顺序与生产一致（先 `pop`，再 `find_work_or_park`）。
+    /// TSAN 下跑它可以抓普通 data race；抓不了 `fence(SeqCst)` 相关的
+    /// lost-wakeup，所以不能替代钩子测试。
     #[test]
     fn park_unpark_churn_does_not_strand_work() {
         const WORKERS: usize = 3;
-        const ROUNDS: u32 = 300;
+        const ROUNDS: u32 = 80;
 
         let node = test_node_with(Config::default().with_thread(WORKERS));
         let sched = &node.sched;
         let popped = AtomicUsize::new(0);
-        let pushed = AtomicUsize::new(0);
+        let park_returns = AtomicUsize::new(0);
 
         thread::scope(|scope| {
+            struct QuitOnDrop<'a>(&'a Scheduler);
+            impl Drop for QuitOnDrop<'_> {
+                fn drop(&mut self) {
+                    self.0.set_quit();
+                }
+            }
+            let _quit = QuitOnDrop(sched);
+
+            let wait_until = |cond: &dyn Fn() -> bool, msg: &str| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while !cond() && std::time::Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                assert!(cond(), "{msg}");
+            };
+
             for id in 0..WORKERS {
                 let popped = &popped;
+                let park_returns = &park_returns;
                 scope.spawn(move || {
                     let _worker = sched.register_worker(id);
                     while !sched.is_quit() {
-                        if let Some(_ctx) = sched.pop() {
+                        if sched.pop().is_some() {
                             popped.fetch_add(1, Ordering::SeqCst);
                             continue;
                         }
-                        if let Some(_ctx) = sched.find_work_or_park() {
+                        if sched.find_work_or_park().is_some() {
                             popped.fetch_add(1, Ordering::SeqCst);
                             continue;
                         }
+                        park_returns.fetch_add(1, Ordering::SeqCst);
                     }
                     while sched.pop().is_some() {
                         popped.fetch_add(1, Ordering::SeqCst);
@@ -1578,24 +1597,32 @@ mod tests {
                 });
             }
 
-            for n in 0..ROUNDS {
-                sched.push(dummy_context_on(node.clone(), n as u64));
-                pushed.fetch_add(1, Ordering::SeqCst);
-            }
+            wait_until(
+                &|| sched.sleeping() == WORKERS,
+                "启动后所有 worker 应先登记 idle",
+            );
 
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while popped.load(Ordering::SeqCst) < pushed.load(Ordering::SeqCst)
-                && std::time::Instant::now() < deadline
-            {
-                sched.poke();
-                std::thread::yield_now();
+            for n in 0..ROUNDS {
+                let returns_before = park_returns.load(Ordering::SeqCst);
+                sched.push(dummy_context_on(node.clone(), n as u64));
+                wait_until(
+                    &|| popped.load(Ordering::SeqCst) == n as usize + 1,
+                    "本轮任务必须被取走",
+                );
+                wait_until(
+                    &|| sched.sleeping() == WORKERS,
+                    "取走后所有 worker 应重新登记 idle",
+                );
+                assert!(
+                    park_returns.load(Ordering::SeqCst) > returns_before,
+                    "第 {n} 轮必须走过一次 park 返回路径"
+                );
             }
-            sched.set_quit();
         });
 
         assert_eq!(
             popped.load(Ordering::SeqCst),
-            pushed.load(Ordering::SeqCst),
+            ROUNDS as usize,
             "park/unpark churn 不得丢活"
         );
         assert_eq!(sched.len(), 0, "取空后 pending 必须归零");
