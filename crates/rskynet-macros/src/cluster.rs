@@ -86,7 +86,7 @@ impl syn::parse::Parse for HandlerArgs {
             Target::Name(input.parse()?)
         } else if input.peek(LitInt) {
             let value: LitInt = input.parse()?;
-            value.base10_parse::<u32>()?;
+            value.base10_parse::<u64>()?;
             Target::Handle(value)
         } else {
             return Err(input.error("目标要写字符串服务名或 u32 handle 字面量"));
@@ -156,7 +156,7 @@ fn try_handler(attr: TokenStream, item: TokenStream) -> Result<TokenStream> {
             )),
         ),
         Target::Handle(handle) => {
-            let value = handle.base10_parse::<u32>()?;
+            let value = handle.base10_parse::<u64>()?;
             (
                 quote!(#value),
                 quote!(#krate::AutoHandler::handle(

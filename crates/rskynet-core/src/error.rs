@@ -8,7 +8,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     /// 目标地址上没有活着的服务，对应 skynet 里 `skynet_context_push` 返回 -1 的情况。
     #[error("服务 :{0:08x} 不存在")]
-    NoService(u32),
+    NoService(crate::Handle),
 
     /// 服务类型没有在 `Registry` 中注册，对应 skynet 找不到 `.so` 模块。
     #[error("未注册的服务类型 `{0}`")]
@@ -20,7 +20,7 @@ pub enum Error {
 
     /// 对端以 `MsgType::ERROR` 应答，或对端在处理请求期间退出。
     #[error("请求被服务 :{0:08x} 拒绝，或对端已退出")]
-    CallFailed(u32),
+    CallFailed(crate::Handle),
 
     /// 等待中的 session 随服务销毁一起消失。
     #[error("请求已取消")]

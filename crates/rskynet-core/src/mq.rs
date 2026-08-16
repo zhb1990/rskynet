@@ -1118,7 +1118,7 @@ mod tests {
             scope.spawn(|| {
                 let _worker = sched.register_worker(0);
                 // 攒够两整块，好让 0 号把它们交给窃贼
-                for handle in 0..(bwos::BLOCK_SIZE as u32 * 2 + 8) {
+                for handle in 0..(bwos::BLOCK_SIZE as u64 * 2 + 8) {
                     sched.push(dummy_context_on(node.clone(), handle));
                 }
             });
@@ -1145,7 +1145,7 @@ mod tests {
             scope.spawn(|| {
                 let _worker = sched.register_worker(0);
                 // 不满一块时对窃贼是隐形的，位图也不该置位
-                for handle in 0..(bwos::BLOCK_SIZE as u32) {
+                for handle in 0..(bwos::BLOCK_SIZE as u64) {
                     sched.push(dummy_context_on(node.clone(), handle));
                 }
                 assert!(!sched.is_stealable(0), "还在当前块里，没什么可偷");
@@ -1214,7 +1214,7 @@ mod tests {
         thread::scope(|scope| {
             scope.spawn(|| {
                 let _worker = sched.register_worker(0);
-                for handle in 0..(capacity as u32 + 8) {
+                for handle in 0..(capacity as u64 + 8) {
                     sched.push(dummy_context_on(node.clone(), handle));
                 }
             });
@@ -1525,9 +1525,9 @@ mod tests {
                 let node = node.clone();
                 scope.spawn(move || {
                     let _worker = sched.register_worker(id);
-                    let base = id as u32 * PER_WORKER;
+                    let base = id as u64 * PER_WORKER as u64;
                     for n in 0..PER_WORKER {
-                        sched.push(dummy_context_on(node.clone(), base + n));
+                        sched.push(dummy_context_on(node.clone(), base + n as u64));
                     }
                     // 不 park：所有 worker 一直扫到全部活取空为止，专测队列本身。
                     // 给个宽限期，失败时别让 scoped thread 无限空转。

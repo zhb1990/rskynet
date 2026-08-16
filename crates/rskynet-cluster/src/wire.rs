@@ -1,6 +1,6 @@
 use prost::{Enumeration, Message, Oneof};
 
-pub(crate) const PROTOCOL_VERSION: u32 = 1;
+pub(crate) const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct Envelope {
@@ -35,8 +35,8 @@ pub(crate) mod target {
 
     #[derive(Clone, PartialEq, Oneof)]
     pub enum Value {
-        #[prost(uint32, tag = "1")]
-        Handle(u32),
+        #[prost(uint64, tag = "1")]
+        Handle(u64),
         #[prost(string, tag = "2")]
         Name(String),
     }

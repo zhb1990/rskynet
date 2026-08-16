@@ -12,12 +12,18 @@
 //!
 //! # 计数器编码
 //!
-//! 块计数器（`last_block` / `start_block` / 块内的 `head` / `steal_tail`）都是 64 位：
+//! 全局计数器（`last_block` / `start_block`）直接存**逻辑 block sequence**：
+//! 从 0 开始单调递增的 u64，永不回绕。物理块下标是 `sequence & mask`，
+//! 块 generation 是 `sequence >> block_shift`；因此块被复用时 generation 必然变化，
+//! 旧 thief 拿着的旧 sequence 不可能再读到新世代数据。
 //!
-//! - 高 32 位：轮次，每绕环一圈加一，溢出即回绕
-//! - 低 32 位：索引（块下标或块内下标）
+//! 块内状态（`head` / `steal_tail`）仍是单个 64 位原子量：
 //!
-//! 轮次的作用是防 ABA：块被复用时轮次必然变化，窃贼拿着旧轮次就会被识破。
+//! - 高 56 位：块 generation
+//! - 低 8 位：块内槽位下标（`BLOCK_SIZE` 必须小于 256）
+//!
+//! generation 的作用是防 ABA；`Block::steal` 在做任何 `ptr::read` 之前先比对
+//! generation，不同则直接停下。
 //!
 //! # 线程安全
 //!
@@ -36,11 +42,14 @@ use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// 计数器低 32 位的索引掩码。
-const IDX_MASK: u64 = 0xFFFF_FFFF;
-
-/// 第 0 轮的「上一轮」。新块的轮次取它，好让第 0 轮的 `is_writable` 一开始就成立。
-const PREV_ROUND_0: u64 = 0xFFFF_FFFF_0000_0000;
+/// 块内槽位占用的低 bit 数。当前最大块长 16，留 8 bit 已经足够，
+/// 而且让「generation << SLOT_BITS | slot」继续装进一个 AtomicU64。
+const SLOT_BITS: u32 = 8;
+/// 块内槽位掩码。
+const SLOT_MASK: u64 = (1 << SLOT_BITS) - 1;
+/// 第 0 代的「上一代」哨兵：未使用块的初始 generation 取最大值，
+/// 让第 0 代的 `is_writable` 一开始就成立。generation 只占高 56 bit。
+const PREV_GEN_0: u64 = (1 << (64 - SLOT_BITS)) - 1;
 
 /// 每条本地队列的块数，必须是 2 的幂且不小于 2。
 pub(crate) const NUM_BLOCKS: usize = 64;
@@ -96,14 +105,14 @@ enum Steal<T> {
 
 /// 环形缓冲的一块。
 struct Block<T> {
-    /// owner 侧边界：高 32 位轮次，低 32 位索引。`takeover` / `grant` 时与
-    /// `steal_tail` 互换。
+    /// owner 侧边界：高 56 bit generation，低 8 bit slot。`takeover` / `grant`
+    /// 时与 `steal_tail` 互换。
     head: CachePad<AtomicU64>,
     /// owner 的写入位置，纯索引，只有 owner 会改。
     tail: CachePad<AtomicU64>,
     /// 已完成的窃取次数，`reclaim` 靠它确认窃贼都收工了。
     steal_count: CachePad<AtomicU64>,
-    /// 窃贼侧边界：高 32 位轮次，低 32 位索引。低位等于块长即表示本块已偷空。
+    /// 窃贼侧边界：高 56 bit generation，低 8 bit slot。低位等于块长即表示本块已偷空。
     steal_tail: CachePad<AtomicU64>,
     ring: Box<[UnsafeCell<MaybeUninit<T>>]>,
 }
@@ -113,11 +122,12 @@ impl<T> Block<T> {
         let mut ring = Vec::with_capacity(block_size);
         ring.resize_with(block_size, || UnsafeCell::new(MaybeUninit::uninit()));
         let size = block_size as u64;
+        let initial = (PREV_GEN_0 << SLOT_BITS) | size;
         Self {
-            head: CachePad(AtomicU64::new(PREV_ROUND_0 | size)),
+            head: CachePad(AtomicU64::new(initial)),
             tail: CachePad(AtomicU64::new(size)),
             steal_count: CachePad(AtomicU64::new(size)),
-            steal_tail: CachePad(AtomicU64::new(PREV_ROUND_0 | size)),
+            steal_tail: CachePad(AtomicU64::new(initial)),
             ring: ring.into_boxed_slice(),
         }
     }
@@ -137,9 +147,8 @@ impl<T> Block<T> {
     /// 只能由 owner 线程调用。
     unsafe fn put(&self, value: T) -> Result<(), T> {
         let back = self.tail.load(Ordering::Relaxed);
-        let back_idx = back & IDX_MASK;
-        if back_idx < self.block_size() {
-            unsafe { ptr::write(self.slot(back_idx), value) };
+        if back < self.block_size() {
+            unsafe { ptr::write(self.slot(back), value) };
             // Release：与窃贼 steal() 里对 tail 的 acquire 配对，保证它读到的槽位是写完的
             self.tail.store(back + 1, Ordering::Release);
             Ok(())
@@ -155,33 +164,32 @@ impl<T> Block<T> {
     /// 只能由 owner 线程调用。
     unsafe fn get(&self) -> Option<T> {
         let back = self.tail.load(Ordering::Relaxed);
-        let back_idx = back & IDX_MASK;
-        if back_idx == 0 {
+        if back == 0 {
             return None;
         }
-        let front_idx = self.head.load(Ordering::Relaxed) & IDX_MASK;
-        if front_idx == back_idx {
+        let front_idx = self.head.load(Ordering::Relaxed) & SLOT_MASK;
+        if front_idx == back {
             // owner 的可取区间 [head, tail) 空了
             return None;
         }
-        let value = unsafe { ptr::read(self.slot(back_idx - 1)) };
+        let value = unsafe { ptr::read(self.slot(back - 1)) };
         self.tail.store(back - 1, Ordering::Release);
         Some(value)
     }
 
     /// 从本块头部偷一个元素（FIFO），任意线程可调用。
-    fn steal(&self, thief_round: u32) -> Steal<T> {
+    fn steal(&self, thief_generation: u64) -> Steal<T> {
         let spos = self.steal_tail.load(Ordering::Relaxed);
-        let sidx = spos & IDX_MASK;
-        let round = spos >> 32;
+        let sidx = spos & SLOT_MASK;
+        let generation = spos >> SLOT_BITS;
+        // generation 校验必须先于任何 ptr::read：旧 thief 可能落后到物理块已经被
+        // 复用给新世代，此时必须直接停下，绝不能把新世代数据当成自己的猎物。
+        if generation != thief_generation {
+            return Steal::Empty;
+        }
         if sidx == self.block_size() {
-            // 本块不可偷。轮次相同说明是「已偷空」，可以往后找；
-            // 轮次不同说明这块属于别的世代，说明已经追到 owner 的当前块了
-            return if u64::from(thief_round) == round {
-                Steal::Done
-            } else {
-                Steal::Empty
-            };
+            // 本块已经偷空，可以往后找。
+            return Steal::Done;
         }
         // Acquire：与 owner put() 的 release 配对
         let back = self.tail.load(Ordering::Acquire);
@@ -216,19 +224,22 @@ impl<T> Block<T> {
         self.steal_tail.store(old_head, Ordering::Release);
     }
 
-    /// 本块能否安全地被第 `round` 轮复用：必须已被偷空，且停在上一轮。
-    fn is_writable(&self, round: u32) -> bool {
-        let writable = (u64::from(round.wrapping_sub(1)) << 32) | self.block_size();
+    /// 本块能否安全地被第 `generation` 代复用：必须已被偷空，且停在上一代。
+    ///
+    /// generation 0 需要和「上一代」哨兵比较，因此这里保留 `wrapping_sub`；
+    /// 它只是块协议里的 sentinel 计算，不是全局 sequence 回绕。
+    fn is_writable(&self, generation: u64) -> bool {
+        let writable = (generation.wrapping_sub(1) << SLOT_BITS) | self.block_size();
         self.steal_tail.load(Ordering::Relaxed) == writable
     }
 
-    /// 复位本块以供第 `round` 轮使用，会自旋等待上一轮的窃贼全部收工。
-    fn reclaim(&self, round: u32) {
-        let expected = self.head.load(Ordering::Relaxed) & IDX_MASK;
+    /// 复位本块以供第 `generation` 代使用，会自旋等待上一代的窃贼全部收工。
+    fn reclaim(&self, generation: u64) {
+        let expected = self.head.load(Ordering::Relaxed) & SLOT_MASK;
         while self.steal_count.load(Ordering::Acquire) != expected {
             std::hint::spin_loop();
         }
-        let expanded = u64::from(round) << 32;
+        let expanded = generation << SLOT_BITS;
         self.head.store(expanded, Ordering::Relaxed);
         self.tail.store(0, Ordering::Relaxed);
         self.steal_tail
@@ -236,13 +247,12 @@ impl<T> Block<T> {
         self.steal_count.store(0, Ordering::Relaxed);
     }
 
-    /// owner 往回走时把窃贼边界的轮次减一，好让后续的 `is_writable` 判断依旧成立。
-    fn reduce_round(&self) {
+    /// owner 往回走时把窃贼边界的 generation 减一，好让后续的 `is_writable`
+    /// 判断依旧成立。减法同样属于块协议 sentinel 运算，不是全局回绕。
+    fn reduce_generation(&self) {
         let steal_tail = self.steal_tail.load(Ordering::Relaxed);
-        let round = (steal_tail >> 32) as u32;
-        let idx = steal_tail & IDX_MASK;
-        let reduced = (u64::from(round.wrapping_sub(1)) << 32) | idx;
-        self.steal_tail.store(reduced, Ordering::Relaxed);
+        self.steal_tail
+            .store(steal_tail.wrapping_sub(1 << SLOT_BITS), Ordering::Relaxed);
     }
 }
 
@@ -255,9 +265,9 @@ impl<T> Drop for Block<T> {
         // [min(head_idx, steal_idx), tail_idx)，对四种块状态都成立：
         // 活跃块 head_idx = 0；已 grant 的块 head_idx = 块长而 steal_idx 是窃取位置；
         // 被偷空的块与从未使用的块两个下标都等于块长，区间自然为空。
-        let head_idx = *self.head.get_mut() & IDX_MASK;
-        let steal_idx = *self.steal_tail.get_mut() & IDX_MASK;
-        let tail_idx = *self.tail.get_mut() & IDX_MASK;
+        let head_idx = *self.head.get_mut() & SLOT_MASK;
+        let steal_idx = *self.steal_tail.get_mut() & SLOT_MASK;
+        let tail_idx = *self.tail.get_mut() & SLOT_MASK;
         for idx in head_idx.min(steal_idx)..tail_idx {
             unsafe { ptr::drop_in_place(self.slot(idx)) };
         }
@@ -265,14 +275,21 @@ impl<T> Drop for Block<T> {
 }
 
 /// 队列本体，由一个 [`Owner`] 和任意多个 [`Stealer`] 共享。
+///
+/// `last_block` / `start_block` 直接存**逻辑 block sequence**：从 0 开始单调递增，
+/// 永不回绕。物理块下标是 `sequence & mask`，块 generation 是
+/// `sequence >> block_shift`。sequence 只增不减，因此旧 thief 永远拿不到新
+/// generation 对应的身份。
 struct LifoQueue<T> {
-    /// owner 当前所在块的计数器，只有 owner 会改。
+    /// owner 当前所在块的逻辑 sequence，只有 owner 会改。
     last_block: CachePad<AtomicU64>,
-    /// 最老的、还可能有货可偷的块的计数器，只有 owner 会改。
+    /// 最老的、还可能有货可偷的块的逻辑 sequence，只有 owner 会改。
     start_block: CachePad<AtomicU64>,
     blocks: Box<[Block<T>]>,
-    /// `blocks.len() - 1`，用来从计数器里抠出块下标。
+    /// `blocks.len() - 1`，用来从 sequence 里抠出物理块下标。
     mask: u64,
+    /// `blocks.len()` 是 2 的幂，sequence >> shift 就是块 generation。
+    block_shift: u32,
 }
 
 // 安全性：见模块头的线程安全说明。槽位的并发访问由块协议保证不重叠，
@@ -287,6 +304,10 @@ impl<T> LifoQueue<T> {
             "块数必须是不小于 2 的 2 的幂"
         );
         assert!(block_size > 0, "块长必须大于 0");
+        assert!(
+            block_size < (1 << SLOT_BITS) as usize,
+            "块长必须小于 2^SLOT_BITS，装不进块内 generation 编码"
+        );
         let mut blocks = Vec::with_capacity(num_blocks);
         blocks.resize_with(num_blocks, || Block::new(block_size));
         blocks[0].reclaim(0);
@@ -295,22 +316,22 @@ impl<T> LifoQueue<T> {
             start_block: CachePad(AtomicU64::new(0)),
             blocks: blocks.into_boxed_slice(),
             mask: (num_blocks - 1) as u64,
+            block_shift: num_blocks.trailing_zeros(),
         }
     }
 
-    fn increase_block_counter(&self, counter: u64) -> u64 {
-        let round = (counter >> 32) as u32;
-        let next_index = ((counter & self.mask) + 1) & self.mask;
-        let next_round = round.wrapping_add(u32::from(next_index == 0));
-        (u64::from(next_round) << 32) | next_index
+    /// 逻辑 sequence 只增不减。u64 耗尽属于进程级故障，直接 fail-fast。
+    fn next_sequence(&self, sequence: u64) -> u64 {
+        sequence
+            .checked_add(1)
+            .expect("BWoS block sequence 耗尽（u64 单调序列走到头）")
     }
 
-    fn decrease_block_counter(&self, counter: u64) -> u64 {
-        let round = (counter >> 32) as u32;
-        let index = counter & self.mask;
-        let prev_index = index.wrapping_sub(1) & self.mask;
-        let prev_round = round.wrapping_sub(u32::from(index == 0));
-        (u64::from(prev_round) << 32) | prev_index
+    /// 逻辑 sequence 只增不减；owner 往回走不会越过 0。
+    fn previous_sequence(&self, sequence: u64) -> u64 {
+        sequence
+            .checked_sub(1)
+            .expect("BWoS block sequence 不能越过 0 回退")
     }
 
     /// # Safety
@@ -361,10 +382,10 @@ impl<T> LifoQueue<T> {
     fn steal_front(&self) -> Option<T> {
         let mut thief = self.start_block.load(Ordering::Relaxed);
         loop {
-            let thief_round = (thief >> 32) as u32;
+            let thief_generation = thief >> self.block_shift;
             let block = &self.blocks[(thief & self.mask) as usize];
             loop {
-                match block.steal(thief_round) {
+                match block.steal(thief_generation) {
                     Steal::Taken(value) => return Some(value),
                     Steal::Empty => return None,
                     Steal::Conflict => continue,
@@ -382,8 +403,8 @@ impl<T> LifoQueue<T> {
         if self.start_block.load(Ordering::Relaxed) == *owner {
             return false;
         }
-        let predecessor = self.decrease_block_counter(*owner);
-        self.blocks[owner_index].reduce_round();
+        let predecessor = self.previous_sequence(*owner);
+        self.blocks[owner_index].reduce_generation();
         self.blocks[(predecessor & self.mask) as usize].takeover();
         self.last_block.store(predecessor, Ordering::Relaxed);
         *owner = predecessor;
@@ -393,31 +414,32 @@ impl<T> LifoQueue<T> {
     /// owner 往前进一块。返回 false 表示下一块还不能复用，队列满了。
     fn advance_put_index(&self, owner: &mut u64) -> bool {
         let owner_index = *owner & self.mask;
-        let next_index = (*owner + 1) & self.mask;
+        let next_sequence = self.next_sequence(*owner);
+        let next_index = next_sequence & self.mask;
         if next_index == owner_index {
             return false;
         }
-        let next_round = ((*owner >> 32) as u32).wrapping_add(u32::from(next_index == 0));
+        let next_generation = next_sequence >> self.block_shift;
         let next_block = &self.blocks[next_index as usize];
-        if !next_block.is_writable(next_round) {
-            // 上一轮的窃贼还没走完，不能覆盖
+        if !next_block.is_writable(next_generation) {
+            // 上一代的窃贼还没走完，不能覆盖
             return false;
         }
         let first = self.start_block.load(Ordering::Relaxed);
         if next_index == (first & self.mask) {
             // 马上要复用 start_block 那一块了，把窃取起点往前推
             self.start_block
-                .store(self.increase_block_counter(first), Ordering::Relaxed);
+                .store(self.next_sequence(first), Ordering::Relaxed);
         }
         self.blocks[owner_index as usize].grant();
-        *owner = (u64::from(next_round) << 32) | next_index;
-        next_block.reclaim(next_round);
+        *owner = next_sequence;
+        next_block.reclaim(next_generation);
         self.last_block.store(*owner, Ordering::Relaxed);
         true
     }
 
     fn advance_steal_index(&self, thief: &mut u64) -> bool {
-        *thief = self.increase_block_counter(*thief);
+        *thief = self.next_sequence(*thief);
         *thief < self.last_block.load(Ordering::Relaxed)
     }
 }
@@ -561,6 +583,44 @@ mod tests {
         assert_eq!(stealer.steal_front(), Some(2));
         assert_eq!(stealer.steal_front(), Some(3));
         assert!(stealer.steal_front().is_none(), "第二块还在 owner 手里");
+    }
+
+    /// 旧 generation 的 thief 即使落后到物理块已经复用，也绝不能读到新世代数据。
+    ///
+    /// 这是 PR3 最关键的 ABA 防线：generation 校验必须先于任何 `ptr::read`。
+    #[test]
+    fn a_stale_generation_thief_cannot_touch_a_reused_block() {
+        let block = Block::<u64>::new(4);
+
+        // 第 0 代：写满、交给窃贼、偷空。
+        block.reclaim(0);
+        for value in 0..4 {
+            unsafe { block.put(value) }.expect("不该满");
+        }
+        block.grant();
+        for value in 0..4 {
+            assert!(matches!(block.steal(0), Steal::Taken(taken) if taken == value));
+        }
+        assert!(matches!(block.steal(0), Steal::Done));
+        assert!(block.is_writable(1), "偷空且停在上一代的块应当可复用");
+
+        // 第 1 代复用同一个物理块，并已经 grant 给窃贼。
+        block.reclaim(1);
+        for value in 10..14 {
+            unsafe { block.put(value) }.expect("不该满");
+        }
+        block.grant();
+
+        // 旧 thief 拿着第 0 代的 generation 回来：必须 Empty，绝不能偷到 10。
+        assert!(
+            matches!(block.steal(0), Steal::Empty),
+            "旧 generation 不得读取已经复用给新世代的数据"
+        );
+        // 新 thief 正常读到第 1 代数据。
+        assert!(matches!(block.steal(1), Steal::Taken(taken) if taken == 10));
+        assert!(matches!(block.steal(1), Steal::Taken(taken) if taken == 11));
+        assert!(matches!(block.steal(1), Steal::Taken(taken) if taken == 12));
+        assert!(matches!(block.steal(1), Steal::Taken(taken) if taken == 13));
     }
 
     /// owner 与多个窃贼并发跑，元素必须不丢不重

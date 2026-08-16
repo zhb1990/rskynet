@@ -12,8 +12,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub(crate) struct Monitor {
     version: AtomicU64,
     checked: AtomicU64,
-    /// 高 32 位是 source，低 32 位是 destination，保证路由成对更新。
-    route: AtomicU64,
+    /// u64 handle 无法像 u32 时代那样打包进单个 u64，这里拆成两个原子量，
+    /// 用 route_seq 做一个两段式 seqlock 保证 source/destination 成对读取。
+    route_source: AtomicU64,
+    route_destination: AtomicU64,
+    route_seq: AtomicU64,
 }
 
 impl Monitor {
@@ -21,28 +24,35 @@ impl Monitor {
         Self {
             version: AtomicU64::new(0),
             checked: AtomicU64::new(0),
-            route: AtomicU64::new(0),
+            route_source: AtomicU64::new(0),
+            route_destination: AtomicU64::new(0),
+            route_seq: AtomicU64::new(0),
         }
     }
 
-    fn begin(&self, source: u32, destination: u32) {
+    fn begin(&self, source: crate::Handle, destination: crate::Handle) {
         // 先推进版本再发布路由。check 在读路由前后各读一次版本，
         // 因此撞在这个边界上只会重建基线，不会把刚开始的 poll 误报。
         self.version.fetch_add(1, Ordering::AcqRel);
-        self.route
-            .store(pack(source, destination), Ordering::Release);
+        self.route_seq.fetch_add(1, Ordering::AcqRel); // 进入奇数写区
+        self.route_source.store(source, Ordering::Release);
+        self.route_destination.store(destination, Ordering::Release);
+        self.route_seq.fetch_add(1, Ordering::Release); // 写区结束，回到偶数
     }
 
     fn finish(&self) {
         // 先清目标，边界竞态最多漏报一轮，不会把已返回的 poll 误报成死循环。
-        self.route.store(0, Ordering::Release);
+        self.route_seq.fetch_add(1, Ordering::AcqRel);
+        self.route_source.store(0, Ordering::Release);
+        self.route_destination.store(0, Ordering::Release);
+        self.route_seq.fetch_add(1, Ordering::Release);
         self.version.fetch_add(1, Ordering::AcqRel);
     }
 
     /// 返回持续未前进的 `(source, destination, version)`。
-    pub(crate) fn check(&self) -> Option<(u32, u32, u64)> {
+    pub(crate) fn check(&self) -> Option<(crate::Handle, crate::Handle, u64)> {
         let before = self.version.load(Ordering::Acquire);
-        let route = self.route.load(Ordering::Acquire);
+        let route = self.read_route();
         let after = self.version.load(Ordering::Acquire);
         if before != after {
             self.checked.store(after, Ordering::Release);
@@ -53,17 +63,27 @@ impl Monitor {
             self.checked.store(after, Ordering::Release);
             return None;
         }
-        let (source, destination) = unpack(route);
+        let (source, destination) = route;
         (destination != 0).then_some((source, destination, after))
     }
-}
 
-fn pack(source: u32, destination: u32) -> u64 {
-    (u64::from(source) << 32) | u64::from(destination)
-}
-
-fn unpack(route: u64) -> (u32, u32) {
-    ((route >> 32) as u32, route as u32)
+    /// 读取一次 seqlock 保护的 (source, destination) 快照。
+    fn read_route(&self) -> (crate::Handle, crate::Handle) {
+        loop {
+            let before = self.route_seq.load(Ordering::Acquire);
+            if before & 1 != 0 {
+                // 写者正在发布路由，等它完成。写区只有两次 store，转瞬即逝。
+                std::hint::spin_loop();
+                continue;
+            }
+            let source = self.route_source.load(Ordering::Acquire);
+            let destination = self.route_destination.load(Ordering::Acquire);
+            let after = self.route_seq.load(Ordering::Acquire);
+            if before == after {
+                return (source, destination);
+            }
+        }
+    }
 }
 
 thread_local! {
@@ -96,7 +116,7 @@ impl Drop for Binding {
 pub(crate) struct Running;
 
 impl Running {
-    pub(crate) fn enter(source: u32, destination: u32) -> Self {
+    pub(crate) fn enter(source: crate::Handle, destination: crate::Handle) -> Self {
         CURRENT.with(|current| {
             if let Some(monitor) = current.borrow().as_ref() {
                 monitor.begin(source, destination);
@@ -134,6 +154,18 @@ mod tests {
         assert_eq!(monitor.check(), None, "第一次只建立基线");
         assert_eq!(monitor.check(), Some((0x12, 0x34, 1)));
         assert_eq!(monitor.check(), Some((0x12, 0x34, 1)), "持续卡住要重复报警");
+    }
+
+    #[test]
+    fn high_u64_route_is_not_truncated() {
+        let monitor = Monitor::new();
+        monitor.begin(0x1_0000_0001, 0x1_0000_0002);
+        assert_eq!(monitor.check(), None, "第一次只建立基线");
+        assert_eq!(
+            monitor.check(),
+            Some((0x1_0000_0001, 0x1_0000_0002, 1)),
+            "u64 handle 必须完整穿过 monitor 路由"
+        );
     }
 
     #[test]

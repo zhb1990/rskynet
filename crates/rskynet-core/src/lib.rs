@@ -78,6 +78,13 @@ mod task;
 pub mod ext;
 pub mod service;
 
+/// Service identity：整个节点生命周期内单调递增、永不复用。
+///
+/// storage slot 可以随服务销毁而复用，但 handle 只会不断变大。这是 u64 而不是
+/// (slot, generation) 组合：所有表达服务身份的路径（地址、消息、回包、定时器、
+/// 监控）都共享同一个简单类型，短生命周期服务高频创建/销毁时也不会消耗身份空间。
+pub type Handle = u64;
+
 pub use clock::Timer;
 pub use context::{Ctx, Service};
 pub use error::{Error, Result};

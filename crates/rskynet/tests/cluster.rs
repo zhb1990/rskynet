@@ -104,7 +104,7 @@ impl Driver {
         let task_ctx = ctx.clone();
         ctx.spawn(async move {
             let node2 = ClusterAddr::new(NodeId::new(2).unwrap(), "echo");
-            let node3 = ClusterAddr::new(NodeId::new(3).unwrap(), 42u32);
+            let node3 = ClusterAddr::new(NodeId::new(3).unwrap(), 42u64);
             let deadline = task_ctx.now() + 500;
             loop {
                 let first =

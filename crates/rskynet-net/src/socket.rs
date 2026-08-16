@@ -105,7 +105,7 @@ impl State {
 /// 一次「等事情办完才回话」的凭据：`connect` 要等连上，`close` 要等写完。
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Pending {
-    pub(crate) source: u32,
+    pub(crate) source: rskynet_core::Handle,
     pub(crate) session: u64,
 }
 
@@ -130,7 +130,7 @@ pub(crate) struct Socket {
     /// 槽位号，也就是它在 poll 里的 token。
     slot: usize,
     /// 属主服务的 handle，事件投给它。对照 C 版的 `opaque`。
-    pub(crate) owner: u32,
+    pub(crate) owner: rskynet_core::Handle,
     pub(crate) kind: Kind,
     pub(crate) state: State,
     /// 读被 [`pause`][crate::pause] 掐了。
@@ -153,7 +153,14 @@ pub(crate) struct Socket {
 }
 
 impl Socket {
-    fn new(id: SocketId, slot: usize, owner: u32, kind: Kind, state: State, floor: usize) -> Self {
+    fn new(
+        id: SocketId,
+        slot: usize,
+        owner: rskynet_core::Handle,
+        kind: Kind,
+        state: State,
+        floor: usize,
+    ) -> Self {
         Self {
             id,
             slot,
@@ -276,7 +283,12 @@ impl Sockets {
     /// 占一个槽位并造一个 socket，槽位满了返回 `None`。
     ///
     /// 找法与 C 版一样：从 `next` 起往后扫一圈，谁空用谁。扫满一圈还没有就是真满了。
-    pub(crate) fn insert(&mut self, owner: u32, kind: Kind, state: State) -> Option<&mut Socket> {
+    pub(crate) fn insert(
+        &mut self,
+        owner: rskynet_core::Handle,
+        kind: Kind,
+        state: State,
+    ) -> Option<&mut Socket> {
         let capacity = self.slots.len();
         for _ in 0..capacity {
             let id = self.next;

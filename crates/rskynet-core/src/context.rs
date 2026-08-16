@@ -68,7 +68,7 @@ impl Ctx {
     }
 
     /// 自己的地址。
-    pub fn handle(&self) -> u32 {
+    pub fn handle(&self) -> crate::Handle {
         self.inner.handle
     }
 
@@ -82,7 +82,7 @@ impl Ctx {
         NodeRef::new(self.inner.node.clone())
     }
 
-    fn resolve(&self, addr: impl Into<Addr>) -> Result<u32> {
+    fn resolve(&self, addr: impl Into<Addr>) -> Result<crate::Handle> {
         self.inner.node.resolve(&addr.into())
     }
 
@@ -253,7 +253,7 @@ impl Ctx {
     /// 启动一个新 service 并等待其 init Future 完整成功。
     ///
     /// 这是 [`NodeRef::launch`] 的便捷代理，可跨线程调用。
-    pub async fn launch(&self, kind: &str, args: impl AsRef<str>) -> Result<u32> {
+    pub async fn launch(&self, kind: &str, args: impl AsRef<str>) -> Result<crate::Handle> {
         let service = self.inner.node.new_service(kind, args.as_ref())?;
         service.init.await?;
         Ok(service.handle)
@@ -269,7 +269,7 @@ impl Ctx {
     }
 
     /// 按本地注册名查 handle，是 [`NodeRef::query_name`] 的便捷代理。
-    pub fn query_name(&self, name: &str) -> Option<u32> {
+    pub fn query_name(&self, name: &str) -> Option<crate::Handle> {
         self.inner
             .node
             .handles
@@ -294,7 +294,7 @@ impl Ctx {
 
     /// 摘除全部非 reserved service，是 [`NodeRef::abort`] 的便捷代理。
     pub fn abort(&self) {
-        self.inner.node.retire_all();
+        self.inner.node.abort();
     }
 
     /// 节点启动至今的毫秒数，是 [`NodeRef::now`] 的便捷代理。

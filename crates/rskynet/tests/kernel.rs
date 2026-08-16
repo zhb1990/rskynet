@@ -182,7 +182,7 @@ struct RelayShared {
 
 /// 环上的一个中转站：收到令牌就传给下家，直到令牌跑完预定的跳数。
 struct Relay {
-    next: SvcCell<u32>,
+    next: SvcCell<u64>,
     shared: Arc<RelayShared>,
 }
 
@@ -191,7 +191,7 @@ impl Relay {
     async fn dispatch(&self, ctx: Ctx, mut msg: Message) {
         let payload = msg.take_payload();
         if msg.mtype == SETUP {
-            self.next.set(*payload.downcast::<u32>().unwrap());
+            self.next.set(*payload.downcast::<u64>().unwrap());
             return;
         }
         let left = *payload.downcast::<u64>().unwrap();

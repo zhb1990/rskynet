@@ -169,7 +169,7 @@ impl Config {
 /// # use rskynet_core::{Builder, Config, Registry, Timer};
 /// # struct MyTimer;
 /// # impl Timer for MyTimer {
-/// #     fn timeout(&self, _handle: u32, _session: u64, _delay_ms: u32) {}
+/// #     fn timeout(&self, _handle: rskynet_core::Handle, _session: u64, _delay_ms: u32) {}
 /// #     fn now(&self) -> u64 { 0 }
 /// #     fn wall_clock(&self) -> u64 { 0 }
 /// #     fn start_time(&self) -> u64 { 0 }
@@ -313,7 +313,7 @@ fn run(
 
 /// 给系统服务绑定约定名字。名字已被别的 handle 占用时启动失败；
 /// 若服务自己在 init 里已经注册过同一个名字，则视为成功。
-fn bind_system_name(node: &Arc<Node>, handle: u32, name: &str) -> Result<()> {
+fn bind_system_name(node: &Arc<Node>, handle: crate::Handle, name: &str) -> Result<()> {
     if node.handles.register_name(handle, name) || node.handles.find_name(name) == Some(handle) {
         return Ok(());
     }

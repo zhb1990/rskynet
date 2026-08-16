@@ -192,7 +192,7 @@ struct Handler {
 #[derive(Clone, Copy)]
 pub enum AutoTarget {
     Name(&'static str),
-    Handle(u32),
+    Handle(rskynet_core::Handle),
 }
 
 #[doc(hidden)]
@@ -216,7 +216,7 @@ impl AutoHandler {
     }
 
     pub const fn handle(
-        target: u32,
+        target: rskynet_core::Handle,
         source: &'static str,
         register: fn(&mut HandlerRegistry) -> Result<(), ClusterError>,
     ) -> Self {
@@ -230,7 +230,7 @@ impl AutoHandler {
     fn sort_key(&self) -> (u8, String, &'static str) {
         match self.target {
             AutoTarget::Name(name) => (0, name.to_string(), self.source),
-            AutoTarget::Handle(handle) => (1, format!("{handle:010}"), self.source),
+            AutoTarget::Handle(handle) => (1, format!("{handle:016x}"), self.source),
         }
     }
 }
@@ -450,7 +450,7 @@ boxed_payload!(Answer);
 
 #[derive(Clone, Hash, PartialEq, Eq)]
 enum ServiceKey {
-    Handle(u32),
+    Handle(rskynet_core::Handle),
     Name(String),
 }
 
@@ -487,7 +487,7 @@ impl std::fmt::Display for ServiceKey {
 }
 
 struct Pending {
-    source: u32,
+    source: rskynet_core::Handle,
     session: u64,
     node: NodeId,
     response_type: u32,

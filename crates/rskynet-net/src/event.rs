@@ -90,7 +90,7 @@ impl SocketEvent {
 pub struct SocketInfo {
     pub id: SocketId,
     /// 属主服务的 handle，事件投给它。对照 C 版的 `opaque`。
-    pub owner: u32,
+    pub owner: rskynet_core::Handle,
     /// 属主服务的类型。属主已经退出时为 `None`。
     pub owner_kind: Option<String>,
     /// 属主服务注册过的全部本地名字。属主已退出或没有名字时为空。

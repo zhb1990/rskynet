@@ -315,7 +315,10 @@ impl NetService {
         loop {
             enum Got {
                 Eof,
-                Data { owner: u32, data: Vec<u8> },
+                Data {
+                    owner: rskynet_core::Handle,
+                    data: Vec<u8>,
+                },
                 Stop,
                 Retry,
                 Failed(String),
@@ -687,7 +690,7 @@ impl NetService {
         }
     }
 
-    fn do_listen(&self, addr: SocketAddr, owner: u32) -> Answer {
+    fn do_listen(&self, addr: SocketAddr, owner: rskynet_core::Handle) -> Answer {
         let listener = match TcpListener::bind(addr) {
             Ok(listener) => listener,
             Err(err) => return Answer::Failed(format!("绑定 {addr} 失败：{err}")),
@@ -795,7 +798,7 @@ impl NetService {
         }
     }
 
-    fn do_udp(&self, addr: SocketAddr, owner: u32) -> Answer {
+    fn do_udp(&self, addr: SocketAddr, owner: rskynet_core::Handle) -> Answer {
         let udp = match UdpSocket::bind(addr) {
             Ok(udp) => udp,
             Err(err) => return Answer::Failed(format!("绑定 UDP {addr} 失败：{err}")),
@@ -827,7 +830,7 @@ impl NetService {
         Answer::Done
     }
 
-    fn do_start(&self, ctx: &Ctx, id: SocketId, owner: u32) -> Answer {
+    fn do_start(&self, ctx: &Ctx, id: SocketId, owner: rskynet_core::Handle) -> Answer {
         let outcome = {
             let mut sockets = self.sockets.borrow_mut();
             let Some(socket) = sockets.get_mut(id) else {

@@ -407,8 +407,8 @@ impl Drop for ServerResponder {
 #[derive(Clone)]
 struct AbortTransport {
     node: rskynet_core::NodeRef,
-    source: u32,
-    dest: u32,
+    source: rskynet_core::Handle,
+    dest: rskynet_core::Handle,
     transport: TransportId,
 }
 

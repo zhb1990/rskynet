@@ -16,7 +16,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::task::{Context, Poll};
 use std::thread::{self, JoinHandle, Thread};
@@ -133,7 +133,7 @@ impl Future for InitTicket {
 }
 
 pub(crate) struct NewService {
-    pub(crate) handle: u32,
+    pub(crate) handle: crate::Handle,
     pub(crate) init: InitTicket,
 }
 
@@ -147,7 +147,7 @@ impl std::fmt::Debug for NewService {
 
 /// 一个服务的运行时上下文。
 pub(crate) struct ServiceContext {
-    pub(crate) handle: u32,
+    pub(crate) handle: crate::Handle,
     /// 服务类型名，即注册表里的键，只用于日志。
     pub(crate) kind: String,
     pub(crate) node: Arc<Node>,
@@ -369,8 +369,8 @@ impl ServiceContext {
     fn install_task(
         self: &Arc<Self>,
         future: BoxFuture<'static, ()>,
-        request: Option<(u32, u64)>,
-        source: u32,
+        request: Option<(crate::Handle, u64)>,
+        source: crate::Handle,
     ) -> TaskId {
         let task = self.tasks.insert(&self.me, future, request, source);
         self.wake_task(task);
@@ -592,7 +592,7 @@ pub(crate) struct Node {
     /// 不能用 `thread::scope` 那种 scoped 线程：独占服务可以在运行期被 `launch`，
     /// 那时启动阶段的作用域早就建好了。所以这里是普通线程加一张表，代价是收尾
     /// 得自己 join（见 [`Node::join_exclusives`]）。
-    exclusives: Mutex<HashMap<u32, JoinHandle<()>>>,
+    exclusives: Mutex<HashMap<crate::Handle, JoinHandle<()>>>,
     /// 计入退出条件的普通服务数，归零即整个节点退出，对照 `skynet_context_total`。
     /// 保留服务从创建起就不计入，销毁时也不参与递减。
     total: AtomicI64,
@@ -602,7 +602,7 @@ pub(crate) struct Node {
     /// 收场。它自己排在引导之前起，光看服务数会把前者当成后者。
     booted: AtomicBool,
     /// logger 服务的 handle，0 表示还没起来。
-    logger: AtomicU32,
+    logger: AtomicU64,
     /// 节点配置原样留一份：服务在自己的 `init` 里靠 [`crate::NodeRef::section`]
     /// 读属于自己的那一段（网络层的 `[net]` 之类）。`init` 只收得到一个字符串
     /// 参数，成段的配置只能从这里来。
@@ -628,7 +628,7 @@ impl Node {
             exclusives: Mutex::new(HashMap::new()),
             total: AtomicI64::new(0),
             booted: AtomicBool::new(false),
-            logger: AtomicU32::new(0),
+            logger: AtomicU64::new(0),
             config: config.clone(),
             profile: config.profile,
             #[cfg(test)]
@@ -673,12 +673,17 @@ impl Node {
         self.profile
     }
 
-    pub(crate) fn set_logger(&self, handle: u32) {
+    pub(crate) fn set_logger(&self, handle: crate::Handle) {
         self.logger.store(handle, Ordering::Release);
     }
 
     /// 记下 monitor 的一次告警。服务可能在检查前已退出，那时只写日志。
-    pub(crate) fn report_endless(&self, source: u32, destination: u32, version: u64) {
+    pub(crate) fn report_endless(
+        &self,
+        source: crate::Handle,
+        destination: crate::Handle,
+        version: u64,
+    ) {
         if let Some(ctx) = self.handles.grab(destination) {
             ctx.mark_endless();
         }
@@ -691,7 +696,7 @@ impl Node {
     }
 
     /// 地址解析，对照 `skynet_queryname`。
-    pub(crate) fn resolve(&self, addr: &Addr) -> Result<u32> {
+    pub(crate) fn resolve(&self, addr: &Addr) -> Result<crate::Handle> {
         match addr {
             Addr::Handle(handle) => Ok(*handle),
             Addr::Name(name) => self
@@ -704,8 +709,8 @@ impl Node {
     /// 发一条消息，对照 `skynet_send`。
     pub(crate) fn send_raw(
         &self,
-        source: u32,
-        dest: u32,
+        source: crate::Handle,
+        dest: crate::Handle,
         mtype: MsgType,
         session: u64,
         payload: Payload,
@@ -817,8 +822,6 @@ impl Node {
             );
         });
 
-        self.log(handle, format!("LAUNCH {kind} {args}"));
-
         #[cfg(test)]
         {
             self.publish_paused.store(true, Ordering::Release);
@@ -837,6 +840,10 @@ impl Node {
 
         // 到这里 service 已经真正交给执行者，gate 才能放。
         drop(gate);
+
+        // 日志必须放在 gate 之外：logger 被这条消息叫醒后可能立刻重入 quit/abort。
+        // 顺序仍是 admission → register → install → publish → drop gate → log。
+        self.log(handle, format!("LAUNCH {kind} {args}"));
 
         Ok(NewService { handle, init })
     }
@@ -862,7 +869,7 @@ impl Node {
     pub(crate) fn join_retired_exclusives(&self) {
         let retired: Vec<_> = {
             let mut table = self.exclusives.lock();
-            let gone: Vec<u32> = table
+            let gone: Vec<crate::Handle> = table
                 .keys()
                 .copied()
                 .filter(|handle| self.handles.grab(*handle).is_none())
@@ -924,12 +931,23 @@ impl Node {
         }
     }
 
+    /// 唯一的 abort 语义：先关闭 launch admission，再摘除全部非保留服务。
+    ///
+    /// 顺序不能反过来。`quit` 与 `new_service_inner` 共用 [`Node::lifecycle_gate`]，
+    /// 因此 abort 之后要么 launch 已经被 publish、能被 `retire_all` 看见；要么
+    /// launch 在 gate 内看到 quit 并直接失败。`retire_all` 本身不拿 gate，因为
+    /// `retire` 会调用 `Exclusive::interrupt` 等可能重入生命周期 API 的路径。
+    pub(crate) fn abort(&self) {
+        self.quit();
+        self.retire_all();
+    }
+
     /// 摘除服务，对照 `skynet_handle_retire`。
     ///
     /// 真正的资源释放交给 worker：这里只把服务从地址表里摘掉并保证它一定会被
     /// 领走一次。若此刻正有 worker 在跑这个服务，它会在本批消息处理完后看到
     /// `dead` 标志并完成销毁。
-    pub(crate) fn retire(&self, handle: u32) -> bool {
+    pub(crate) fn retire(&self, handle: crate::Handle) -> bool {
         match self.handles.retire(handle) {
             None => false,
             Some(ctx) => {
@@ -1140,7 +1158,7 @@ impl Node {
     ///
     /// 零延迟不必惊动时间来源：直接回包，语义上等价于「本刻度就到期」，
     /// 也让 `ctx.yield_now()` 这条最常走的路少绕一圈。
-    pub(crate) fn timeout(&self, handle: u32, delay_ms: u32, session: u64) {
+    pub(crate) fn timeout(&self, handle: crate::Handle, delay_ms: u32, session: u64) {
         if delay_ms == 0 {
             let _ = self.send_raw(0, handle, MsgType::RESPONSE, session, Payload::None);
         } else {
@@ -1149,7 +1167,7 @@ impl Node {
     }
 
     /// 写日志，对照 `skynet_error`：日志本身也是一条消息，发给 logger 服务。
-    pub(crate) fn log(&self, source: u32, text: String) {
+    pub(crate) fn log(&self, source: crate::Handle, text: String) {
         let logger = self.logger.load(Ordering::Acquire);
         if logger != 0 {
             if let Some(ctx) = self.handles.grab(logger) {
@@ -1187,13 +1205,37 @@ pub(crate) mod tests {
     #[rskynet_macros::exclusive(crate = ::rskynet_core, name = "solo")]
     impl NullExclusive {}
 
+    /// 在 `interrupt` 里探测 lifecycle_gate 是否可重入，用来验证 LAUNCH log 已移出 gate。
+    struct ReentrantLogger {
+        node: Weak<Node>,
+        reentered: Arc<AtomicBool>,
+    }
+
+    impl Service for ReentrantLogger {
+        fn dispatch(self: Arc<Self>, _ctx: Ctx, _msg: Message) -> BoxFuture<'static, ()> {
+            Box::pin(async {})
+        }
+    }
+
+    impl Exclusive for ReentrantLogger {
+        fn interrupt(&self) {
+            // 若 LAUNCH log 仍在 lifecycle_gate 内，这里 try_lock 必然失败；
+            // 固定后的顺序允许 interrupt 立即重入生命周期 API。
+            let acquired = self
+                .node
+                .upgrade()
+                .is_some_and(|node| node.lifecycle_gate.try_lock().is_some());
+            self.reentered.store(acquired, Ordering::Release);
+        }
+    }
+
     /// 测试用的时间来源：刻度从不前进，挂上的表也不会到期。内核的单元测试只关心
     /// 消息与调度，真正的时间轮在 `rskynet-timer` 里自测。
     #[derive(Default)]
     pub(crate) struct StubTimer;
 
     impl Timer for StubTimer {
-        fn timeout(&self, _handle: u32, _session: u64, _delay_ms: u32) {}
+        fn timeout(&self, _handle: crate::Handle, _session: u64, _delay_ms: u32) {}
 
         fn now(&self) -> u64 {
             0
@@ -1220,12 +1262,12 @@ pub(crate) mod tests {
     }
 
     /// 给 handle 表的单元测试用：造一个不参与调度的空壳上下文。
-    pub(crate) fn dummy_context(handle: u32) -> Arc<ServiceContext> {
+    pub(crate) fn dummy_context(handle: crate::Handle) -> Arc<ServiceContext> {
         dummy_context_on(test_node(), handle)
     }
 
     /// 同上，但挂在指定节点下，好让一批上下文共用一个调度器。
-    pub(crate) fn dummy_context_on(node: Arc<Node>, handle: u32) -> Arc<ServiceContext> {
+    pub(crate) fn dummy_context_on(node: Arc<Node>, handle: crate::Handle) -> Arc<ServiceContext> {
         let init = InitTicket::new("null");
         init.shared.complete(Ok(()));
         Arc::new_cyclic(|me| ServiceContext {
@@ -1252,6 +1294,73 @@ pub(crate) mod tests {
             started_at_unix_ms: 0,
             me: me.clone(),
         })
+    }
+
+    /// 造一个带 `Exclusive` 面孔、但不真正起线程的空壳上下文，给 logger 重入测试用。
+    fn dummy_exclusive_context(
+        node: Arc<Node>,
+        service: Arc<dyn Exclusive>,
+    ) -> Arc<ServiceContext> {
+        let init = InitTicket::new("reentrant-logger");
+        init.shared.complete(Ok(()));
+        let service_arc: Arc<dyn Service> = service.clone();
+        let node_for_ctx = node.clone();
+        node.handles.register_with(move |handle| {
+            let node = node_for_ctx.clone();
+            Arc::new_cyclic(|me| ServiceContext {
+                handle,
+                kind: "reentrant-logger".to_string(),
+                node,
+                mailbox: Mailbox::new(),
+                sessions: SessionTable::new(),
+                service: service_arc,
+                exclusive: Some(service),
+                thread: ArcSwapOption::empty(),
+                tasks: TaskSet::new(),
+                lifecycle: AtomicU8::new(lifecycle::RUNNING),
+                init,
+                init_self_exit: AtomicBool::new(false),
+                pending_messages: crate::task::SvcCell::new(None),
+                dead: AtomicBool::new(false),
+                reserved: false,
+                destroyed: AtomicBool::new(false),
+                endless: AtomicBool::new(false),
+                message_count: AtomicU64::new(0),
+                cpu_cost: AtomicU64::new(0),
+                started_at_ms: 0,
+                started_at_unix_ms: 0,
+                me: me.clone(),
+            })
+        })
+    }
+
+    /// LAUNCH log 必须发生在 lifecycle_gate 释放之后：logger 被这条日志唤醒后
+    /// 立即重入生命周期 API 时必须能拿到 gate，而不是死锁或被迫串行。
+    #[test]
+    fn launch_log_runs_outside_lifecycle_gate() {
+        let node = test_node();
+        let reentered = Arc::new(AtomicBool::new(false));
+        let logger: Arc<dyn Exclusive> = Arc::new(ReentrantLogger {
+            node: Arc::downgrade(&node),
+            reentered: reentered.clone(),
+        });
+        let logger = dummy_exclusive_context(node.clone(), logger);
+        logger.mailbox.mark_running();
+        assert!(logger.mailbox.release(), "logger 邮箱应先落到 IDLE");
+        node.set_logger(logger.handle);
+
+        let handle = node.new_service("null", "").expect("应创建成功").handle;
+
+        assert!(
+            reentered.load(Ordering::Acquire),
+            "LAUNCH log 应已在 gate 外投递，interrupt 应能立即重入 lifecycle_gate"
+        );
+        assert_eq!(logger.mailbox.len(), 1, "logger 应当收到一条 LAUNCH 日志");
+
+        // 清理：把刚 launch 的 service 走完 destroy，避免测试节点留下记账。
+        assert!(node.retire(handle));
+        assert!(node.dispatch(None).is_none());
+        assert_eq!(node.total(), 0);
     }
 
     /// 服务创建之后应当能按地址找回来
@@ -1382,6 +1491,102 @@ pub(crate) mod tests {
         });
 
         assert_eq!(node.total(), 1, "已 publish 的服务仍应记在 total 上");
+    }
+
+    /// abort 之后 admission 永久关闭：新的 launch 必须在 gate 内被拒绝。
+    #[test]
+    fn abort_rejects_future_launch() {
+        let node = test_node();
+        node.abort();
+
+        assert!(node.sched.is_quit(), "abort 必须先置上收工标记");
+        let err = node
+            .new_service("null", "")
+            .expect_err("abort 之后不得再创建服务");
+        assert!(matches!(err, Error::Service(_)));
+        assert_eq!(node.total(), 0);
+    }
+
+    /// abort 与尚未 publish 的 launch 线性化：quit 必须等 launch 完成 publish，
+    /// 随后 retire_all 必须能看到并摘掉那个 service。
+    #[test]
+    fn abort_linearizes_with_inflight_launch() {
+        let node = test_node();
+        node.pause_before_publish.store(true, Ordering::SeqCst);
+
+        std::thread::scope(|scope| {
+            struct ReleasePublish<'a>(&'a Node);
+            impl Drop for ReleasePublish<'_> {
+                fn drop(&mut self) {
+                    self.0.pause_before_publish.store(false, Ordering::SeqCst);
+                }
+            }
+            let _release = ReleasePublish(&node);
+
+            let launcher = scope.spawn({
+                let node = node.clone();
+                move || node.new_service("null", "").map(|service| service.handle)
+            });
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !node.publish_paused.load(Ordering::Acquire)
+                && std::time::Instant::now() < deadline
+            {
+                std::hint::spin_loop();
+            }
+            assert!(
+                node.publish_paused.load(Ordering::Acquire),
+                "launch 应停在 admission 之后、publish 之前"
+            );
+
+            let aborter_started = Arc::new(AtomicBool::new(false));
+            let aborter = scope.spawn({
+                let node = node.clone();
+                let aborter_started = aborter_started.clone();
+                move || {
+                    aborter_started.store(true, Ordering::Release);
+                    node.abort();
+                }
+            });
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !aborter_started.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                std::hint::spin_loop();
+            }
+            assert!(
+                aborter_started.load(Ordering::Acquire),
+                "abort 线程应已启动"
+            );
+
+            // abort 的第一件事 quit 站在 gate 前面；launch 还没 publish 就不许越过
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            assert!(
+                !node.sched.is_quit(),
+                "abort 不得越过尚未 publish 的 launch"
+            );
+
+            node.pause_before_publish.store(false, Ordering::SeqCst);
+
+            let handle = launcher
+                .join()
+                .expect("launch 线程不应 panic")
+                .expect("launch 应创建成功");
+            aborter.join().expect("abort 线程不应 panic");
+
+            assert!(node.sched.is_quit(), "publish 之后 quit 必须生效");
+            assert!(
+                node.handles.grab(handle).is_none(),
+                "abort 的 retire_all 必须摘掉 publish 成功的 service"
+            );
+
+            let err = node
+                .new_service("null", "")
+                .expect_err("abort 之后新的 launch 应失败");
+            assert!(matches!(err, Error::Service(_)));
+        });
+
+        // 摘除不等于销毁：没有 worker 跑 dispatch，destroy 记账仍未发生。
+        assert_eq!(node.total(), 1, "retire_all 只摘除，不越权做 destroy");
     }
 
     /// 摘除服务后地址即刻失效，服务计数归零并通知 worker 收工
@@ -1582,6 +1787,64 @@ pub(crate) mod tests {
             .send_raw(0, 0xdead, MsgType::USER, 0, Payload::None)
             .expect_err("应失败");
         assert!(matches!(err, Error::NoService(0xdead)));
+    }
+
+    /// 高位 u64 handle 完整穿过 Ctx::send、ReplyToken、Timer、logger 与错误格式，
+    /// 防止某处偷偷 `as u32` 截断。
+    #[test]
+    fn high_u64_handle_routes_through_core_paths() {
+        const HIGH: crate::Handle = 0x1_0000_0001;
+        let node = test_node();
+        node.handles.set_next_for_test(HIGH);
+
+        let source = node
+            .handles
+            .register_with(|handle| dummy_context_on(node.clone(), handle));
+        let dest = node
+            .handles
+            .register_with(|handle| dummy_context_on(node.clone(), handle));
+        assert_eq!((source.handle, dest.handle), (HIGH, HIGH + 1));
+
+        // Ctx::send：source 必须完整出现在对端消息里
+        let cx = Ctx::new(source.clone());
+        source.with_ownership(|| {
+            cx.send(HIGH + 1, MsgType::USER, Payload::text("hi"))
+                .unwrap()
+        });
+        let sent = dest.mailbox.drain();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].source, HIGH);
+        assert_eq!(sent[0].payload.as_str(), Some("hi"));
+
+        // ReplyToken：dest 是高 handle 时不能截断
+        crate::ReplyToken::new(node.clone(), HIGH + 1, 77).reply(Payload::text("pong"));
+        let replies = dest.mailbox.drain();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].mtype, MsgType::RESPONSE);
+        assert_eq!(replies[0].session, 77);
+        assert_eq!(replies[0].payload.as_str(), Some("pong"));
+
+        // Timer：零延迟回包同样走完整 handle
+        node.timeout(HIGH + 1, 0, 88);
+        let timeout = dest.mailbox.drain();
+        assert_eq!(timeout.len(), 1);
+        assert_eq!(timeout[0].mtype, MsgType::RESPONSE);
+        assert_eq!(timeout[0].session, 88);
+
+        // logger：高 source handle 要原样出现在 TEXT 消息里
+        node.set_logger(HIGH + 1);
+        node.log(HIGH, "hello".to_string());
+        let logs = dest.mailbox.drain();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].mtype, MsgType::TEXT);
+        assert_eq!(logs[0].source, HIGH);
+        assert_eq!(logs[0].payload.as_str(), Some("hello"));
+
+        assert_eq!(node.resolve(&Addr::Handle(HIGH + 1)).unwrap(), HIGH + 1);
+        assert!(
+            Error::NoService(HIGH).to_string().contains(":100000001"),
+            "错误信息必须显示完整 u64 handle"
+        );
     }
 
     /// endless 标记是给服务自己读的一次性状态。

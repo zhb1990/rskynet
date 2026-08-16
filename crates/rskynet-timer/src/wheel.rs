@@ -18,7 +18,7 @@ const TIME_LEVEL_MASK: u32 = TIME_LEVEL as u32 - 1;
 /// 一个到期事件：把 `session` 号的应答发给 `handle`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TimerEvent {
-    pub(crate) handle: u32,
+    pub(crate) handle: rskynet_core::Handle,
     pub(crate) session: u64,
     pub(crate) expire: u32,
 }

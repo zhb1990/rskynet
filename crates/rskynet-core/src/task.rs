@@ -219,9 +219,9 @@ struct TaskSlot {
     /// 服务半途退出时要给这些请求方回一个错误，否则对方的 `call` 永远挂着；
     /// 对照 `lualib/skynet.lua` 里 `skynet.exit` 遍历 `session_coroutine_id` 的那段。
     /// 记在任务槽里而不是另开一张表，是因为它的生命周期与任务严丝合缝。
-    request: Option<(u32, u64)>,
+    request: Option<(crate::Handle, u64)>,
     /// 最初开出这个任务的消息来源，给 worker monitor 报告死循环用。
-    source: u32,
+    source: crate::Handle,
 }
 
 /// 任务 waker：被唤醒时把任务 id 塞回服务的就绪队列，并让服务重新进入全局队列。
@@ -278,8 +278,8 @@ impl TaskSet {
         &self,
         owner: &Weak<ServiceContext>,
         future: BoxFuture<'static, ()>,
-        request: Option<(u32, u64)>,
-        source: u32,
+        request: Option<(crate::Handle, u64)>,
+        source: crate::Handle,
     ) -> TaskId {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
         let mut slots = self.slots.borrow_mut();
@@ -307,7 +307,10 @@ impl TaskSet {
     }
 
     /// 取出任务准备 poll。任务已完成、generation 不匹配或正被 poll 时返回 `None`。
-    pub(crate) fn take(&self, task: TaskId) -> Option<(BoxFuture<'static, ()>, Waker, u32)> {
+    pub(crate) fn take(
+        &self,
+        task: TaskId,
+    ) -> Option<(BoxFuture<'static, ()>, Waker, crate::Handle)> {
         let mut slots = self.slots.borrow_mut();
         let slot = slots.get_mut(task.index)?;
         if slot.generation != task.generation {
@@ -353,7 +356,7 @@ impl TaskSet {
     }
 
     /// 摘走所有「正在处理中的请求」，摘过就不会再报一遍。
-    pub(crate) fn take_requests(&self) -> Vec<(u32, u64)> {
+    pub(crate) fn take_requests(&self) -> Vec<(crate::Handle, u64)> {
         self.slots
             .borrow_mut()
             .iter_mut()
@@ -428,9 +431,9 @@ mod tests {
     fn task_keeps_the_source_that_created_it() {
         let tasks = TaskSet::new();
         let owner = Weak::<ServiceContext>::new();
-        let task = tasks.insert(&owner, Box::pin(async {}), None, 0x1234);
+        let task = tasks.insert(&owner, Box::pin(async {}), None, 0x1_0000_0001);
         let (_, _, source) = tasks.take(task).expect("任务应当存在");
-        assert_eq!(source, 0x1234);
+        assert_eq!(source, 0x1_0000_0001, "高 u64 source 不得截断");
     }
 
     #[test]

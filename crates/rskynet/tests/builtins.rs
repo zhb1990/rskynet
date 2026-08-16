@@ -347,7 +347,7 @@ fn a_custom_timer_can_replace_the_wheel() {
     }
 
     impl Timer for FakeTimer {
-        fn timeout(&self, _handle: u32, _session: u64, _delay_ms: u32) {}
+        fn timeout(&self, _handle: rskynet::Handle, _session: u64, _delay_ms: u32) {}
 
         fn now(&self) -> u64 {
             self.elapsed.fetch_add(1, SeqCst)

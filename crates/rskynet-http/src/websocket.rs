@@ -181,7 +181,7 @@ struct SharedSocketOptions {
 
 pub(crate) struct SharedSocket {
     id: WebSocketId,
-    owner: u32,
+    owner: rskynet_core::Handle,
     transport: TransportId,
     protocol: Option<String>,
     input_high_water: usize,
@@ -414,8 +414,8 @@ impl SharedSocket {
 #[derive(Clone)]
 struct AbortTransport {
     node: rskynet_core::NodeRef,
-    source: u32,
-    dest: u32,
+    source: rskynet_core::Handle,
+    dest: rskynet_core::Handle,
     transport: TransportId,
 }
 
@@ -542,7 +542,7 @@ struct ClientState {
 }
 
 struct WebSocketClientCore {
-    owner: SvcCell<Option<u32>>,
+    owner: SvcCell<Option<rskynet_core::Handle>>,
     config: WebSocketClientConfig,
     state: SvcCell<ClientState>,
     #[cfg(feature = "tls")]

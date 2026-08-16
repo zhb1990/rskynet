@@ -105,7 +105,7 @@ impl Logger {
         Ok(())
     }
 
-    fn write(&self, ctx: &Ctx, source: u32, text: &str) {
+    fn write(&self, ctx: &Ctx, source: rskynet_core::Handle, text: &str) {
         // 时间戳用节点内相对时间（毫秒），免掉一个日期库依赖，排查问题也更直观
         let elapsed_ms = ctx.now();
         let line = format!(

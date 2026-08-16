@@ -17,13 +17,13 @@ use crate::identity::ServerTlsConfig;
 
 #[derive(Clone, Copy)]
 struct Pending {
-    source: u32,
+    source: rskynet_core::Handle,
     session: u64,
 }
 
 struct Listener {
     socket: SocketId,
-    owner: u32,
+    owner: rskynet_core::Handle,
     local: Option<SocketAddr>,
     config: ServerTlsConfig,
     started: bool,
@@ -32,7 +32,7 @@ struct Listener {
 struct TlsConnection {
     id: TlsId,
     socket: SocketId,
-    owner: u32,
+    owner: rskynet_core::Handle,
     connection: Connection,
     listen: Option<TlsId>,
     local: Option<SocketAddr>,
@@ -432,7 +432,7 @@ impl TlsService {
         });
     }
 
-    fn shutdown(&self, ctx: &Ctx, id: TlsId, source: u32) -> Answer {
+    fn shutdown(&self, ctx: &Ctx, id: TlsId, source: rskynet_core::Handle) -> Answer {
         if let Some(listener) = self.state.borrow().listeners.get(&id) {
             if listener.owner != source {
                 return denied(id);
@@ -464,7 +464,7 @@ impl TlsService {
         }
     }
 
-    fn info(&self, id: TlsId, source: u32) -> Answer {
+    fn info(&self, id: TlsId, source: rskynet_core::Handle) -> Answer {
         let state = self.state.borrow();
         if let Some(listener) = state.listeners.get(&id) {
             if listener.owner != source {
@@ -498,7 +498,7 @@ impl TlsService {
         &self,
         ctx: &Ctx,
         id: TlsId,
-        source: u32,
+        source: rskynet_core::Handle,
         data: Vec<u8>,
         high: bool,
     ) -> Answer {
@@ -531,7 +531,7 @@ impl TlsService {
         &self,
         ctx: &Ctx,
         id: TlsId,
-        source: u32,
+        source: rskynet_core::Handle,
         data: Vec<u8>,
         high: bool,
     ) -> Answer {
@@ -560,7 +560,7 @@ impl TlsService {
         }
     }
 
-    async fn pause(&self, ctx: &Ctx, id: TlsId, source: u32) -> Answer {
+    async fn pause(&self, ctx: &Ctx, id: TlsId, source: rskynet_core::Handle) -> Answer {
         let socket = {
             let state = self.state.borrow();
             let Some(connection) = state.connections.get(&id) else {
@@ -1007,7 +1007,7 @@ impl TlsService {
         Some(connection)
     }
 
-    fn emit(&self, ctx: &Ctx, owner: u32, event: TlsEvent) {
+    fn emit(&self, ctx: &Ctx, owner: rskynet_core::Handle, event: TlsEvent) {
         let _ = ctx.send(owner, MsgType::TLS, Payload::of(event));
     }
 }

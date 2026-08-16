@@ -108,7 +108,7 @@ impl Origin {
 
 #[derive(Debug, Clone, Copy)]
 struct Pending {
-    source: u32,
+    source: rskynet_core::Handle,
     session: u64,
 }
 
@@ -1315,13 +1315,13 @@ async fn ask(ctx: &Ctx, command: Command) -> Result<Answer> {
 pub(crate) struct ClientBodyHandle {
     id: u64,
     node: rskynet_core::NodeRef,
-    source: u32,
-    dest: u32,
+    source: rskynet_core::Handle,
+    dest: rskynet_core::Handle,
     active: bool,
 }
 
 impl ClientBodyHandle {
-    fn new(id: u64, ctx: &Ctx, source: u32) -> Self {
+    fn new(id: u64, ctx: &Ctx, source: rskynet_core::Handle) -> Self {
         Self {
             id,
             node: ctx.node(),
@@ -1357,8 +1357,8 @@ impl Drop for ClientBodyHandle {
 pub struct ClientExchange {
     id: u64,
     node: rskynet_core::NodeRef,
-    source: u32,
-    dest: u32,
+    source: rskynet_core::Handle,
+    dest: rskynet_core::Handle,
     active: bool,
 }
 

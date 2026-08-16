@@ -41,7 +41,7 @@ enum Event {
     /// 内核说「邮箱里有活」，回去重扫一遍即可。
     Wake,
     /// 该给某个服务投一条 IO 事件了。
-    Poke(u32),
+    Poke(rskynet::Handle),
 }
 
 /// 轮询器自己那段配置，从 `[poller]` 段来。
@@ -113,7 +113,9 @@ impl Poller {
         let payload = msg.take_payload();
         if msg.mtype == POKE_REQUEST {
             // 把活交给自己那条线程的事件源，等它下一轮醒来再办
-            let dest = *payload.downcast::<u32>().expect("敲门对象应当是个 handle");
+            let dest = *payload
+                .downcast::<rskynet::Handle>()
+                .expect("敲门对象应当是个 handle");
             let _ = self.events.send(Event::Poke(dest));
             return;
         }

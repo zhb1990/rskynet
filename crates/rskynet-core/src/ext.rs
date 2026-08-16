@@ -42,7 +42,7 @@ pub struct NodeStats {
 /// 单个 service 的近似观测快照，拥有全部数据，可直接交给其他线程或序列化。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ServiceStats {
-    pub handle: u32,
+    pub handle: crate::Handle,
     pub kind: String,
     pub names: Vec<String>,
     /// 服务上下文创建、开始初始化时的 Unix 时间。
@@ -84,8 +84,8 @@ impl NodeRef {
     /// `call` 会被直接唤醒，不经过 `dispatch`。
     pub fn send(
         &self,
-        source: u32,
-        dest: u32,
+        source: crate::Handle,
+        dest: crate::Handle,
         mtype: MsgType,
         session: u64,
         payload: Payload,
@@ -94,17 +94,17 @@ impl NodeRef {
     }
 
     /// 地址解析，对照 `skynet_queryname`。名字表是快照读，不抢锁。
-    pub fn resolve(&self, addr: &Addr) -> Result<u32> {
+    pub fn resolve(&self, addr: &Addr) -> Result<crate::Handle> {
         self.node.resolve(addr)
     }
 
     /// 按本地注册名查 handle。
-    pub fn query_name(&self, name: &str) -> Option<u32> {
+    pub fn query_name(&self, name: &str) -> Option<crate::Handle> {
         self.node.handles.find_name(name.trim_start_matches('.'))
     }
 
     /// 启动 service 并等待其 init Future 完整成功。
-    pub async fn launch(&self, kind: &str, args: impl AsRef<str>) -> Result<u32> {
+    pub async fn launch(&self, kind: &str, args: impl AsRef<str>) -> Result<crate::Handle> {
         let service = self.node.new_service(kind, args.as_ref())?;
         service.init.await?;
         Ok(service.handle)
@@ -119,8 +119,11 @@ impl NodeRef {
     }
 
     /// 摘除全部非 reserved service，使节点进入关停流程。
+    ///
+    /// 唯一的 abort 语义在 `Node::abort`：先 quit 关闭 admission，再 retire_all，
+    /// 保证返回之后不会再有任何 service 从 launch 窗口逃出。
     pub fn abort(&self) {
-        self.node.retire_all();
+        self.node.abort();
     }
 
     /// 节点是否已经收工。自己起的线程该盯着它决定何时退出。
@@ -233,7 +236,7 @@ impl NodeRef {
     }
 
     /// 写一条日志，走的是发给 logger 服务的那条路。
-    pub fn log(&self, source: u32, text: impl Into<String>) {
+    pub fn log(&self, source: crate::Handle, text: impl Into<String>) {
         self.node.log(source, text.into());
     }
 
@@ -280,13 +283,13 @@ impl std::fmt::Debug for NodeRef {
 /// panic、命令队列被清空）时，发起方那个 `await` 不至于永久挂着。
 pub struct ReplyToken {
     node: Arc<Node>,
-    dest: u32,
+    dest: crate::Handle,
     /// 回过话就置 0，兼作「已完成」标记，好让析构时不再补发。
     session: u64,
 }
 
 impl ReplyToken {
-    pub(crate) fn new(node: Arc<Node>, dest: u32, session: u64) -> Self {
+    pub(crate) fn new(node: Arc<Node>, dest: crate::Handle, session: u64) -> Self {
         Self {
             node,
             dest,
@@ -295,7 +298,7 @@ impl ReplyToken {
     }
 
     /// 等待方的地址，日志与索引用。
-    pub fn dest(&self) -> u32 {
+    pub fn dest(&self) -> crate::Handle {
         self.dest
     }
 

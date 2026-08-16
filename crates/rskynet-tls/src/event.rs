@@ -65,7 +65,7 @@ boxed_payload!(TlsEvent);
 #[derive(Debug, Clone)]
 pub struct TlsInfo {
     pub id: TlsId,
-    pub owner: u32,
+    pub owner: rskynet_core::Handle,
     pub kind: &'static str,
     pub state: &'static str,
     pub paused: bool,

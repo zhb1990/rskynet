@@ -155,7 +155,7 @@ impl From<&str> for Payload {
 #[derive(Debug)]
 pub struct Message {
     /// 发送方 handle，0 表示来自内核（定时器等）。
-    pub source: u32,
+    pub source: crate::Handle,
     /// 会话号。请求方分配的正数，应答时原样带回；0 表示不需要应答。
     pub session: u64,
     pub mtype: MsgType,
@@ -163,7 +163,7 @@ pub struct Message {
 }
 
 impl Message {
-    pub fn new(source: u32, session: u64, mtype: MsgType, payload: Payload) -> Self {
+    pub fn new(source: crate::Handle, session: u64, mtype: MsgType, payload: Payload) -> Self {
         Self {
             source,
             session,
@@ -186,12 +186,12 @@ impl Message {
 /// 寻址方式，对照 skynet 的 `:handle` 与 `.name` 两种写法。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Addr {
-    Handle(u32),
+    Handle(crate::Handle),
     Name(String),
 }
 
-impl From<u32> for Addr {
-    fn from(value: u32) -> Self {
+impl From<crate::Handle> for Addr {
+    fn from(value: crate::Handle) -> Self {
         Addr::Handle(value)
     }
 }
@@ -200,7 +200,7 @@ impl From<&str> for Addr {
     fn from(value: &str) -> Self {
         // `:0100000a` 是十六进制 handle，`.foo` 与 `foo` 都按本地名字解析
         if let Some(hex) = value.strip_prefix(':') {
-            if let Ok(handle) = u32::from_str_radix(hex, 16) {
+            if let Ok(handle) = crate::Handle::from_str_radix(hex, 16) {
                 return Addr::Handle(handle);
             }
         }
@@ -239,8 +239,13 @@ mod tests {
         assert_eq!(Addr::from(":0100000a"), Addr::Handle(0x0100_000a));
         assert_eq!(Addr::from(".logger"), Addr::Name("logger".into()));
         assert_eq!(Addr::from("logger"), Addr::Name("logger".into()));
-        assert_eq!(Addr::from(7u32), Addr::Handle(7));
+        assert_eq!(Addr::from(7u64), Addr::Handle(7));
         assert_eq!(Addr::Handle(0x0100_000a).to_string(), ":0100000a");
+        assert_eq!(
+            Addr::from(":100000001").to_string(),
+            ":100000001",
+            "u64 handle 不截断"
+        );
     }
 
     /// 对象负载能原样取回，取错类型时也不会把负载弄丢
