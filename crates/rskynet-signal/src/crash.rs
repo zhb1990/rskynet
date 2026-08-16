@@ -36,8 +36,20 @@ pub struct CrashGuard {
 
 /// 安装独立崩溃报告进程。
 ///
-/// 标准 `rskynet::main::run()` 会自动调用；自定义入口应在解析业务参数之前调用，
-/// 并把返回的 guard 留到进程结束。
+/// 标准 `rskynet::main::run()` 会在读取参数与配置之前自动调用；自定义入口的
+/// 启动契约是**先安装、后初始化**，并把返回的 guard 留到进程结束：
+///
+/// ```ignore
+/// fn main() -> rskynet::Result<()> {
+///     let _crash = rskynet::crash::install()?;
+///     // 之后才能初始化 / 启动 rskynet
+///     Ok(())
+/// }
+/// ```
+///
+/// workspace profile 统一使用 `panic = "abort"`。普通 `panic = "abort"` 仍会执行
+/// panic hook，因此 Rust panic 与 native crash 都会经过这里生成 minidump；
+/// 不要使用 `immediate-abort`。
 pub fn install() -> Result<CrashGuard> {
     if let Some((socket, directory, pid)) = helper_args()? {
         let code = match run_helper(&socket, &directory, pid) {

@@ -18,7 +18,6 @@
 //! 好让后面每一步出的岔子都有人记，定时器排在业务引导之前，于是那时挂的表、打的
 //! 日志时间戳都是准的。
 
-use std::any::Any;
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -273,8 +272,7 @@ fn run(
 
     // 各 worker 共享同一个不可变引用，&Node 是 Copy 的，每个闭包各拿一份
     let shared: &Node = &node;
-    let mut boot_panic: Option<Box<dyn Any + Send + 'static>> = None;
-    let (boot_result, panic) = thread::scope(|scope| {
+    let boot_result = thread::scope(|scope| {
         let (stop_monitor, stopped) = mpsc::channel();
         let observed = &monitors;
         let monitor_thread = thread::Builder::new()
@@ -292,47 +290,24 @@ fn run(
             );
         }
         // worker 已经在跑，下面同步等待 init 时，服务仍能处理 RPC、timer 与 IO 回包。
-        //
-        // boot 跑在主线程上，panic 不能直接穿过 scope 闭包：那样 Rust 会先隐式
-        // join 所有 scoped worker，而此刻还没人叫 quit，join 会永久卡住。
-        // 先接住 panic、叫醒所有 worker，等收尾完成后再重抛。
-        let boot_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            boot(&node, &config, &startup_services)
-        })) {
-            Ok(result) => result,
-            Err(payload) => {
-                boot_panic = Some(payload);
-                node.quit();
-                Err(Error::Service("启动过程发生 panic".into()))
-            }
-        };
+        let boot_result = boot(&node, &config, &startup_services);
         if boot_result.is_ok() {
             node.mark_booted();
         } else {
             node.quit();
         }
-        // 显式 join 是为了把 worker 里的 panic 接住（隐式 join 会当场抛出去）。
-        // 重抛留到收尾之后：独占线程还等着「自己被摘除」这个通知，先抛就没人给了
-        let mut panic = None;
+
         for worker in workers {
-            if let Err(payload) = worker.join() {
-                panic = panic.or(Some(payload));
-            }
+            worker.join().expect("worker 线程异常结束");
         }
         // recv_timeout 会被这条消息立刻打断，正常关停不必等完 5 秒检查周期。
         let _ = stop_monitor.send(());
-        if let Err(payload) = monitor_thread.join() {
-            panic = panic.or(Some(payload));
-        }
-        (boot_result, panic)
+        monitor_thread.join().expect("monitor 线程异常结束");
+        boot_result
     });
 
     // worker 收工了，在主线程上把尾收完
-    let shutdown_panic = shutdown(&node);
-    let panic = boot_panic.take().or(panic).or(shutdown_panic);
-    if let Some(payload) = panic {
-        std::panic::resume_unwind(payload);
-    }
+    shutdown(&node);
     boot_result
 }
 
@@ -352,23 +327,19 @@ fn boot(node: &Arc<Node>, config: &Config, startup_services: &[(String, String)]
     // 日志最先：从这里开始，后面每一步的动静都有人记
     let kind = config.system_kind(service::LOGGER, service::LOGGER)?;
     if !kind.trim().is_empty() {
-        let logger = node.new_service(&kind, "")?;
+        let logger = node.new_reserved_service(&kind, "")?;
         logger.init.wait()?;
         node.set_logger(logger.handle);
         bind_system_name(node, logger.handle, service::LOGGER)?;
-        // logger 不计入「服务数归零就退出」的判断，并且留到最后才送走，
-        // 这样关停过程中产生的日志仍然写得出来
-        node.reserve(logger.handle);
     }
 
     // 信号服务也必须留到普通服务全部退出之后；否则关停途中再来的信号会落回
     // 操作系统默认动作，直接截断日志与邮箱的排空。
     let kind = config.system_kind(service::SIGNAL, service::SIGNAL)?;
     if !kind.trim().is_empty() {
-        let signal = node.new_service(&kind, "")?;
+        let signal = node.new_reserved_service(&kind, "")?;
         signal.init.wait()?;
         bind_system_name(node, signal.handle, service::SIGNAL)?;
-        node.reserve(signal.handle);
     }
 
     // 定时器排在引导之前，于是引导期间刻度就在走：那会儿挂的表立刻开始计时，
@@ -376,10 +347,9 @@ fn boot(node: &Arc<Node>, config: &Config, startup_services: &[(String, String)]
     // 有过服务」，否则它一上来就会看到服务数为 0 而宣布收工
     let kind = config.system_kind(service::TIMER, service::TIMER)?;
     if !kind.trim().is_empty() {
-        let timer = node.new_service(&kind, "")?;
+        let timer = node.new_reserved_service(&kind, "")?;
         timer.init.wait()?;
         bind_system_name(node, timer.handle, service::TIMER)?;
-        node.reserve(timer.handle);
     }
 
     for (kind, args) in startup_services {
@@ -406,21 +376,20 @@ fn boot(node: &Arc<Node>, config: &Config, startup_services: &[(String, String)]
 /// 留到最后，而 logger 又是保留服务里最后走的那个，这样关停过程中每一条日志都
 /// 还有人写。
 ///
-/// 返回独占线程里没接住的 panic，由调用方重抛。
-fn shutdown(node: &Arc<Node>) -> Option<Box<dyn Any + Send + 'static>> {
-    let mut panic = None;
+/// 线程 panic 由 `JoinHandle::join` 直接暴露，不做收集与重抛。
+fn shutdown(node: &Arc<Node>) {
     drain(node);
     node.retire_all();
     drain(node);
-    panic = panic.or(node.join_retired_exclusives());
+    node.join_retired_exclusives();
 
     // 保留服务分两批走：先送走定时器之类，等它们的线程收完工，logger 才最后走
     node.retire_reserved(true);
     drain(node);
-    panic = panic.or(node.join_retired_exclusives());
+    node.join_retired_exclusives();
     node.retire_reserved(false);
     drain(node);
-    panic.or(node.join_exclusives())
+    node.join_exclusives();
 }
 
 /// worker 主循环，对照 C 版 `thread_worker`。
@@ -430,18 +399,13 @@ fn worker_loop(node: &Node, id: usize, monitor: Arc<Monitor>) {
     let _worker = node.sched.register_worker(id);
     let mut hold = None;
 
-    // destroy/cleanup 应当是 no-unwind 的，但万一有内部路径漏出 panic，也必须
-    // 在 worker 退出前把本地队列倒进 injector 并叫醒其余 worker，否则收尾主线程
-    // 取不到 BWoS 本地队列，整个节点可能卡死或泄漏。
-    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        while !node.sched.is_quit() {
-            hold = node.dispatch(hold.take());
-            if hold.is_none() {
-                // 找活：先自旋几轮，还是空手就登记空闲位并挂起，等人定向叫醒
-                hold = node.sched.find_work_or_park();
-            }
+    while !node.sched.is_quit() {
+        hold = node.dispatch(hold.take());
+        if hold.is_none() {
+            // 找活：先自旋几轮，还是空手就登记空闲位并挂起，等人定向叫醒
+            hold = node.sched.find_work_or_park();
         }
-    }));
+    }
 
     // 收工时手里可能还捏着一个服务：它的 in_global 仍是置位的，却已经不在运行
     // 队列里了。必须放回去，否则收尾流程找不到它，它邮箱里的消息（比如最后几条
@@ -452,11 +416,6 @@ fn worker_loop(node: &Node, id: usize, monitor: Arc<Monitor>) {
     // 本地队列里剩下的服务同理。收尾在主线程上做，而主线程取不到别人的本地队列，
     // 所以必须由 owner 自己倒进 injector。
     node.sched.flush_local();
-
-    if let Err(payload) = panic {
-        node.sched.set_quit();
-        std::panic::resume_unwind(payload);
-    }
 }
 
 /// 对照 C 版 `thread_monitor`：每 5 秒扫描一遍，但每秒都给关停信号一次立即打断的机会。
@@ -536,14 +495,13 @@ mod tests {
     use crate::context::{Ctx, Service};
     use crate::message::Message;
 
-    /// init 里直接 panic 的服务：旧实现会让 `Builder::run` 永久卡在
-    /// `InitTicket::wait()`，现在应当被隔离成 `Error::Init`。
+    /// init 返回 Err 的服务：这是正常错误路径，必须仍然能干净关停。
     #[derive(Default)]
-    struct PanicInit;
+    struct FailingInit;
 
-    impl Service for PanicInit {
+    impl Service for FailingInit {
         fn init(self: Arc<Self>, _ctx: Ctx, _args: String) -> BoxFuture<'static, Result<()>> {
-            Box::pin(async { panic!("boom in init") })
+            Box::pin(async { Err(Error::service("预期的初始化失败")) })
         }
 
         fn dispatch(self: Arc<Self>, _ctx: Ctx, _msg: Message) -> BoxFuture<'static, ()> {
@@ -591,162 +549,39 @@ mod tests {
         }
     }
 
-    struct FutureDropBomb;
-
-    impl Drop for FutureDropBomb {
-        fn drop(&mut self) {
-            panic!("boom in Future::drop during cleanup");
-        }
-    }
-
-    /// init 里留下一个已 poll 过、正挂在 Pending 上的 Future，然后退出自己，
-    /// 销毁路径必须把这个 Future 的坏析构隔离掉。
-    #[derive(Default)]
-    struct PanicDropOnCleanup;
-
-    impl Service for PanicDropOnCleanup {
-        fn init(self: Arc<Self>, ctx: Ctx, _args: String) -> BoxFuture<'static, Result<()>> {
-            Box::pin(async move {
-                ctx.spawn(async move {
-                    let _bomb = FutureDropBomb;
-                    std::future::pending::<()>().await;
-                });
-                // 先让出一次，确保上面这个任务已经被 poll 过、Bomb 真正构造出来。
-                ctx.yield_now().await;
-                ctx.exit();
-                Ok(())
-            })
-        }
-
-        fn dispatch(self: Arc<Self>, _ctx: Ctx, _msg: Message) -> BoxFuture<'static, ()> {
-            Box::pin(async {})
-        }
-    }
-
-    /// service 对象自己的 Drop panic 也要在销毁路径里被接住。
-    struct ServiceDropBomb;
-
-    impl Drop for ServiceDropBomb {
-        fn drop(&mut self) {
-            panic!("boom in Service::drop");
-        }
-    }
-
-    impl Service for ServiceDropBomb {
-        fn init(self: Arc<Self>, ctx: Ctx, _args: String) -> BoxFuture<'static, Result<()>> {
-            Box::pin(async move {
-                ctx.exit();
-                Ok(())
-            })
-        }
-
-        fn dispatch(self: Arc<Self>, _ctx: Ctx, _msg: Message) -> BoxFuture<'static, ()> {
-            Box::pin(async {})
-        }
-    }
-
+    /// init 返回 Err 时必须走正常收尾：worker 退出、保留服务被送走，返回 Error::Init。
     #[test]
-    fn init_panic_is_contained_and_reported() {
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let result = {
-            let mut registry = Registry::new();
-            registry.register("panic-init", PanicInit::default);
-            let config = Config::from_toml_str(
-                r#"
-                thread = 1
+    fn init_error_shuts_down_cleanly() {
+        let mut registry = Registry::new();
+        registry.register("failing-init", FailingInit::default);
+        let config = Config::from_toml_str(
+            r#"
+            thread = 1
 
-                [logger]
-                name = "panic-init"
+            [logger]
+            name = "failing-init"
 
-                [signal]
-                name = ""
+            [signal]
+            name = ""
 
-                [timer]
-                name = ""
+            [timer]
+            name = ""
 
-                [bootstrap]
-                name = ""
-                "#,
-            )
-            .expect("配置应解析成功");
-            start(config, registry, Arc::new(crate::server::tests::StubTimer))
-        };
-        std::panic::set_hook(previous);
+            [bootstrap]
+            name = ""
+            "#,
+        )
+        .expect("配置应解析成功");
+
+        let result = start(config, registry, Arc::new(crate::server::tests::StubTimer));
 
         match result {
             Err(Error::Init { kind, reason }) => {
-                assert_eq!(kind, "panic-init");
-                assert!(reason.contains("panic"), "原因应包含 panic：{reason}");
+                assert_eq!(kind, "failing-init");
+                assert!(reason.contains("预期的初始化失败"), "原因应保留：{reason}");
             }
-            other => panic!("init panic 应当变成 Init 错误，实际是 {other:?}"),
+            other => panic!("init 错误应当原样返回，实际是 {other:?}"),
         }
-    }
-
-    /// 销毁路径里的 Future::Drop panic 不能打穿 worker，也不能破坏节点收尾。
-    #[test]
-    fn cleanup_future_drop_panic_is_contained() {
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let result = {
-            let mut registry = Registry::new();
-            registry.register("bootstrap", PanicDropOnCleanup::default);
-            let config = Config::from_toml_str(
-                r#"
-                thread = 1
-
-                [logger]
-                name = ""
-
-                [signal]
-                name = ""
-
-                [timer]
-                name = ""
-                "#,
-            )
-            .expect("配置应解析成功");
-            start(config, registry, Arc::new(crate::server::tests::StubTimer))
-        };
-        std::panic::set_hook(previous);
-
-        assert!(
-            result.is_ok(),
-            "cleanup 里的 Future::Drop panic 应当被隔离，节点应正常收尾：{result:?}"
-        );
-    }
-
-    /// service 对象自身的 Drop panic 同样不能从销毁路径逃逸。
-    #[test]
-    fn service_drop_panic_is_contained() {
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let result = {
-            let mut registry = Registry::new();
-            registry.register("bootstrap", || ServiceDropBomb);
-            let config = Config::from_toml_str(
-                r#"
-                thread = 1
-
-                [logger]
-                name = ""
-
-                [signal]
-                name = ""
-
-                [timer]
-                name = ""
-                "#,
-            )
-            .expect("配置应解析成功");
-            start(config, registry, Arc::new(crate::server::tests::StubTimer))
-        };
-        std::panic::set_hook(previous);
-
-        assert!(
-            result.is_ok(),
-            "service 对象的 Drop panic 应当被隔离，节点应正常收尾：{result:?}"
-        );
     }
 
     #[test]

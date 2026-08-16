@@ -114,57 +114,14 @@ impl std::fmt::Debug for Idler {
 ///
 /// 与 worker 的区别只有两处：手里的服务永远是同一个（不必去运行队列取，也不必
 /// 让渡），以及没活干时去调服务自己的 [`Exclusive::idle`] 而不是找活或挂起。
+///
+/// idle / dispatch / drain / destroy 或最终 Drop 中的 panic 都不做恢复，
+/// 由进程级崩溃处理统一记录后 abort。
 pub(crate) fn exclusive_loop(ctx: Arc<ServiceContext>, service: Arc<dyn Exclusive>) {
     // 必须在任何一次挂起之前登记，见 [`Idler`] 的说明
     ctx.bind_thread();
-    let handle = ctx.handle;
-    let kind = ctx.kind.clone();
+
     let node = ctx.node.clone();
-
-    // idle / dispatch / drain / destroy 中的 panic 都收在这里。with_ownership
-    // 把整个善后路径都罩在「本服务持有者」作用域内，`fail_after_panic` 才能
-    // 当场给 in-flight 请求回错误。
-    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        ctx.with_ownership(|| {
-            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                exclusive_loop_inner(&ctx, &service, &node);
-            }));
-            if panic.is_err() {
-                ctx.fail_after_panic();
-                ctx.mailbox.mark_running();
-                node.destroy(ctx.clone());
-            }
-        });
-    }));
-
-    // 上面那条恢复路径若仍意外失败，这里做最后一次无 panic 销毁尝试。
-    // 恢复路径成功后 destroyed 已经置位且邮箱已放生，不能再清一遍。
-    if panic.is_err() && !ctx.is_destroyed() {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ctx.mailbox.mark_running();
-            node.destroy(ctx.clone());
-        }));
-    }
-
-    // `ctx` 与 `service` 的最后一个 Arc 可能在这条线程上释放；service 对象的
-    // Drop 是用户代码，同样收住，不能让独占线程在最后一步逃逸 panic。
-    let drop_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        drop(service);
-        drop(ctx);
-    }));
-    if drop_panic.is_err() {
-        node.log(
-            handle,
-            format!("error: 独占服务 `{kind}` 最终析构时发生 panic，线程已正常收工"),
-        );
-    }
-}
-
-fn exclusive_loop_inner(
-    ctx: &Arc<ServiceContext>,
-    service: &Arc<dyn Exclusive>,
-    node: &crate::server::Node,
-) {
     let idler = Idler::new(ctx.clone());
     let cx = Ctx::new(ctx.clone());
 
@@ -173,7 +130,7 @@ fn exclusive_loop_inner(
         // 要么已经把状态推成 QUEUED（那也是给本线程看的），要么随后压进来的活
         // 会把状态推成 NOTIFIED，被 take_work 的重扫接住
         ctx.mailbox.mark_running();
-        if node.run_service(ctx, false).is_dead() || ctx.is_dead() {
+        if node.run_service(&ctx, false).is_dead() || ctx.is_dead() {
             break;
         }
         ctx.with_ownership(|| service.idle(&cx, &idler));
@@ -183,7 +140,7 @@ fn exclusive_loop_inner(
     // worker 完全一样的销毁流程。`mark_running` 是因为排空那一步会把状态放回
     // IDLE，而销毁的最后一步要从 RUNNING 放生
     ctx.mailbox.mark_running();
-    node.drain_service(ctx);
+    node.drain_service(&ctx);
     ctx.mailbox.mark_running();
-    node.destroy(ctx.clone());
+    node.destroy(ctx);
 }

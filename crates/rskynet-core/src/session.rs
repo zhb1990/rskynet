@@ -30,12 +30,6 @@ struct Inner {
     slots: HashMap<u64, Slot>,
 }
 
-/// 析构一个 session 槽位。`Slot::Done` 里可能装着用户 `Payload`，
-/// 它的 `Drop` 是用户代码，不能让它把销毁流程打穿。
-fn drop_slot_catching_panic(slot: Slot) {
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(slot)));
-}
-
 pub(crate) struct SessionTable {
     /// 只有当前执行本 service 的线程可以修改；跨线程观测只能读取 `active`。
     inner: SvcCell<Inner>,
@@ -78,7 +72,7 @@ impl SessionTable {
         let mut inner = self.inner.borrow_mut();
         match inner.slots.get(&session) {
             // 丢弃回包 Payload 前先释放表借用，否则用户 Drop 重入 session 表会撞车。
-            // 析构 panic 仍向上传播，交给 run_work 按「用户代码 panic」处理。
+            // 析构 panic 与其它用户代码 panic 一样直接向上传播。
             None => {
                 drop(inner);
                 drop(result);
@@ -125,7 +119,7 @@ impl SessionTable {
     /// 等待方放弃等待。直接删除表项；迟到的回包会因查无此 session 被丢弃。
     pub(crate) fn abandon(&self, session: u64) {
         // 先搬出借用再析构：`Done` 里的 Payload Drop 可能重入 session 表。
-        // 析构 panic 仍向上传播；清理路径的调用方已经逐任务/逐槽位包了 catch。
+        // 析构 panic 与其它用户代码 panic 一样直接向上传播。
         let removed = {
             let mut inner = self.inner.borrow_mut();
             inner.slots.remove(&session)
@@ -138,12 +132,12 @@ impl SessionTable {
 
     /// 服务销毁时清空。此时所有等待中的任务马上会被一起丢弃，无需逐个唤醒。
     pub(crate) fn clear(&self) {
-        // 整张表搬出来，释放 SvcCell 借用后再逐个析构槽位。
+        // 整张表搬出来，释放 SvcCell 借用后再析构槽位。
+        // `Slot::Done` 里可能装着用户 `Payload`；它的 Drop panic 与其它用户代码
+        // panic 一样是进程级故障，不做恢复。
         let slots = std::mem::take(&mut self.inner.borrow_mut().slots);
         self.active.store(0, Ordering::Relaxed);
-        for (_, slot) in slots {
-            drop_slot_catching_panic(slot);
-        }
+        drop(slots);
     }
 
     pub(crate) fn pending(&self) -> usize {
@@ -261,9 +255,9 @@ mod tests {
         }
     }
 
-    /// 清表时到达的 Payload 析构 panic 不能逃出 session 表。
+    /// 清表时到达的 Payload 析构 panic 不做恢复，直接向上传播。
     #[test]
-    fn clear_contains_payload_drop_panics() {
+    fn clear_propagates_payload_drop_panic() {
         let table = SessionTable::new();
         let session = table.alloc();
         assert!(table.complete(session, Ok(Payload::of(PanicDropPayload))));
@@ -273,7 +267,7 @@ mod tests {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| table.clear()));
         std::panic::set_hook(previous);
 
-        assert!(result.is_ok(), "clear 必须吞掉 Payload 的析构 panic");
+        assert!(result.is_err(), "clear 必须传播 Payload 的析构 panic");
         assert_eq!(table.pending(), 0);
     }
 

@@ -837,8 +837,8 @@ impl Scheduler {
 
 impl Drop for Scheduler {
     fn drop(&mut self) {
-        // handoff 槽里寄存着 Arc 强引用，正常收尾时 flush_local 会取空，
-        // 这里兜住异常路径（比如 worker 线程 panic）以免泄漏
+        // handoff 槽里寄存着 Arc 强引用，正常收尾时 flush_local 会取空；
+        // 这里兜住 Scheduler 直接析构时仍有寄存引用的路径，以免泄漏
         for slot in &self.slots {
             drop(slot.take());
         }

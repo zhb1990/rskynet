@@ -300,27 +300,17 @@ impl TaskSet {
         slot.future = Some(future);
     }
 
+    /// 删除任务。槽位 generation 不匹配时无事发生。
     pub(crate) fn remove(&self, task: TaskId) {
-        let _ = self.remove_with_request(task);
-    }
-
-    /// 删除任务并返回它仍在处理的请求。panic 善后路径用它给当前请求方回错误。
-    pub(crate) fn remove_with_request(&self, task: TaskId) -> Option<(u32, u64)> {
         let mut slots = self.slots.borrow_mut();
         if !slots
             .get(task.index)
             .is_some_and(|slot| slot.generation == task.generation)
         {
-            return None;
+            return;
         }
-        let request = slots
-            .get_mut(task.index)
-            .expect("刚刚确认过槽位存在")
-            .request
-            .take();
         slots.remove(task.index);
         self.count.store(slots.len(), Ordering::Relaxed);
-        request
     }
 
     pub(crate) fn len(&self) -> usize {

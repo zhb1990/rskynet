@@ -58,6 +58,12 @@ toml = "0.9"
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 ureq-proto = "0.6"
 
+# 统一 fail-fast：普通 panic="abort" 仍会执行 panic hook，崩溃信息由 rskynet-signal 记录。
+# 不要改成 immediate-abort，那会跳过 hook。cargo test 的 harness 仍强制 unwind。
+[profile.dev]
+panic = "abort"
+
 [profile.release]
+panic = "abort"
 lto = "thin"
 codegen-units = 1

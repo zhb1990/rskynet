@@ -34,6 +34,26 @@
 //! 三块：[`Exclusive`] 那套独占线程的服务、[`ext`] 里给内核之外的线程用的接口
 //! （服务住在独立 crate 里，总得有条公开的路进得来），以及 [`Timer`] 这个把
 //! 时间实现挡在内核之外的抽象。
+//!
+//! ## panic 契约：内核不恢复 panic
+//!
+//! rskynet 采用 fail-fast：worker、exclusive、`Future::poll`、`Service::dispatch`、
+//! `Drop` 或运行时内部路径里的 panic 都是进程级故障，内核不做 `catch_unwind`、
+//! 不把单个服务转成 FAILED 后继续运行。workspace 的 dev/release profile 都设置
+//! `panic = "abort"`；普通 `panic = "abort"` 仍会执行进程入口安装的 panic hook，
+//! 因此崩溃信息与 minidump 由 `rskynet-signal` 的 crash reporter 统一记录。
+//!
+//! 自定义入口的启动契约是：**先安装 crash handler，再读取参数 / 配置并启动节点**。
+//!
+//! ```ignore
+//! fn main() -> rskynet::Result<()> {
+//!     let _crash = rskynet::crash::install()?;
+//!     // 之后才能初始化 / 启动 rskynet
+//!     Ok(())
+//! }
+//! ```
+//!
+//! `cargo test` 的测试 harness 强制使用 unwind，因此单元测试不依赖进程 abort。
 
 // 给过程宏一个在 crate 内外都稳定的绝对路径；也避免 rust-analyzer 在单元测试
 // 的宏展开中把 `::rskynet_core` 误判成不存在的外部 crate。

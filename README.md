@@ -630,6 +630,13 @@ fn main() -> rskynet::Result<()> {
 }
 ```
 
+这是 fail-fast 的启动契约：`rskynet-core` 不恢复 panic，worker、exclusive、
+`Future::poll`、`Service::dispatch`、`Drop` 或运行时内部的 panic 都按进程级故障
+处理。workspace 的 dev / release profile 统一设置 `panic = "abort"`；普通
+`abort` 仍会执行 panic hook，所以上面的 handler 一定会先记录 PanicMetadata、
+backtrace 并让 helper 生成 dump，随后进程 abort。`cargo test` 的测试 harness
+强制 unwind，因此单元测试仍按测试语义运行。
+
 Unix 的 `SIGINT` 与 `SIGTERM`、Windows 的 Ctrl+C 默认调用 `NodeRef::abort()` 优雅
 关停。属性宏可以覆盖某个信号的默认行为：
 

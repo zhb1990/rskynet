@@ -110,8 +110,21 @@ pub use rskynet_signal as signal;
 #[cfg(feature = "timer")]
 pub use rskynet_timer as timer;
 
-/// 独立崩溃报告进程。标准 [`main::run`] 会自动安装；自定义入口应在启动节点前
-/// 调用 [`crash::install`] 并把返回的 guard 留到进程结束。
+/// 独立崩溃报告进程，也是 fail-fast 进程契约的安装点。
+///
+/// 标准 [`main::run`] 会在读取参数与配置之前自动安装；自定义入口同样必须最先
+/// 调用 [`crash::install`]，并把返回的 guard 留到进程结束：
+///
+/// ```no_run
+/// fn main() -> rskynet::Result<()> {
+///     let _crash = rskynet::crash::install()?;
+///     // 之后才能初始化 / 启动 rskynet
+///     Ok(())
+/// }
+/// ```
+///
+/// rskynet 内核不恢复 panic。workspace profile 使用 `panic = "abort"`，而普通
+/// `abort` 仍会执行 panic hook：panic 与 native crash 都由这里统一记录并生成 dump。
 #[cfg(feature = "signal")]
 pub use rskynet_signal::crash;
 
@@ -124,6 +137,9 @@ pub mod main {
     use super::{Config, Error, Registry, Result};
 
     /// 使用进程参数启动节点。要求且只接受一个 TOML 配置路径。
+    ///
+    /// 启用 `signal` feature 时，在读取参数与配置之前先安装崩溃处理器，
+    /// 因此启动阶段、运行阶段与关停阶段的 panic 都已在崩溃报告覆盖范围内。
     pub fn run() -> ExitCode {
         #[cfg(feature = "signal")]
         let _crash = match crate::crash::install() {

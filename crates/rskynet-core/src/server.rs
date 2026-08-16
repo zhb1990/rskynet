@@ -12,7 +12,6 @@
 //! [`Node::destroy`] 会清空任务集，循环随之断开，`Arc` 计数归零。
 //! 这与 skynet 里 `delete_context` 释放 Lua 虚拟机、连带干掉所有协程是一个道理。
 
-use std::any::Any;
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -168,10 +167,10 @@ pub(crate) struct ServiceContext {
     pending_messages: crate::task::SvcCell<Option<VecDeque<Message>>>,
     /// 已被摘出 handle 表，等待某个 worker 领走做销毁。
     dead: AtomicBool,
-    /// 保留服务：不计入退出条件，且要留到最后才释放。
+    /// 保留服务：创建时确定，之后不再改变。不计入退出条件，且要留到最后才释放。
     /// 对照 `skynet_context_reserve`，logger 用它保住自己
     /// ——否则关停时它邮箱里积压的日志会跟着一起被丢掉。
-    reserved: AtomicBool,
+    reserved: bool,
     /// 销毁记账是否已完成，保证 `total` 只减一次。
     destroyed: AtomicBool,
     /// monitor 发现过疑似死循环；读取即清除。
@@ -240,12 +239,8 @@ impl ServiceContext {
         self.dead.load(Ordering::Acquire)
     }
 
-    pub(crate) fn is_destroyed(&self) -> bool {
-        self.destroyed.load(Ordering::Acquire)
-    }
-
     pub(crate) fn is_reserved(&self) -> bool {
-        self.reserved.load(Ordering::Acquire)
+        self.reserved
     }
 
     fn is_running(&self) -> bool {
@@ -273,26 +268,6 @@ impl ServiceContext {
             && self.owns_current_thread();
         if self.node.retire(self.handle) && initializing_here {
             self.init_self_exit.store(true, Ordering::Release);
-        }
-    }
-
-    /// 用户代码 panic 后的服务级善后：初始化票据必须完成，服务必须被摘除，
-    /// 所有还在等待的请求都要收到错误，随后由持有它的 worker/独占线程销毁。
-    ///
-    /// 调用方必须正持有本服务（`Running` 作用域内），这样 `Node::retire` 才会
-    /// 顺带执行 `fail_inflight`。
-    pub(crate) fn fail_after_panic(&self) {
-        if self.lifecycle.load(Ordering::Acquire) == lifecycle::INITIALIZING {
-            self.finish_init(Err("服务初始化期间 panic".into()));
-        } else {
-            self.lifecycle.store(lifecycle::FAILED, Ordering::Release);
-        }
-        self.node.log(
-            self.handle,
-            format!("error: 服务 `{}` 的用户代码 panic，已终止该服务", self.kind),
-        );
-        if !self.node.retire(self.handle) {
-            self.fail_inflight();
         }
     }
 
@@ -347,14 +322,12 @@ impl ServiceContext {
 
     /// 无条件把独占线程从阻塞里敲出来，普通服务无事可做。节点收工时用它。
     ///
-    /// `Exclusive::interrupt` 可能在任意投递线程上执行；它的 panic 不能让投递方
-    /// 线程死掉，所以这里吞掉并只做尽力唤醒。
+    /// `Exclusive::interrupt` 可能在任意投递线程上执行；它的 panic 与其它用户代码
+    /// panic 一样是进程级故障，不做恢复。
     pub(crate) fn interrupt(&self) {
         if let Some(service) = &self.exclusive {
             self.unpark();
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                service.interrupt();
-            }));
+            service.interrupt();
         }
     }
 
@@ -462,41 +435,19 @@ impl ServiceContext {
         let (source, session) = (msg.source, msg.session);
         let request = (session != 0 && source != 0).then_some((source, session));
         let ctx = Ctx::new(self.clone());
-        // `Service::dispatch` 是同步构造 future 的，手写实现可以在这里 panic。
-        // 在消息进入任务集之前单独隔离，保证当前请求方仍能收到错误回包。
-        let future = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.service.clone().dispatch(ctx.clone(), msg)
-        })) {
-            Ok(future) => future,
-            Err(_) => {
-                if let Some((source, session)) = request {
-                    let _ = self.node.send_raw(
-                        self.handle,
-                        source,
-                        MsgType::ERROR,
-                        session,
-                        Payload::None,
-                    );
-                }
-                self.fail_after_panic();
-                return;
-            }
-        };
+        // `Service::dispatch` 是同步构造 future 的；这里 panic 与 Future 内部 panic
+        // 一样交给进程级崩溃处理，不做服务级恢复。
+        let future = self.service.clone().dispatch(ctx, msg);
         self.install_task(future, request, source);
     }
 
-    /// 执行一件用户代码可能 panic 的活。
+    /// 执行一件活：消息直接开任务，就绪任务 poll 一次。
     ///
-    /// panic 被隔离在服务边界内：服务会转为 FAILED、初始化票据会完成、
-    /// in-flight 请求会收到错误，随后服务被摘除并交给当前线程销毁。
-    /// 调用方必须已经处于本服务的 `Running` 作用域。
+    /// 调用方必须已经处于本服务的 `Running` 作用域。用户代码 panic 不做恢复。
     fn run_work(self: &Arc<Self>, work: Work) {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match work {
+        match work {
             Work::Ready(Ready::Task(task)) => self.poll_task(task),
             Work::Message(msg) => self.handle_message(msg),
-        }));
-        if result.is_err() {
-            self.fail_after_panic();
         }
     }
 
@@ -515,36 +466,14 @@ impl ServiceContext {
         let _monitored = crate::monitor::Running::enter(source, self.handle);
         let mut cx = std::task::Context::from_waker(&waker);
         let started = self.node.profile().then(std::time::Instant::now);
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            future.as_mut().poll(&mut cx)
-        }));
+        match future.as_mut().poll(&mut cx) {
+            // 任务正常跑完，它手上那个请求也就算办完了，不必再回错误
+            std::task::Poll::Ready(()) => self.tasks.remove(task),
+            std::task::Poll::Pending => self.tasks.restore(task, future),
+        }
         if let Some(started) = started {
             self.cpu_cost
                 .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-        }
-        match result {
-            // 任务正常跑完，它手上那个请求也就算办完了，不必再回错误
-            Ok(std::task::Poll::Ready(())) => self.tasks.remove(task),
-            Ok(std::task::Poll::Pending) => self.tasks.restore(task, future),
-            Err(_) => {
-                // 先把当前任务正在服务的请求摘出来并回错误；否则 remove 之后
-                // fail_inflight 就再也看不到这个请求了。
-                if let Some((source, session)) = self.tasks.remove_with_request(task) {
-                    let _ = self.node.send_raw(
-                        self.handle,
-                        source,
-                        MsgType::ERROR,
-                        session,
-                        Payload::None,
-                    );
-                }
-                // Future 的析构可能还会碰 session 表 / SvcCell，同样包一层，
-                // 避免一个坏掉的 Drop 把 worker 带崩。
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    drop(future);
-                }));
-                self.fail_after_panic();
-            }
         }
     }
 
@@ -581,15 +510,25 @@ impl ServiceContext {
         loop {
             self.fail_inflight();
             // 先丢任务再清 session 表：任务里的 `Call` 析构时还会来注销 session。
-            // 每个 Future / 消息 / Payload 的析构都单独隔离，既不让单个坏析构
-            // 打穿销毁流程，也避免 Vec 整体析构时多个 Drop panic 造成 double panic。
+            // 析构里的 panic 不做隔离，与其它用户代码 panic 一样交给崩溃处理。
             for task in self.tasks.drain() {
-                drop_catching_panic(task);
+                drop(task);
             }
             self.sessions.clear();
             // 邮箱里没来得及处理的请求同样要回个错误
             for msg in self.mailbox.drain() {
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if msg.needs_reply() && msg.source != 0 && !msg.mtype.is_reply() {
+                    let _ = self.node.send_raw(
+                        self.handle,
+                        msg.source,
+                        MsgType::ERROR,
+                        msg.session,
+                        Payload::None,
+                    );
+                }
+            }
+            if let Some(pending) = self.pending_messages.borrow_mut().take() {
+                for msg in pending {
                     if msg.needs_reply() && msg.source != 0 && !msg.mtype.is_reply() {
                         let _ = self.node.send_raw(
                             self.handle,
@@ -599,23 +538,6 @@ impl ServiceContext {
                             Payload::None,
                         );
                     }
-                    drop(msg);
-                }));
-            }
-            if let Some(pending) = self.pending_messages.borrow_mut().take() {
-                for msg in pending {
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        if msg.needs_reply() && msg.source != 0 && !msg.mtype.is_reply() {
-                            let _ = self.node.send_raw(
-                                self.handle,
-                                msg.source,
-                                MsgType::ERROR,
-                                msg.session,
-                                Payload::None,
-                            );
-                        }
-                        drop(msg);
-                    }));
                 }
             }
             if self.lifecycle.load(Ordering::Acquire) == lifecycle::INITIALIZING {
@@ -626,11 +548,6 @@ impl ServiceContext {
             }
         }
     }
-}
-
-/// 析构一个可能执行用户 `Drop` 的值，并把 panic 就地吞掉。
-fn drop_catching_panic<T>(value: T) {
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value)));
 }
 
 /// 一轮 [`Node::run_service`] 的结局。
@@ -649,15 +566,11 @@ impl Ran {
     }
 }
 
-/// join 一批线程，返回其中第一个没接住的 panic。
-fn join_all(threads: Vec<JoinHandle<()>>) -> Option<Box<dyn Any + Send + 'static>> {
-    let mut panic = None;
+/// join 一批线程。线程 panic 按 fail-fast 处理：直接失败。
+fn join_all(threads: Vec<JoinHandle<()>>) {
     for thread in threads {
-        if let Err(payload) = thread.join() {
-            panic = panic.or(Some(payload));
-        }
+        thread.join().expect("线程异常结束");
     }
-    panic
 }
 
 /// 一个 rskynet 节点。
@@ -673,7 +586,8 @@ pub(crate) struct Node {
     /// 那时启动阶段的作用域早就建好了。所以这里是普通线程加一张表，代价是收尾
     /// 得自己 join（见 [`Node::join_exclusives`]）。
     exclusives: Mutex<HashMap<u32, JoinHandle<()>>>,
-    /// 活着的服务数，归零即整个节点退出，对照 `skynet_context_total`。
+    /// 计入退出条件的普通服务数，归零即整个节点退出，对照 `skynet_context_total`。
+    /// 保留服务从创建起就不计入，销毁时也不参与递减。
     total: AtomicI64,
     /// 系统服务是否都已拉起。
     ///
@@ -746,16 +660,6 @@ impl Node {
         );
     }
 
-    /// 把服务标成保留服务，对照 `skynet_context_reserve`：
-    /// 不计入退出条件（否则节点永远等不到服务数归零），并且留到最后才释放。
-    pub(crate) fn reserve(&self, handle: u32) {
-        if let Some(ctx) = self.handles.grab(handle) {
-            if !ctx.reserved.swap(true, Ordering::AcqRel) {
-                self.total.fetch_sub(1, Ordering::AcqRel);
-            }
-        }
-    }
-
     /// 地址解析，对照 `skynet_queryname`。
     pub(crate) fn resolve(&self, addr: &Addr) -> Result<u32> {
         match addr {
@@ -786,6 +690,27 @@ impl Node {
     /// 初始化被当成服务自己的第一个任务：共享服务交给 worker，独占服务交给专属
     /// 线程。调用者只拿到等待票据，绝不在自己的线程上 poll 用户的 `init`。
     pub(crate) fn new_service(self: &Arc<Self>, kind: &str, args: &str) -> Result<NewService> {
+        self.new_service_inner(kind, args, false)
+    }
+
+    /// 创建一个保留服务：不计入退出条件，销毁时也不改变服务计数。
+    ///
+    /// `reserved` 从创建到销毁都不变，因此不需要运行期身份转换，
+    /// 也就没有「创建后 total+1、reserve 时 total-1」与 destroy 之间的记账竞态。
+    pub(crate) fn new_reserved_service(
+        self: &Arc<Self>,
+        kind: &str,
+        args: &str,
+    ) -> Result<NewService> {
+        self.new_service_inner(kind, args, true)
+    }
+
+    fn new_service_inner(
+        self: &Arc<Self>,
+        kind: &str,
+        args: &str,
+        reserved: bool,
+    ) -> Result<NewService> {
         if self.sched.is_quit() {
             return Err(Error::Service("节点已经收工，不能再启动新服务".into()));
         }
@@ -819,7 +744,7 @@ impl Node {
                 init_self_exit: AtomicBool::new(false),
                 pending_messages: crate::task::SvcCell::new(Some(VecDeque::new())),
                 dead: AtomicBool::new(false),
-                reserved: AtomicBool::new(false),
+                reserved,
                 destroyed: AtomicBool::new(false),
                 endless: AtomicBool::new(false),
                 message_count: AtomicU64::new(0),
@@ -830,7 +755,9 @@ impl Node {
             })
         });
         let handle = ctx.handle;
-        self.total.fetch_add(1, Ordering::AcqRel);
+        if !reserved {
+            self.total.fetch_add(1, Ordering::AcqRel);
+        }
 
         let cx = Ctx::new(ctx.clone());
         let args = args.to_string();
@@ -881,8 +808,8 @@ impl Node {
     /// join 掉那些服务已经被摘除的独占线程。
     ///
     /// 摘除即意味着那条线程一定会收工（`retire` 会把它叫醒），所以这一步不会
-    /// 等到天荒地老。返回线程里没接住的 panic，由调用方重抛。
-    pub(crate) fn join_retired_exclusives(&self) -> Option<Box<dyn Any + Send + 'static>> {
+    /// 等到天荒地老。线程 panic 直接按 fail-fast 处理。
+    pub(crate) fn join_retired_exclusives(&self) {
         let retired: Vec<_> = {
             let mut table = self.exclusives.lock();
             let gone: Vec<u32> = table
@@ -901,7 +828,8 @@ impl Node {
     /// join 掉全部独占线程。
     ///
     /// **调用前必须保证它们的服务都已被摘除**，否则那些线程还在等活，这里会等死。
-    pub(crate) fn join_exclusives(&self) -> Option<Box<dyn Any + Send + 'static>> {
+    /// 线程 panic 直接按 fail-fast 处理。
+    pub(crate) fn join_exclusives(&self) {
         let all: Vec<_> = self
             .exclusives
             .lock()
@@ -982,44 +910,21 @@ impl Node {
 
     /// 真正释放服务资源，只会由持有该服务的 worker 调用。
     ///
-    /// 这里收下 `Arc` 而不是借用：cleanup 与最终一次 `Arc` 析构都可能执行用户
-    /// `Drop`，所以两层都包进 `catch_unwind`。`destroyed` / `total` / `quit` 的
-    /// 记账不能依赖任何用户析构函数正常返回。
+    /// `destroyed` / `total` / `quit` 是正常的生命周期记账，不依赖任何用户析构
+    /// 函数；cleanup 或最终 Drop 里的 panic 一律不做恢复，交给崩溃处理。
     pub(crate) fn destroy(&self, ctx: Arc<ServiceContext>) {
-        let handle = ctx.handle;
-        let kind = ctx.kind.clone();
+        ctx.cleanup();
 
-        // cleanup 幂等：清理之后迟到的消息会把服务再推一次全局队列，在这里被再清一遍
-        let cleanup_panic =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.cleanup())).is_err();
+        if !ctx.destroyed.swap(true, Ordering::AcqRel) {
+            self.log(ctx.handle, format!("KILL {}", ctx.kind));
 
-        let claimed = !ctx.destroyed.swap(true, Ordering::AcqRel);
-        if claimed {
-            self.log(handle, format!("KILL {kind}"));
-            if cleanup_panic {
-                self.log(
-                    handle,
-                    format!("error: 服务 `{kind}` 销毁清理时发生 panic，已继续收尾"),
-                );
-            }
             if !ctx.is_reserved()
                 && self.total.fetch_sub(1, Ordering::AcqRel) <= 1
                 && self.is_booted()
             {
-                // 最后一个服务也走了，通知所有线程收工
+                // 最后一个普通服务也走了，通知所有线程收工
                 self.quit();
             }
-        }
-
-        // 最后一个 ServiceContext 引用可能在这里释放，service 对象的 Drop 也是
-        // 用户代码；同样只记录，不让它把 worker / 收尾线程打穿。
-        let drop_panic =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(ctx))).is_err();
-        if drop_panic {
-            self.log(
-                handle,
-                format!("error: 服务 `{kind}` 最终析构时发生 panic，已继续收尾"),
-            );
         }
     }
 
@@ -1136,10 +1041,8 @@ impl Node {
             .saturating_add(ctx.task_count().saturating_mul(2))
             .saturating_add(16);
         while budget > 0 {
-            // 这里只负责给仍 RUNNING 的服务排空收尾。若排空期间用户代码 panic，
-            // 服务已进入 FAILED，继续取消息只会触发 handle_message 里
-            // `pending_messages` 的 expect 并丢掉排队请求；交给 destroy/cleanup
-            // 统一回错误才是正确路径。
+            // 这里只负责给仍 RUNNING 的服务排空收尾；init 失败之类不在 RUNNING
+            // 状态的服务交给 destroy/cleanup 统一回错误。
             if !ctx.is_running() {
                 return;
             }
@@ -1258,7 +1161,7 @@ pub(crate) mod tests {
             init_self_exit: AtomicBool::new(false),
             pending_messages: crate::task::SvcCell::new(None),
             dead: AtomicBool::new(false),
-            reserved: AtomicBool::new(false),
+            reserved: false,
             destroyed: AtomicBool::new(false),
             endless: AtomicBool::new(false),
             message_count: AtomicU64::new(0),
@@ -1286,6 +1189,23 @@ pub(crate) mod tests {
         let err = node.new_service("并不存在", "").expect_err("应失败");
         assert!(matches!(err, Error::UnknownService(_)));
         assert_eq!(node.total(), 0);
+    }
+
+    /// 保留服务创建时不增加 total，销毁时也不减少 total。
+    #[test]
+    fn reserved_service_does_not_affect_total() {
+        let node = test_node();
+        let handle = node
+            .new_reserved_service("null", "")
+            .expect("应创建成功")
+            .handle;
+        let ctx = node.handles.grab(handle).expect("应当能按地址找回来");
+        assert!(ctx.is_reserved());
+        assert_eq!(node.total(), 0, "保留服务不计入退出条件");
+
+        assert!(node.retire(handle));
+        assert!(node.dispatch(None).is_none());
+        assert_eq!(node.total(), 0, "销毁保留服务不应改变服务计数");
     }
 
     /// 节点收工后不能再创建服务，否则 init ticket 永远不会被 worker 完成
@@ -1412,9 +1332,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// `Service::dispatch` 的同步构造路径 panic 也不能打死 worker。
+    /// `Service::dispatch` 的同步构造路径 panic 不再被服务边界吞掉，直接向上传播。
     #[test]
-    fn a_panicking_dispatch_is_contained() {
+    fn a_panicking_dispatch_propagates() {
         #[derive(Default)]
         struct PanicDispatch;
 
@@ -1424,31 +1344,29 @@ pub(crate) mod tests {
             }
         }
 
+        let registry = Registry::new().with("panic-dispatch", PanicDispatch::default);
+        let node = Node::new(&Config::default(), registry, Arc::new(StubTimer));
+        let handle = node
+            .new_service("panic-dispatch", "")
+            .expect("应创建成功")
+            .handle;
+
+        // 先跑完 init，让服务进入 RUNNING
+        let ctx = node.sched.pop().expect("新服务应当排在运行队列里");
+        assert!(matches!(node.run_service(&ctx, true), Ran::Idle));
+
+        node.send_raw(0, handle, MsgType::USER, 0, Payload::None)
+            .expect("服务仍应存活");
+        let ctx = node.sched.pop().expect("消息应把服务重新排进队列");
+
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
-        {
-            let registry = Registry::new().with("panic-dispatch", PanicDispatch::default);
-            let node = Node::new(&Config::default(), registry, Arc::new(StubTimer));
-            let handle = node
-                .new_service("panic-dispatch", "")
-                .expect("应创建成功")
-                .handle;
-
-            // 先跑完 init，让服务进入 RUNNING
-            let ctx = node.sched.pop().expect("新服务应当排在运行队列里");
-            assert!(matches!(node.run_service(&ctx, true), Ran::Idle));
-
-            node.send_raw(0, handle, MsgType::USER, 0, Payload::None)
-                .expect("服务仍应存活");
-            let ctx = node.sched.pop().expect("消息应把服务重新排进队列");
-            assert!(
-                matches!(node.run_service(&ctx, true), Ran::Dead),
-                "dispatch panic 应被隔离并摘除服务"
-            );
-            assert!(node.dispatch(Some(ctx)).is_none());
-            assert_eq!(node.total(), 0, "服务应被正常销毁");
-        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            node.run_service(&ctx, true)
+        }));
         std::panic::set_hook(previous);
+
+        assert!(result.is_err(), "dispatch panic 必须向上传播");
     }
 
     /// 独占服务不进运行队列，它自带一条线程；摘除之后那条线程要自己收工
@@ -1464,7 +1382,7 @@ pub(crate) mod tests {
 
         // 摘除就是通知：那条线程会被叫醒、看到 dead、自己把销毁做掉
         assert!(node.retire(handle));
-        assert!(node.join_exclusives().is_none(), "线程不该 panic");
+        node.join_exclusives();
         assert_eq!(node.total(), 0, "销毁记账要由那条线程自己做掉");
         assert!(node.sched.is_quit(), "服务数归零应通知所有线程收工");
     }
@@ -1489,7 +1407,7 @@ pub(crate) mod tests {
         assert_eq!(ctx.mailbox.len(), 0);
 
         node.retire(handle);
-        assert!(node.join_exclusives().is_none());
+        node.join_exclusives();
     }
 
     /// 发给不存在的地址应当报错而不是悄悄丢弃
@@ -1590,9 +1508,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// cleanup 里多个用户 Payload 的析构 panic 都要逐个隔离。
+    /// cleanup 里用户 Payload 的析构 panic 不做隔离，直接向上传播。
     #[test]
-    fn cleanup_contains_payload_drop_panics() {
+    fn cleanup_propagates_payload_drop_panic() {
         let node = test_node();
         let ctx = dummy_context_on(node.clone(), 7);
         ctx.mailbox.mark_running();
@@ -1602,21 +1520,13 @@ pub(crate) mod tests {
             MsgType::USER,
             Payload::of(PanicDropPayload),
         ));
-        let session = ctx.sessions.alloc();
-        assert!(
-            ctx.sessions
-                .complete(session, Ok(Payload::of(PanicDropPayload)))
-        );
 
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| node.destroy(ctx)));
         std::panic::set_hook(previous);
 
-        assert!(
-            result.is_ok(),
-            "destroy 必须吞掉 cleanup 中的用户析构 panic"
-        );
+        assert!(result.is_err(), "destroy 必须传播 cleanup 里的析构 panic");
     }
 
     /// FAILED 服务不应再被 drain_service 逐条吞消息；应留给 destroy/cleanup 回错误。
