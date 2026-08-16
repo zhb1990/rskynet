@@ -8,9 +8,12 @@
 //!
 //!   RUSTFLAGS="--cfg loom" cargo test -p rskynet-core --lib loom_ -- --test-threads=1
 //!
-//! TSAN（nightly + rust-src；仅 Apple Silicon / aarch64-apple-darwin。
+//! TSAN（nightly + rust-src；下列为已验证的 Apple Silicon /
+//! aarch64-apple-darwin 命令。
 //! `-Zsanitizer` / `-Zbuild-std` 未稳定，不是 crate MSRV。
-//! 仓库 panic=abort，必须独立目录且测试用 unwind）：
+//! 为隔离普通构建与 TSAN 构建产物使用独立 `CARGO_TARGET_DIR`；
+//! test harness 本身要求 unwind，下面的 `CARGO_PROFILE_*_PANIC=unwind`
+//! 作为显式防御保留）：
 //!
 //!   rustup component add rust-src --toolchain nightly-aarch64-apple-darwin
 //!

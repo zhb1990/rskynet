@@ -1,15 +1,16 @@
 //! Scheduler lost-wakeup 协议的抽象状态机。
 //!
 //! 对应当前 [`crate::mq`] 的 lost-wakeup 协议。只模拟
-//! `work` / `searching` / `idle` / `wake` token / 每 worker 一个 `Notify`，
-//! 不模拟 `thread::park`、`SegQueue`、BWoS、`ArcSwap`。
+//! `pending` / `visible_work` / `searching` / `idle` / `wake` token /
+//! 每 worker 一个 `Notify`，不模拟 `thread::park`、`SegQueue`、BWoS、`ArcSwap`。
 //!
 //! | 模型 | `Scheduler` |
 //! |---|---|
-//! | `work.fetch_add` + `fence(SeqCst)` + 读 `searching` | `pending.fetch_add` + `fence(SeqCst)` + `searching.load` |
+//! | `pending.fetch_add` + `fence(SeqCst)` + 读 `searching` | `pending.fetch_add` + `fence` + `searching.load` |
+//! | `visible_work.fetch_add` + `fence(SeqCst)` | `injector.push` / `slot.offer` / `place` |
 //! | `searching==0` 时 claim idle + `wake` bit + `Notify` | `claim_idle` + `Thread::unpark` |
-//! | 发布后再读 `searching.load(SeqCst)==0` 则补叫 | injector / place 后的复查 |
-//! | worker：`searching++`，扫 work，`idle`，`searching--`，`fence`，再扫，否则 `Notify::wait` | `find_work_or_park` |
+//! | 可见发布后再读 `searching==0` 则补叫 | injector / place 后的复查 |
+//! | worker：`searching++`，扫 `visible_work`，`idle`，`searching--`，`fence`，再扫，否则 `Notify::wait` | `find_work_or_park` |
 //!
 //! 三层加 quit：
 //!
@@ -24,8 +25,10 @@
 //! 自己的 wake bit，绝不能直接 `take()`。shutdown 对每个 worker 无条件
 //! `notify()`，对齐 `set_quit()`，但不改 wake bitmap。
 //!
-//! 核心不变量：`work 已发布 ⇒ worker 能看见 work OR 持有 wake token`。
-//! 真正 lost-wakeup 时 worker 会在 `Notify::wait` 上阻塞，Loom 报 deadlock。
+//! 核心不变量：`visible_work > 0 ⇒ work 不得因 lost-wakeup 永久 stranded`。
+//! `pending++` 只表示 producer 已宣告工作；在 `visible_work++` 之前，
+//! worker 的 `take()` 必须失败。真正 lost-wakeup 时 worker 会在
+//! `Notify::wait` 上阻塞，Loom 报 deadlock。
 //!
 //! Loom 把普通 `SeqCst` 访问按较弱的 `AcqRel` 处理；`fence(SeqCst)` 是支持的，
 //! 但本模型全绿不是形式化证明。真实协议仍靠
@@ -40,7 +43,10 @@ use crate::sync::{Arc, AtomicBool, AtomicU64, AtomicUsize, Ordering, fence, thre
 use loom::sync::Notify;
 
 struct WakeModel {
-    work: AtomicUsize,
+    /// declaration counter only; intentionally never consumed
+    pending: AtomicUsize,
+    /// 已真正进入可取位置。不模拟 queue payload。
+    visible_work: AtomicUsize,
     searching: AtomicUsize,
     idle: AtomicU64,
     wake: AtomicU64,
@@ -52,7 +58,8 @@ struct WakeModel {
 impl WakeModel {
     fn new(workers: usize) -> Self {
         Self {
-            work: AtomicUsize::new(0),
+            pending: AtomicUsize::new(0),
+            visible_work: AtomicUsize::new(0),
             searching: AtomicUsize::new(0),
             idle: AtomicU64::new(0),
             wake: AtomicU64::new(0),
@@ -63,23 +70,41 @@ impl WakeModel {
     }
 
     fn publish(&self) {
-        self.work.fetch_add(1, Ordering::Relaxed);
+        self.pending.fetch_add(1, Ordering::Relaxed);
         fence(Ordering::SeqCst);
+
         if self.searching.load(Ordering::Relaxed) > 0 {
+            self.publish_visible();
             if self.searching.load(Ordering::SeqCst) == 0 {
                 self.wake_idle();
             }
             return;
         }
-        if self.wake_idle() {
+
+        if let Some(id) = self.claim_idle() {
+            self.publish_visible();
+            self.notify_worker(id);
             return;
         }
+
+        self.publish_visible();
         if self.searching.load(Ordering::SeqCst) == 0 {
             self.wake_idle();
         }
     }
 
-    fn wake_idle(&self) -> bool {
+    /// 工作进入可取位置。
+    ///
+    /// Loom 把普通 `SeqCst` 访问按 `AcqRel` 处理，只有 `fence(SeqCst)` 才是
+    /// 全序点。发布后必须再 fence，才能和 worker 睡前的 fence 配对：
+    /// 要么 worker 最终那次 `take` 看见 `visible_work`，要么复查看到
+    /// `searching == 0` 并补叫。
+    fn publish_visible(&self) {
+        self.visible_work.fetch_add(1, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+    }
+
+    fn claim_idle(&self) -> Option<usize> {
         let mut bits = self.idle.load(Ordering::Relaxed);
         while bits != 0 {
             let id = bits.trailing_zeros() as usize;
@@ -90,14 +115,19 @@ impl WakeModel {
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
-                Ok(_) => {
-                    self.notify_worker(id);
-                    return true;
-                }
+                Ok(_) => return Some(id),
                 Err(actual) => bits = actual,
             }
         }
-        false
+        None
+    }
+
+    fn wake_idle(&self) -> bool {
+        let Some(id) = self.claim_idle() else {
+            return false;
+        };
+        self.notify_worker(id);
+        true
     }
 
     /// 工作唤醒：必须先写 protocol token，再 Notify。
@@ -116,17 +146,18 @@ impl WakeModel {
     }
 
     fn take(&self) -> bool {
-        let mut current = self.work.load(Ordering::Relaxed);
+        let mut current = self.visible_work.load(Ordering::Relaxed);
         while current > 0 {
-            match self.work.compare_exchange_weak(
+            match self.visible_work.compare_exchange_weak(
                 current,
                 current - 1,
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    // 最后一件被取走：叫醒所有 waiter 复查 quit / 空队列。
-                    // 不改 wake bitmap。quit 尚未置位时，他们会再 wait，等 shutdown。
+                    // Test-harness termination only：最后一件可见工作被消费后叫醒 waiter，
+                    // 让它们复查 quit / 空队列并完成 join。
+                    // 不改 wake bitmap，也不属于 Scheduler lost-wakeup protocol。
                     if current == 1 {
                         for notify in &self.notifies {
                             notify.notify();
@@ -141,7 +172,7 @@ impl WakeModel {
     }
 
     fn should_exit(&self) -> bool {
-        self.quit.load(Ordering::Acquire) && self.work.load(Ordering::Relaxed) == 0
+        self.quit.load(Ordering::Acquire) && self.visible_work.load(Ordering::Relaxed) == 0
     }
 
     fn worker(&self, id: usize) -> bool {
@@ -218,7 +249,7 @@ fn check(workers: usize) {
             handle.join().unwrap();
         }
         assert_eq!(
-            model.work.load(Ordering::SeqCst),
+            model.visible_work.load(Ordering::SeqCst),
             0,
             "published work must be consumed"
         );
