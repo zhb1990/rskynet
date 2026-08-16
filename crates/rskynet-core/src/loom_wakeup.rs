@@ -7,7 +7,7 @@
 //! | 模型 | `Scheduler` |
 //! |---|---|
 //! | `pending.fetch_add` + `fence(SeqCst)` + 读 `searching` | `pending.fetch_add` + `fence` + `searching.load` |
-//! | `visible_work.fetch_add` + `fence(SeqCst)` | `injector.push` / `slot.offer` / `place` |
+//! | `visible_work.fetch_add` | `injector.push` / `slot.offer` / `place` |
 //! | `searching==0` 时 claim idle + `wake` bit + `Notify` | `claim_idle` + `Thread::unpark` |
 //! | 可见发布后再读 `searching==0` 则补叫 | injector / place 后的复查 |
 //! | worker：`searching++`，扫 `visible_work`，`idle`，`searching--`，`fence`，再扫，否则 `Notify::wait` | `find_work_or_park` |
@@ -93,12 +93,12 @@ impl WakeModel {
         }
     }
 
-    /// 工作进入可取位置。
+    /// `visible_work++` 抽象 queue publication。
     ///
-    /// Loom 把普通 `SeqCst` 访问按 `AcqRel` 处理，只有 `fence(SeqCst)` 才是
-    /// 全序点。发布后必须再 fence，才能和 worker 睡前的 fence 配对：
-    /// 要么 worker 最终那次 `take` 看见 `visible_work`，要么复查看到
-    /// `searching == 0` 并补叫。
+    /// 后面的 SeqCst fence 是 Loom-only 建模补偿：Loom 会把普通
+    /// SeqCst atomic access 按 AcqRel 处理，因此在 post-publish
+    /// searching recheck 前补一个受支持的 SeqCst 全序点。
+    /// 它不对应生产 Scheduler 中额外的一道 fence。
     fn publish_visible(&self) {
         self.visible_work.fetch_add(1, Ordering::Relaxed);
         fence(Ordering::SeqCst);
