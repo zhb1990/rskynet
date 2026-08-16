@@ -18,6 +18,7 @@
 //! 好让后面每一步出的岔子都有人记，定时器排在业务引导之前，于是那时挂的表、打的
 //! 日志时间戳都是准的。
 
+use std::collections::HashMap;
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -435,13 +436,17 @@ fn monitor_loop(node: &Node, monitors: &[Arc<Monitor>], stop: mpsc::Receiver<()>
     }
 }
 
-/// 收尾排空时，同一个服务最多连续让渡多少轮；超过即视为「排不完」，强制摘除。
+/// 收尾排空时，同一个服务累计让渡多少轮即视为「排不完」，强制摘除。
 ///
 /// 一轮 `dispatch` 最多干 64 件活（收工信号下每满 64 件让渡一次，见
 /// `Node::run_service` 的 `YIELD_INTERVAL`），所以预算对应约 `DRAIN_BUDGET × 64`
 /// 次 poll。任意 Future 都无法从外部判断它最终会不会完成——自唤醒任务可能 poll
 /// 256 次后才 Ready，也可能永远 Pending——因此只能用预算来兜底，而不是看「一个
 /// 轮次前后状态有没有变化」：后者会把合法的慢任务误判成死循环提前杀掉。
+///
+/// 预算按**服务累计**而不是按「连续让渡」记：排空时多个死循环服务会轮流出现在
+/// dispatch 的结果里，谁都不会连续让渡，但各自的总轮数照样在涨；只记连续轮数
+/// 的话它们就互相掩护，谁也到不了预算，收尾流程被永久挂住。
 const DRAIN_BUDGET: usize = 4096;
 
 /// 在当前线程上把运行队列里剩下的活干完，用于启动失败或退出时的清理。
@@ -451,37 +456,36 @@ const DRAIN_BUDGET: usize = 4096;
 /// 线程执行」那条不变量。
 fn drain(node: &Node) {
     let mut hold: Option<Arc<crate::server::ServiceContext>> = None;
-    // 同一个服务连续被 dispatch 交还的轮数。换了一个服务就清零，让每个服务都
-    // 各自拿到完整的预算；别的服务还在排队时，dispatch 本来就会交替返回它们。
-    let mut rounds_on_hold = 0usize;
+    // 每个服务各自累计的让渡轮数，见 DRAIN_BUDGET 的说明：预算必须挂在服务上，
+    // 否则两个死循环服务交替出现时互相掩护，谁都到不了预算。
+    let mut budgets: HashMap<crate::Handle, usize> = HashMap::new();
     loop {
-        let prev_handle = hold.as_ref().map(|ctx| ctx.handle);
         hold = node.dispatch(hold);
         let Some(ctx) = &hold else {
             return;
         };
-        if prev_handle != Some(ctx.handle) {
-            rounds_on_hold = 0;
+        let count = budgets.entry(ctx.handle).or_insert(0);
+        *count += 1;
+        if *count < DRAIN_BUDGET {
             continue;
         }
-        rounds_on_hold += 1;
-        if rounds_on_hold < DRAIN_BUDGET {
-            continue;
-        }
-        // 预算耗尽：同一个服务连续让渡了 DRAIN_BUDGET 轮还没收工。这通常是邮箱里
-        // 挂着一个自唤醒的无限 Future——它的可观测状态（消息数、任务数）可能一直
-        // 不变，也可能一直在变，所以不能靠「状态有没有变化」判断，只能靠预算强制
-        // 结束，否则收尾流程会被它永久挂住。
+        // 预算耗尽：该服务累计让渡了 DRAIN_BUDGET 轮还没收工。这通常是服务里
+        // 挂着一个自唤醒的无限 Future——它的可观测状态（消息数、任务数）可能
+        // 一直不变，也可能一直在变，所以不能靠「状态有没有变化」判断，只能靠
+        // 预算强制结束，否则收尾流程会被它永久挂住。
         node.log(
             0,
             format!(
-                "error: 服务 :{:08x} 在收尾排空中超过 {DRAIN_BUDGET} 轮仍未结束，强制摘除",
-                ctx.handle
+                "error: 服务 :{:08x} ({}) 在收尾排空中累计让渡 {DRAIN_BUDGET} 轮仍未结束（任务数 {}，邮箱长度 {}），强制摘除",
+                ctx.handle,
+                ctx.kind,
+                ctx.task_count(),
+                ctx.mailbox.len(),
             ),
         );
         node.retire(ctx.handle);
+        budgets.remove(&ctx.handle);
         hold = node.dispatch(hold.take());
-        rounds_on_hold = 0;
         if hold.is_none() {
             return;
         }
@@ -715,6 +719,61 @@ mod tests {
         assert!(
             node.handles.grab(handle).is_none(),
             "无限 Future 的服务应在预算耗尽后被强制摘除"
+        );
+        assert_eq!(node.total(), 0, "摘除后应由 dispatch 完成销毁记账");
+    }
+
+    /// 排空时两个服务各挂一个自唤醒的无限 Future：它们会轮流被 dispatch 交还，
+    /// 谁都不会「连续」让渡，但各自的总轮数照样在涨。预算必须按服务累计——
+    /// 只记连续轮数的话，两个死循环服务就互相掩护，谁也到不了预算，收尾流程
+    /// 被永久挂住。
+    #[test]
+    fn drain_infinite_future_cannot_hide_behind_other_services() {
+        #[derive(Default)]
+        struct InfiniteFutureService;
+
+        impl Service for InfiniteFutureService {
+            fn init(self: Arc<Self>, ctx: Ctx, _args: String) -> BoxFuture<'static, Result<()>> {
+                Box::pin(async move {
+                    ctx.spawn(async move {
+                        std::future::poll_fn(|cx| {
+                            cx.waker().wake_by_ref();
+                            std::task::Poll::Pending
+                        })
+                        .await
+                    });
+                    Ok(())
+                })
+            }
+
+            fn dispatch(self: Arc<Self>, _ctx: Ctx, _msg: Message) -> BoxFuture<'static, ()> {
+                Box::pin(async {})
+            }
+        }
+
+        let registry = Registry::new()
+            .with("infinite-a", InfiniteFutureService::default)
+            .with("infinite-b", InfiniteFutureService::default);
+        let node = Node::new(&Config::default(), registry, Arc::new(StubTimer));
+        let handle_a = node
+            .new_service("infinite-a", "")
+            .expect("应创建成功")
+            .handle;
+        let handle_b = node
+            .new_service("infinite-b", "")
+            .expect("应创建成功")
+            .handle;
+        node.sched.set_quit();
+
+        drain(&node);
+
+        assert!(
+            node.handles.grab(handle_a).is_none(),
+            "无限 Future 的服务 A 应在预算耗尽后被强制摘除"
+        );
+        assert!(
+            node.handles.grab(handle_b).is_none(),
+            "无限 Future 的服务 B 应在预算耗尽后被强制摘除"
         );
         assert_eq!(node.total(), 0, "摘除后应由 dispatch 完成销毁记账");
     }

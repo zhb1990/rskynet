@@ -559,8 +559,14 @@ impl<T> Stealer<T> {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::thread;
+
+    /// 三个测试钩子（[`STEAL_PAUSE`] / [`STEAL_PAUSE_TARGET`] / [`PAUSED_THIEF`]）
+    /// 是进程级全局量，用它们的用例必须串行执行，否则两个用例会互相踩坏对方的
+    /// 暂停窗口。`unwrap_or_else` 容忍前一个用例 panic 留下的中毒锁。
+    static STEAL_PAUSE_LOCK: Mutex<()> = Mutex::new(());
 
     /// owner 侧是后进先出，这是 BWoS lifo 变体的定义
     #[test]
@@ -684,6 +690,10 @@ mod tests {
     /// 可见性保证的落点，relaxed CAS 会让这次读取与 owner 的写入失去同步。
     #[test]
     fn a_stale_thief_cas_reads_the_refilled_data() {
+        // 本用例与 a_stale_thief_cannot_cross_generation 共用全局暂停钩子，必须串行
+        let _serial = STEAL_PAUSE_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let block = Block::<u64>::new(4);
 
         // 第 0 代第一轮：写满、grant，主线程偷走 0 号，让 steal_tail 停在 slot 1。
@@ -694,6 +704,8 @@ mod tests {
         block.grant();
         assert!(matches!(block.steal(0), Steal::Taken(0)));
 
+        // PAUSED_THIEF 由上一个用例留下时可能是 true，这里先清掉再等新的暂停
+        PAUSED_THIEF.store(false, Ordering::Release);
         STEAL_PAUSE_TARGET.store(&block as *const Block<u64> as usize, Ordering::Release);
         STEAL_PAUSE.store(true, Ordering::Release);
 
@@ -738,6 +750,81 @@ mod tests {
             matches!(stolen, Steal::Taken(10)),
             "stale CAS 必须读到重填后的数据，实际是 {stolen:?}"
         );
+    }
+
+    /// 旧 thief 停在「已读 `steal_tail`、还没 CAS」的窗口里时，owner 把整块收回、
+    /// 掏空、推进到**下一代**、重填、再交出去。这一次收尾时 `steal_tail` 的
+    /// generation 位已经变了，与旧 thief 手里的旧值不可能相同，它的 CAS 必然落空，
+    /// 也就没有机会读到新世代数据——这是「同世代位模式重现」那条用例的跨世代补集：
+    /// 同世代复用靠成功 CAS 的 Acquire 保证读到重填后的数据，跨世代复用靠
+    /// generation 参与边界值编码让 CAS 直接失败。
+    #[test]
+    fn a_stale_thief_cannot_cross_generation() {
+        // 本用例与 a_stale_thief_cas_reads_the_refilled_data 共用全局暂停钩子，必须串行
+        let _serial = STEAL_PAUSE_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let block = Block::<u64>::new(4);
+
+        // 第 0 代：写满、grant，主线程偷走 0 号，让 steal_tail 停在 slot 1。
+        block.reclaim(0);
+        for value in 0..4 {
+            unsafe { block.put(value) }.expect("不该满");
+        }
+        block.grant();
+        assert!(matches!(block.steal(0), Steal::Taken(0)));
+
+        PAUSED_THIEF.store(false, Ordering::Release);
+        STEAL_PAUSE_TARGET.store(&block as *const Block<u64> as usize, Ordering::Release);
+        STEAL_PAUSE.store(true, Ordering::Release);
+
+        let stolen = thread::scope(|scope| {
+            // 无论用例在哪一步失败，都要先放行窃贼再让 scope 等它结束，
+            // 否则它会带着 STEAL_PAUSE 一直转下去，scope 的 join 就等死了。
+            struct ReleasePause;
+            impl Drop for ReleasePause {
+                fn drop(&mut self) {
+                    STEAL_PAUSE.store(false, Ordering::Release);
+                    STEAL_PAUSE_TARGET.store(0, Ordering::Release);
+                }
+            }
+            let _release = ReleasePause;
+
+            // thread::scope 保证所有线程在 block 析构前收工，这里按地址访问是安全的。
+            let raw = &block as *const Block<u64> as usize;
+            let handle = scope.spawn(move || unsafe { &*(raw as *const Block<u64>) }.steal(0));
+
+            // 等窃贼读走 steal_tail = (0<<8)|1 并停在 CAS 之前。
+            while !PAUSED_THIEF.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+
+            // owner 在这段窗口里把整块收回来、掏空、推进到第 1 代、重填、再交出去：
+            // 收尾时 steal_tail 变成 (1<<8)|0，旧 thief 手里的 (0<<8)|1 永远对不上。
+            block.takeover();
+            for _ in 0..3 {
+                unsafe { block.get() }.expect("应能取回三个元素");
+            }
+            block.reclaim(1);
+            for value in 10..14 {
+                unsafe { block.put(value) }.expect("不该满");
+            }
+            block.grant();
+
+            // 先放行窃贼，再 join。
+            drop(_release);
+            handle.join().expect("窃贼线程不应 panic")
+        });
+
+        assert!(
+            matches!(stolen, Steal::Conflict),
+            "跨 generation 的 stale CAS 必须落空，绝不能读到新世代数据，实际是 {stolen:?}"
+        );
+        // 新一代 thief 正常读到第 1 代数据。
+        assert!(matches!(block.steal(1), Steal::Taken(10)));
+        assert!(matches!(block.steal(1), Steal::Taken(11)));
+        assert!(matches!(block.steal(1), Steal::Taken(12)));
+        assert!(matches!(block.steal(1), Steal::Taken(13)));
     }
 
     /// generation 编码上限：越过 `(1 << 56) - 1` 必须 fail-fast，而不是回绕。
