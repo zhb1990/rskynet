@@ -24,7 +24,7 @@
 //! - 高 56 位：块 generation
 //! - 低 8 位：块内槽位下标（`BLOCK_SIZE` 必须小于 256）
 //!
-//! generation 的作用是防 ABA；`Block::steal` 在做任何 `ptr::read` 之前先比对
+//! generation 的作用是防 ABA；`Block::steal` 在做任何 slot 读取之前先比对
 //! generation，不同则直接停下。
 //!
 //! # 线程安全
@@ -37,14 +37,51 @@
 //! `Arc<Node>` 里跨线程共享（真正的互斥由 worker 编号保证），
 //! 和 [`crate::task::SvcCell`] 是同一种取舍。
 
-use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::ops::{Deref, DerefMut};
-use std::ptr;
-use std::sync::Arc;
-#[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicUsize};
-use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::sync::{Arc, AtomicU64, Ordering, UnsafeCell, spin_loop};
+
+/// 环形块里的一个槽位。生产路径走 `std::cell::UnsafeCell`；Loom 下换成
+/// `loom::cell::UnsafeCell`，用 `with` / `with_mut` 跟踪并发访问范围。
+struct Slot<T>(UnsafeCell<MaybeUninit<T>>);
+
+impl<T> Slot<T> {
+    fn uninit() -> Self {
+        Self(UnsafeCell::new(MaybeUninit::uninit()))
+    }
+
+    unsafe fn write(&self, value: T) {
+        #[cfg(not(loom))]
+        unsafe {
+            std::ptr::write(self.0.get().cast::<T>(), value);
+        }
+        #[cfg(loom)]
+        self.0.with_mut(|p| unsafe {
+            (*p).write(value);
+        });
+    }
+
+    unsafe fn read(&self) -> T {
+        #[cfg(not(loom))]
+        unsafe {
+            std::ptr::read(self.0.get().cast::<T>())
+        }
+        #[cfg(loom)]
+        self.0.with(|p| unsafe { (*p).assume_init_read() })
+    }
+
+    unsafe fn drop_in_place(&self) {
+        #[cfg(not(loom))]
+        unsafe {
+            std::ptr::drop_in_place(self.0.get().cast::<T>());
+        }
+        #[cfg(loom)]
+        self.0.with_mut(|p| unsafe {
+            (*p).assume_init_drop();
+        });
+    }
+}
 
 /// 块内槽位占用的低 bit 数。当前最大块长 16，留 8 bit 已经足够，
 /// 而且让「generation << SLOT_BITS | slot」继续装进一个 AtomicU64。
@@ -66,14 +103,17 @@ const MAX_GENERATION: u64 = (1 << (64 - SLOT_BITS)) - 1;
 
 /// 测试钩子：置位后，`Block::steal` 里所有目标块（地址匹配
 /// [`STEAL_PAUSE_TARGET`]）的 thief 都会在读走 `steal_tail` 之后、CAS 之前停下。
-#[cfg(test)]
-static STEAL_PAUSE: AtomicBool = AtomicBool::new(false);
+///
+/// 必须用 `std` 原子量：Loom 原子量不能做进程级 static，而且 Loom 自己会枚举
+/// 这个窗口，不需要自旋钩子。
+#[cfg(all(test, not(loom)))]
+static STEAL_PAUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// 测试钩子：受 [`STEAL_PAUSE`] 影响的块地址，0 表示不暂停任何块。
-#[cfg(test)]
-static STEAL_PAUSE_TARGET: AtomicUsize = AtomicUsize::new(0);
+#[cfg(all(test, not(loom)))]
+static STEAL_PAUSE_TARGET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// 测试钩子：某个 thief 已经停在 [`STEAL_PAUSE`] 的窗口里。
-#[cfg(test)]
-static PAUSED_THIEF: AtomicBool = AtomicBool::new(false);
+#[cfg(all(test, not(loom)))]
+static PAUSED_THIEF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 每条本地队列的块数，必须是 2 的幂且不小于 2。
 pub(crate) const NUM_BLOCKS: usize = 64;
@@ -139,13 +179,13 @@ struct Block<T> {
     steal_count: CachePad<AtomicU64>,
     /// 窃贼侧边界：高 56 bit generation，低 8 bit slot。低位等于块长即表示本块已偷空。
     steal_tail: CachePad<AtomicU64>,
-    ring: Box<[UnsafeCell<MaybeUninit<T>>]>,
+    ring: Box<[Slot<T>]>,
 }
 
 impl<T> Block<T> {
     fn new(block_size: usize) -> Self {
         let mut ring = Vec::with_capacity(block_size);
-        ring.resize_with(block_size, || UnsafeCell::new(MaybeUninit::uninit()));
+        ring.resize_with(block_size, Slot::uninit);
         let size = block_size as u64;
         let initial = (PREV_GEN_0 << SLOT_BITS) | size;
         Self {
@@ -161,10 +201,6 @@ impl<T> Block<T> {
         self.ring.len() as u64
     }
 
-    fn slot(&self, idx: u64) -> *mut T {
-        self.ring[idx as usize].get().cast::<T>()
-    }
-
     /// 写入一个元素。返回 `Err` 表示本块写满了，值原样交还给调用方。
     ///
     /// # Safety
@@ -173,7 +209,7 @@ impl<T> Block<T> {
     unsafe fn put(&self, value: T) -> Result<(), T> {
         let back = self.tail.load(Ordering::Relaxed);
         if back < self.block_size() {
-            unsafe { ptr::write(self.slot(back), value) };
+            unsafe { self.ring[back as usize].write(value) };
             // Release：与窃贼 steal() 里对 tail 的 acquire 配对，保证它读到的槽位是写完的
             self.tail.store(back + 1, Ordering::Release);
             Ok(())
@@ -197,7 +233,7 @@ impl<T> Block<T> {
             // owner 的可取区间 [head, tail) 空了
             return None;
         }
-        let value = unsafe { ptr::read(self.slot(back - 1)) };
+        let value = unsafe { self.ring[(back - 1) as usize].read() };
         self.tail.store(back - 1, Ordering::Release);
         Some(value)
     }
@@ -221,15 +257,16 @@ impl<T> Block<T> {
         if sidx == back {
             return Steal::Empty;
         }
-        #[cfg(test)]
+        #[cfg(all(test, not(loom)))]
         {
             // 测试钩子：让 thief 停在「已经确认本块可偷、还没 CAS」的窗口里，
             // 便于把「owner 在 CAS 前把整块换了个世代」的竞态放大成确定性用例。
-            if STEAL_PAUSE.load(Ordering::Acquire)
-                && self as *const Self as usize == STEAL_PAUSE_TARGET.load(Ordering::Relaxed)
+            if STEAL_PAUSE.load(std::sync::atomic::Ordering::Acquire)
+                && self as *const Self as usize
+                    == STEAL_PAUSE_TARGET.load(std::sync::atomic::Ordering::Relaxed)
             {
-                PAUSED_THIEF.store(true, Ordering::Release);
-                while STEAL_PAUSE.load(Ordering::Acquire) {
+                PAUSED_THIEF.store(true, std::sync::atomic::Ordering::Release);
+                while STEAL_PAUSE.load(std::sync::atomic::Ordering::Acquire) {
                     std::hint::spin_loop();
                 }
             }
@@ -260,7 +297,7 @@ impl<T> Block<T> {
         {
             return Steal::Conflict;
         }
-        let value = unsafe { ptr::read(self.slot(sidx)) };
+        let value = unsafe { self.ring[sidx as usize].read() };
         // Release：保证 reclaim() 看到这次计数时，我们对槽位的读取已经完成
         self.steal_count.fetch_add(1, Ordering::Release);
         Steal::Taken(value)
@@ -294,7 +331,7 @@ impl<T> Block<T> {
     fn reclaim(&self, generation: u64) {
         let expected = self.head.load(Ordering::Relaxed) & SLOT_MASK;
         while self.steal_count.load(Ordering::Acquire) != expected {
-            std::hint::spin_loop();
+            spin_loop();
         }
         let expanded = generation << SLOT_BITS;
         self.head.store(expanded, Ordering::Relaxed);
@@ -322,11 +359,11 @@ impl<T> Drop for Block<T> {
         // [min(head_idx, steal_idx), tail_idx)，对四种块状态都成立：
         // 活跃块 head_idx = 0；已 grant 的块 head_idx = 块长而 steal_idx 是窃取位置；
         // 被偷空的块与从未使用的块两个下标都等于块长，区间自然为空。
-        let head_idx = *self.head.get_mut() & SLOT_MASK;
-        let steal_idx = *self.steal_tail.get_mut() & SLOT_MASK;
-        let tail_idx = *self.tail.get_mut() & SLOT_MASK;
+        let head_idx = self.head.load(Ordering::Relaxed) & SLOT_MASK;
+        let steal_idx = self.steal_tail.load(Ordering::Relaxed) & SLOT_MASK;
+        let tail_idx = self.tail.load(Ordering::Relaxed) & SLOT_MASK;
         for idx in head_idx.min(steal_idx)..tail_idx {
-            unsafe { ptr::drop_in_place(self.slot(idx)) };
+            unsafe { self.ring[idx as usize].drop_in_place() };
         }
     }
 }
@@ -568,7 +605,7 @@ impl<T> Stealer<T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use super::*;
     use std::collections::VecDeque;
@@ -993,5 +1030,64 @@ mod tests {
             assert_eq!(Arc::strong_count(&token), 1 + 7);
         }
         assert_eq!(Arc::strong_count(&token), 1, "队列析构后不该还有残留引用");
+    }
+}
+
+#[cfg(all(test, loom))]
+mod loom_block {
+    use super::*;
+    use crate::sync::thread;
+
+    /// P0：旧 thief 停在 load 之后、CAS 之前，owner 把物理块 reclaim 到新 generation。
+    /// generation 编入 CAS compare value，旧 spos 必须对不上，绝不能读到新世代数据。
+    #[test]
+    fn stale_thief_cas_fails_after_reclaim() {
+        let mut builder = loom::model::Builder::new();
+        builder.preemption_bound = Some(2);
+        builder.check(|| {
+            let block = crate::sync::Arc::new(Block::<u64>::new(2));
+            block.reclaim(0);
+            unsafe {
+                block.put(10).expect("不该满");
+                block.put(11).expect("不该满");
+            }
+            block.grant();
+            assert!(matches!(block.steal(0), Steal::Taken(10)));
+
+            let thief_block = block.clone();
+            let thief = thread::spawn(move || thief_block.steal(0));
+
+            block.takeover();
+            while unsafe { block.get() }.is_some() {}
+            block.reclaim(1);
+            unsafe {
+                block.put(20).expect("不该满");
+                block.put(21).expect("不该满");
+            }
+            block.grant();
+
+            let stolen = thief.join().unwrap();
+            match stolen {
+                Steal::Taken(11) => {}
+                Steal::Conflict | Steal::Empty | Steal::Done => {}
+                Steal::Taken(v) => {
+                    panic!("旧 thief 读到了新世代数据 {v}，CAS 必须在跨 generation 时失败")
+                }
+            }
+            let mut rest = Vec::new();
+            while let Steal::Taken(v) = block.steal(1) {
+                rest.push(v);
+            }
+            match stolen {
+                Steal::Taken(11) => assert_eq!(rest, vec![20, 21]),
+                _ => {
+                    assert!(
+                        rest.contains(&20) && rest.contains(&21),
+                        "新世代数据必须仍在：{rest:?}"
+                    );
+                    assert!(!rest.contains(&11), "第 0 代剩余不该混进 generation 1");
+                }
+            }
+        });
     }
 }

@@ -60,11 +60,22 @@
 extern crate self as rskynet_core;
 
 mod bwos;
+mod handoff;
+mod sync;
+
 mod clock;
 mod context;
 mod error;
 mod exclusive;
 mod handle;
+#[cfg(all(test, loom))]
+mod loom_bwos;
+#[cfg(all(test, loom))]
+mod loom_handoff;
+#[cfg(all(test, loom))]
+mod loom_stealable;
+#[cfg(all(test, loom))]
+mod loom_wakeup;
 mod message;
 mod module;
 mod monitor;

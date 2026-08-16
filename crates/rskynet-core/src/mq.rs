@@ -41,10 +41,11 @@
 
 use std::cell::Cell;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::thread::{self, Thread};
 
 use crate::bwos::{self, CachePad, Owner, Stealer};
+use crate::handoff::Handoff;
 use crate::message::Message;
 use crate::server::ServiceContext;
 use crate::task::TaskId;
@@ -96,7 +97,7 @@ pub(crate) struct Mailbox {
 }
 
 impl Mailbox {
-    #[cfg(test)]
+    #[cfg(all(test, not(loom)))]
     pub(crate) fn take_ready(&self) -> Option<Ready> {
         self.ready.pop()
     }
@@ -329,7 +330,7 @@ struct WorkerSlot {
     ///
     /// 空指针表示没有；非空时它是一个「寄存」在这里的 `Arc` 强引用，
     /// 取出方负责用 [`Arc::from_raw`] 收回，因此计数不会失衡。
-    handoff: AtomicPtr<ServiceContext>,
+    handoff: Handoff<ServiceContext>,
 }
 
 impl WorkerSlot {
@@ -353,21 +354,15 @@ impl WorkerSlot {
     /// 把服务直接递到这个 worker 手上。槽已被占时原样交还调用方。
     fn offer(&self, ctx: Arc<ServiceContext>) -> Result<(), Arc<ServiceContext>> {
         let ptr = Arc::into_raw(ctx).cast_mut();
-        match self.handoff.compare_exchange(
-            std::ptr::null_mut(),
-            ptr,
-            Ordering::AcqRel,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => Ok(()),
+        self.handoff
+            .offer_raw(ptr)
             // 安全性：CAS 失败说明这个 Arc 没交出去，所有权仍在我们手里
-            Err(_) => Err(unsafe { Arc::from_raw(ptr) }),
-        }
+            .map_err(|ptr| unsafe { Arc::from_raw(ptr) })
     }
 
     /// 取走别人递过来的服务。
     fn take(&self) -> Option<Arc<ServiceContext>> {
-        let ptr = self.handoff.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        let ptr = self.handoff.take_raw();
         // 安全性：swap 保证同一个指针只会被一个线程取到，收回的正是 offer 寄存的那个引用
         (!ptr.is_null()).then(|| unsafe { Arc::from_raw(ptr) })
     }
@@ -866,7 +861,7 @@ impl Scheduler {
     }
 
     /// 已登记空闲的 worker 数，仅供测试等待「对方确实睡下了」。
-    #[cfg(test)]
+    #[cfg(all(test, not(loom)))]
     pub(crate) fn sleeping(&self) -> usize {
         self.idle
             .iter()
@@ -899,7 +894,7 @@ impl Drop for WorkerGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 mod tests {
     use std::thread;
 
@@ -1547,5 +1542,62 @@ mod tests {
 
         assert_eq!(popped.load(Ordering::SeqCst), TOTAL, "一件都不能丢");
         assert_eq!(sched.len(), 0, "取空后运行队列计数必须归零");
+    }
+
+    /// 高频 park / unpark：worker 真正走 `find_work_or_park`，补 Loom 状态机
+    /// 故意不模拟 `thread::park` 的缺口。TSAN 下跑它可以抓普通 data race；
+    /// 抓不了 `fence(SeqCst)` 相关的 lost-wakeup，所以不能替代钩子测试。
+    #[test]
+    fn park_unpark_churn_does_not_strand_work() {
+        const WORKERS: usize = 3;
+        const ROUNDS: u32 = 300;
+
+        let node = test_node_with(Config::default().with_thread(WORKERS));
+        let sched = &node.sched;
+        let popped = AtomicUsize::new(0);
+        let pushed = AtomicUsize::new(0);
+
+        thread::scope(|scope| {
+            for id in 0..WORKERS {
+                let popped = &popped;
+                scope.spawn(move || {
+                    let _worker = sched.register_worker(id);
+                    while !sched.is_quit() {
+                        if let Some(_ctx) = sched.pop() {
+                            popped.fetch_add(1, Ordering::SeqCst);
+                            continue;
+                        }
+                        if let Some(_ctx) = sched.find_work_or_park() {
+                            popped.fetch_add(1, Ordering::SeqCst);
+                            continue;
+                        }
+                    }
+                    while sched.pop().is_some() {
+                        popped.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+
+            for n in 0..ROUNDS {
+                sched.push(dummy_context_on(node.clone(), n as u64));
+                pushed.fetch_add(1, Ordering::SeqCst);
+            }
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while popped.load(Ordering::SeqCst) < pushed.load(Ordering::SeqCst)
+                && std::time::Instant::now() < deadline
+            {
+                sched.poke();
+                std::thread::yield_now();
+            }
+            sched.set_quit();
+        });
+
+        assert_eq!(
+            popped.load(Ordering::SeqCst),
+            pushed.load(Ordering::SeqCst),
+            "park/unpark churn 不得丢活"
+        );
+        assert_eq!(sched.len(), 0, "取空后 pending 必须归零");
     }
 }
