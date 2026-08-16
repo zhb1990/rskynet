@@ -237,17 +237,22 @@ impl<T> Block<T> {
         // 成功的 CAS 必须是 Acquire：它是 thief 对「当前 steal_tail
         // 仍属于自己看到的这一代/这一位置」的最终确认。
         //
-        // 当当前位模式来自本轮 grant() 的 Release store 时，成功的
-        // Acquire CAS 与这次发布同步，因此 grant 之前完成的槽位写入
-        // 对 thief 可见。
+        // grant() 的 Release store 发布本轮可偷边界，以及此前已经完成的
+        // 槽位写入。之后 steal_tail 上成功的 CAS 都是 RMW，它们延续以
+        // 这次 Release store 为首的 release sequence。因此后续成功的
+        // Acquire CAS，无论直接读到 grant() 写入的值，还是读到前一个
+        // thief 的 RMW 写入，都能观察到本轮 grant() 之前完成的槽位写入。
         //
-        // 如果物理块已经被 reclaim 到下一 generation，则 generation
-        // 已参与 steal_tail 的比较值，旧 thief 的 CAS 必然失败，因此
-        // 不会读取新世代槽位。
+        // 如果物理块已经 reclaim 到下一 generation，则 generation 已经
+        // 参与 steal_tail 的比较值。旧 generation 的 thief 保存的 spos
+        // 不可能再与当前值相等，因此 CAS 必然失败，也不会执行后面的
+        // ptr::read()，从而不能读取新世代的数据。
         //
-        // takeover / reclaim / reduce_generation 本身不需要组成 release
-        // sequence；每一轮真正向 thief 发布可偷边界的同步点都是 grant()。
-        // 失败时没有读取，Relaxed 即可。
+        // takeover / reclaim / reduce_generation 之间不要求维持跨世代的
+        // release sequence；物理块每次重新交给 thief 时，都由新的 grant()
+        // Release store 建立这一代新的发布关系。
+        //
+        // CAS 失败路径不会读取槽位，因此 failure ordering 使用 Relaxed 即可。
         if self
             .steal_tail
             .compare_exchange(spos, spos + 1, Ordering::Acquire, Ordering::Relaxed)
