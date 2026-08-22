@@ -2,764 +2,266 @@
 
 vibe coding 玩具项目，所有代码，包括当前文档均 ai 生成。
 
-用 Rust 复刻 [skynet](https://github.com/cloudwu/skynet) 的 Actor 内核。**不需要 Lua**——skynet 用协程解决的问题，Rust 的 `async`/`Future` 原样能解，还多了编译期类型检查。
+rskynet 是一个受 [skynet](https://github.com/cloudwu/skynet) 启发、使用 Rust 编写的 Actor 运行时。它保留了 skynet 的服务、邮箱、地址和 session 通信模型，并用 Rust `Future` 表达服务内异步流程，不依赖 Lua 运行时。
 
-```rust
-// 这段代码读起来是同步的，实际上挂起的只是当前这个任务，服务照常处理其它消息
-let reply = ctx.request(".pong", Payload::of(Ask::Ball(round))).await?;
-```
+项目当前要求 Rust 1.85 或更高版本，使用 Rust 2024 edition。
 
-## skynet 的灵魂是哪三件事
+## 核心特性
 
-| skynet 的做法 | rskynet 的做法 |
-| --- | --- |
-| **服务即 Actor**：每个服务有独立地址、独立邮箱，彼此只靠消息往来，内部天然单线程 | 一样。服务实现 `Service` trait，状态放进 `SvcCell`，全程不需要锁 |
-| **两级消息队列**：每服务一个邮箱，全局一个「有活干的服务」队列，N 个 worker 线程从中取活 | 一样。`Mailbox` + 运行队列，邮箱状态机保证同一服务绝不被两个 worker 同时执行。区别是两级队列都不加锁，见下文 |
-| **session 配对**：`call` 分配一个 session 并挂起协程，回包带同一 session 回来时唤醒它 | 一样，只是把协程换成 `Future`：`session -> Waker`，`call` 就是一句 `.await` |
+- 每个服务拥有独立地址和邮箱；同一服务在任意时刻只会由一条线程执行。
+- 共享服务运行在工作窃取线程池上，服务状态可使用 `SvcCell`，无需为普通访问加锁。
+- `request` / `reply` 通过 session 配对应答，调用方可直接 `.await`。
+- 一个服务内可用 `ctx.spawn` 并发执行多个任务，`ctx.sleep_ms`、RPC 回包和外部唤醒统一进入调度器。
+- 支持独占线程服务，适合定时器、日志和基于 `mio` 的网络轮询。
+- 可选 TCP/UDP、TLS、HTTP/1.1、WebSocket、Dashboard 和 Protobuf 跨节点通信。
+- TOML 驱动启动流程；具名服务和集群 handler 可在链接期自动注册。
+- 支持优雅关停、崩溃报告、服务运行统计和疑似死循环检测。
 
-第三点是关键：**Lua 协程只是实现手段，不是设计本身**。把它换成 `Future` 之后，`call`、`sleep`、`fork` 的语义一字不差，而且不再需要嵌一个脚本虚拟机。
+## 快速运行
 
-## 调度模型
-
-rskynet 在 skynet 的基础上做了一处推广：**服务的「可运行」条件从「邮箱非空」变成「邮箱非空 或 有就绪任务」**。于是定时器回包、RPC 回包、外部线程唤醒三者走的是同一条路径，邮箱那一个状态机就同时管住了消息与 Future 唤醒。
-
-```mermaid
-flowchart LR
-    subgraph svc [ServiceContext 一个服务]
-        MB[Mailbox 邮箱]
-        RQ[就绪任务队列]
-        TS[任务集 BoxFuture]
-        SS["Session 表 session 到 Waker"]
-    end
-    Sender[其他服务 send/call] -->|投递消息| MB
-    TimerSvc[定时器服务 时间轮] -->|RESPONSE 消息| MB
-    Waker[Future 被唤醒] -->|任务 id| RQ
-    MB -->|状态从 Idle 变 Queued 时入队| GQ[运行队列]
-    RQ -->|状态从 Idle 变 Queued 时入队| GQ
-    GQ --> W1[worker 线程 1]
-    GQ --> WN[worker 线程 N]
-    W1 -->|取一件活干 就绪任务优先| svc
-```
-
-worker 的一轮调度（对照 C 版 `skynet_context_message_dispatch`）：
-
-1. 从运行队列取一个服务，取不到就先自旋一会儿，还是空手才挂起
-2. 反复 `take_work()`：优先 poll 就绪任务，其次取一条消息
-   - 消息是 `RESPONSE`/`ERROR` 且带 session → 直接唤醒等待中的任务
-   - 其它消息 → 开一个新任务跑 `dispatch`，等价于 skynet 新建一个协程
-3. 每干满 64 件活（消息与就绪任务各算一件）就回头看一眼运行队列：确实有别人在等才让渡，把自己交回队列；没人等就重新计数接着跑
-4. 邮箱和就绪队列都空了 → 状态落回 `Idle`，脱离运行队列，等下一次投递
-
-「就绪任务优先于新消息」不是随便定的：它对应 skynet 里被 resume 的协程会一路跑到下一次 yield，之后才轮到下一条消息。
-
-### monitor 死循环检测
-
-每个共享 worker 各有一份 monitor 进度，另有一条 `rskynet-monitor` 线程每 5 秒扫描一次。worker 在每次 poll Future 的前后推进版本；同一次 poll 连续跨过两个检查点仍未返回，就会记录包含消息来源和目标 handle 的疑似死循环日志。
-
-检测只告警，不强杀线程或节点。监控方可用 `node.take_endless(handle)` 读取并清除这个一次性标记，对应 `skynet.stat("endless")`。监测边界是共享 worker 上的单次 Future poll；独占服务线程和启动阶段的同步初始化不在其中。
-
-### 独占一条线程的服务
-
-服务默认跑在共享的 worker 池上，也可以让它**独占一条线程**——这样的服务每 `launch` 一次就新起一条线程，那条线程只跑这一个服务，空闲时由服务自己决定怎么睡。日志、定时器、网络层都是这一类。
-
-C 版 skynet 为定时器与 socket 各写了一条专用线程：它们不是服务，没有邮箱也没有地址，内核得为它们单开一套代码。这里换个思路，把「独占一条线程」做成**服务的一种运行方式**（形态接近 ltask 的 exclusive service），于是那些活都由普通服务承担：
-
-| | 共享服务 | 独占服务 |
-| --- | --- | --- |
-| 谁来执行 | 运行队列上的某个 worker，可能被窃取 | 自己那条线程，从不进运行队列 |
-| 没活干时 | 去找别的服务干，找不到才挂起 | 调服务自己的 `idle` 钩子 |
-| 有活投进来 | 邮箱入运行队列，按空闲位图点名叫一个 worker | `unpark` 那条线程，再调一次 `interrupt` |
-| 适合什么 | 业务服务：`launch` 一万个只是一万个邮箱 | 要阻塞在自己事件源上（epoll）、或要按节拍醒来（时间轮）的活 |
-
-两者共用同一个邮箱状态机与同一段取活逻辑（`Node::run_service`），`init` / `dispatch` 的写法一字不差。「同一服务任意时刻只在一条线程上执行」这条不变量在独占模式下只会更强，所以 `SvcCell` 照旧可用。
-
-`Exclusive` 只有两个钩子：
-
-- `idle(&self, ctx, idler)`：邮箱与就绪队列都空了时调用，跑在自己那条线程上，可以放心阻塞。默认实现是 `idler.park()`；定时器在这里推一格时间轮再 `park_timeout(2.5ms)`；网络层在这里 `poll.poll(events, None)`，顺手把 IO 事件转成消息投出去。
-- `interrupt(&self)`：从任意线程把上面那个阻塞叫醒。默认空实现——内核每次唤醒都会**先 `unpark` 再调 `interrupt`**，所以纯消息驱动的服务（日志）什么都不用写；阻塞在别处的服务在这里敲自己那个唤醒手段（mio 的 `Waker`）。这里有一条硬要求：`interrupt` 必须接得住**早到的唤醒**——它可能发生在线程真正睡下去之前，那一下不能丢，否则「取活取空」与「睡下去」之间的那次投递就没人管了。`std` 的 park 令牌与 mio 的 `Waker` 都满足，`Condvar` 不满足。
-
-退出时序上，独占线程的退出条件是**自己被摘除**而不是节点收工，这样日志服务「留到最后收尾」的语义原样保住：`start()` 收尾时先 `retire_all()` 送走普通服务、join 掉它们的线程，最后才摘除保留服务（日志与定时器）。而发现自己已死之后，那条线程会先把邮箱里积压的消息处理完再销毁——不然关停前最后几行日志就跟着清理一起丢了。
-
-### 邮箱：无锁队列 + 四态状态机
-
-C 版的邮箱是「一把锁 + 环形缓冲 + `in_global` 布尔量」，投递、取活、就绪任务全压在那一把锁上。这里换成两条无锁队列（`crossbeam` 的 `SegQueue`）加一个原子状态机。
-
-状态机是必须的，不能只把布尔量改成 `AtomicBool`：**「队列已空」与「我要放生这个服务」这两件事必须原子地绑在一起**，否则会丢活——消费方看到两条队列都空 → 投递方压入新消息、看到标志仍为真于是不入队 → 消费方清掉标志放生。那条消息就此再也无人处理。C 版靠邮箱那把锁把两件事圈在一起，无锁化之后改用四个状态，把「持有期间来了新活」显式记下来：
-
-```mermaid
-stateDiagram-v2
-    [*] --> Queued: 服务创建
-    Idle --> Queued: 投递方 CAS 成功 由它负责入运行队列
-    Queued --> Running: worker 从运行队列取到 开始独占执行
-    Running --> Notified: 持有期间又来了新活 投递方无需入队
-    Notified --> Running: 消费方复位后重扫队列 必有收获
-    Running --> Idle: 两条队列都空 CAS 成功才算放生
-    Running --> Queued: 让渡 先改状态再入队
-```
-
-三条纪律撑住了整套东西：
-
-- **投递方先压队列、再改状态**。于是消费方一看到 `Notified`，复位重扫就一定捞得到东西，那个循环必然收敛。
-- **入队方先改状态、再真的入队**（都收在 `Scheduler::push` 里）。反过来的话，别的 worker 可能已经把服务取走并置成 `Running`，那一记 `store` 就把它标成了「在队列里，实际谁也没拿着」，这个服务从此不会再被唤醒。
-- **销毁流程的最后一步才放生**，而且只有确认清理期间没有新活进来才算成功。服务一旦放生就可能被别的 worker 重新领走、再清一次，而清理动的都是「只有持有者会碰」的结构，两个 worker 同时清一个服务是不行的。
-
-### 运行队列：每 worker 一条，闲了去偷别人的
-
-C 版的全局队列是一把大锁护着的环形缓冲，worker 越多争得越凶。这里换成 [BWoS 块式工作窃取队列](https://www.usenix.org/conference/atc23/presentation/wang-jiawei)（移植自 [stdexec](https://github.com/NVIDIA/stdexec) 的 `bwos_lifo_queue.hpp`）：每个 worker 一条自己的队列，在上面 push/pop 不需要任何锁，闲下来才去别人队列头部窃取。
-
-BWoS 的巧劲在于把环形缓冲切成若干**块**：owner 只碰当前块的写指针，窃贼只碰更早那些已经「交出去」的块，两者常态下一次 CAS 都不用打照面，只有跨块的瞬间才同步一次，摊薄到每 16 个元素一次。
-
-```mermaid
-flowchart LR
-    W0[worker 0] -->|投递| L0[本地 BWoS 队列 0]
-    W1[worker 1] -->|投递| L1[本地 BWoS 队列 1]
-    L0 -->|尾部取 后进先出| W0
-    L1 -->|尾部取 后进先出| W1
-    L1 -->|头部偷 先进先出| W0
-    L0 -->|头部偷 先进先出| W1
-    Timer[独占线程 定时器等] --> INJ[injector 队列]
-    Ext[外部线程唤醒 waker] --> INJ
-    L0 -.->|写满溢出| INJ
-    INJ --> W0
-    INJ --> W1
-```
-
-BWoS 的 owner 侧操作只允许绑定线程调用，可投递方却是任意线程——独占服务那几条线程、被外部 channel 唤醒的 waker 都算。所以还留了一条 injector 队列兜底（同样是 `SegQueue`，无锁）：非 worker 线程的投递、本地队列写满的溢出都落在这里，谁都能取。worker 每取 64 次活会回头看一眼 injector，免得里面的服务被本地队列饿死。
-
-**本地队列是后进先出的**，这是 BWoS lifo 变体的定义，图的是刚投递的服务多半还热在缓存里。代价是让渡回去的服务下一轮很可能又被同一个 worker 取到，不再是 skynet 那种严格 FIFO 轮转；跨 worker 的公平由窃取（从队列头部取最老的）和 injector 兜底。
-
-### 让渡：按争用情况决定，没有权重表
-
-C 版给每个 worker 分了档：前 4 条线程一次只处理一条消息（响应快），后面的按 `队列长度 >> weight` 批处理（吞吐高）。**这张表这里没有照搬**，因为它的前提是那条全局 FIFO 队列——服务每次让渡后可能被任何一个 worker 取走，所以它在时间上体验到的是各档权重的平均值，那张表表达的是「整个池子里四分之一的线程偏延迟」这个赌注。
-
-换成每 worker 一条本地队列之后前提就没了：投递在无人空闲时落进自己的队列，owner 侧又是后进先出，服务倾向和某个 worker 粘住。照搬的结果是两个一模一样的服务，落在 0 号的永远一条一条处理、落在 8 号的每次批处理一半积压，差别完全取决于它偶然落在了哪里。而线程数不满 32 时还只用表的前几项，`thread = 4` 就是四个 worker 全档 `-1`，等于整个节点没有批处理。
-
-所以让渡改成一条统一规则：**干满 64 件活，问一次「运行队列里有人在等吗」，有就让渡，没有就接着跑。**
-
-- 没人等的时候行为与「一口气干到邮箱空」完全一致，多付的只有每 64 件一次原子读。批量的意义本来也不在省下队列往返，而在于让一个服务在被换下之前把自己那几 KB 工作集（任务槽、session 表、future 状态机）用够
-- 判断按批问而不是按件问，是因为记录排队总数的那个计数器被所有 worker 的每次 push/pop 反复写，是条热缓存行。而且「有人在等」只是个提示：别人本地队列当前块里的服务偷不动、handoff 槽里的只有那个 worker 拿得到，误判时这一趟找活白跑，批量正好给误判设了个摊薄系数
-- **消息与就绪任务各算一件**。只数消息的话，一个在 poll 里唤醒自己再挂起的任务（`yield_now` 那类 future 就是这么写的）会让就绪队列永远非空、邮箱永远等不到空，那个 worker 从此看不到收工信号——而主线程正卡在 join 上、摘除服务排在 join 之后，于是节点再也关不掉
-- 收工信号也算「该让渡了」，这是上面那种任务唯一的出口
-
-独占服务不参与这套：它那条线程只有它一个服务，让渡给谁都没有意义，所以一次干到邮箱空。
-
-### 唤醒：空闲位图 + 定向 unpark + handoff 槽
-
-投递方想唤醒一个 worker，得先答出「有人在睡吗、叫谁、要不要叫」。队列一分散，「有没有新活」就不再是一次判断能问出来的，两边必须构成 Dekker 模式（各有一个全序点）才不会丢唤醒：
-
-- **worker 侧先登记再扫**：`fetch_or` 把自己在空闲位图（每 64 个 worker 一个 `AtomicU64`）里的那一位置上，**然后**才去扫队列；扫到活就清位干活，扫不到才 `thread::park()`。park 自带 token，早到的 `unpark` 不会丢，所以不需要「睡前复查序列号」那一套。
-- **投递侧先入队再看**：一记 `fence(SeqCst)` 之后读位图，非零就 CAS 清掉某一位、`unpark` 那个**具体**的 worker。比起原先每次投递都在共享行上做一次 `fetch_add` RMW，这里是本地 fence 加一次读多写少的普通读。
-
-叫谁：**取位图最低位**。这等于稳定偏好编号小的那几个 worker，其余的长睡不受反复扰动——正是「worker 远多于负载」那个场景要的。缓存热度上「最近睡下的优先」（Treiber LIFO 栈）更好，但会把唤醒摊到所有线程上，与省唤醒的目标相反。
-
-再叠两层节流：
-
-- **`searching` 计数抑制无谓唤醒**：worker 醒来找活时 `+1`，拿到活或决定去睡时 `-1`。投递方只在 `searching == 0` 时才唤醒——已经有人醒着在扫队列，就让它顺手把这件活捞走。一条消息扇出几十次投递时，这一条把唤醒次数从 O(消息数) 压到 O(1)。代价是有人在找活时投递要走 injector（本地队列里正在写的那块对别人隐形），换来的是不叫第二个线程起来。
-- **睡前先自旋**：找不到活不立刻 park，先做几轮轻量重扫。活是一阵一阵来的，这一条避免了「消息比我睡下晚了半微秒」就白付一次挂起+唤醒——Windows 上一次往返 1~10µs，正是那 1/6 吞吐的去处。
-
-`handoff` 槽治的是另一个问题：唤醒了一个 worker，活该放哪儿？放本地队列它看不见（BWoS 里 owner 正在写的那一块对窃贼隐形），全走 injector 又等于放弃了本地路径。学 ltask 的 `service_ready`，每个 worker 一个单槽 `AtomicPtr`，投递方 CAS 占位、被唤醒者醒来先看自己的槽。于是服务能直接递到目标 worker 手上；槽已被占才退回 injector。
-
-### 窃取：位图挑受害者，别扫全场
-
-原先的窃取是「随机起点 + 环形扫完所有 worker」。22 核上一个空闲 worker 最坏要读 21 条别人的队列头，所有空闲 worker 同时这么干就是 O(N²) 的跨核缓存流量——偷不到的时候尤其亏，因为 BWoS 允许伪失败，「扫完一圈没偷到」根本不代表别人真闲着。
-
-`Scheduler` 于是维护一张 `stealable` 位图，位 i 表示 i 号 worker 的本地队列**有已交出的整块可偷**。维护信号从 `bwos` 的返回值里透出来，而不是塞回调进去：`Owner::push_back` 告诉调用方「本次跨块了，前一块已交给窃贼」→ owner 置自己的位；窃贼偷空一条队列 → 清掉受害者的位。owner 侧每 16 个元素才更新一次位图，摊薄后可忽略；窃贼从此是「读一个字、挑一位」。
-
-外加两道限流：并发窃取者数不超过 `max(1, worker 数 / 2)`（超了就直接去睡，tokio 的做法），单轮最多试几个受害者，失败就回退到「看 injector → 自旋 → park」，不再固执地扫满 N-1 个。
-
-## 快速上手
-
-```rust
-use rskynet::{Config, ConfigExt, Ctx, Message, Registry, Result};
-
-struct Echo;
-
-#[rskynet::service]
-impl Echo {
-    async fn init(&self, ctx: Ctx) -> Result<()> {
-        ctx.register_name("echo");
-        Ok(())
-    }
-
-    async fn dispatch(&self, ctx: Ctx, mut msg: Message) {
-        let payload = msg.take_payload();
-        let _ = ctx.reply(&msg, payload);
-    }
-}
-
-fn main() -> Result<()> {
-    // 日志、信号、定时器、引导这些内置服务由 rskynet::start 按 feature 挂上
-    let registry = Registry::new().with("echo", || Echo);
-    let config = Config::default().with_bootstrap(["echo"]);
-    rskynet::start(config, registry)
-}
-```
-
-跑内置示例：
+克隆仓库后，可直接运行内置示例：
 
 ```bash
 cargo run -p rskynet-examples -- config/examples/ping_pong.toml
 ```
 
-它会演示三件事：`call` 的同步写法、`spawn` 的服务内并发、`sleep` 走定时器。输出大致是：
+这个示例会启动 `pong` 和 `ping` 两个服务，演示：
 
-```
-[     0.015] [:00000006] 1000 个来回耗时 13.654041ms，平均单程 6.827µs
-[     0.060] [:00000006] 三个请求的完成顺序是 ["睡10毫秒", "睡20毫秒", "睡30毫秒"]，总耗时 44.763625ms
-```
+- `ctx.request(...).await` 的请求/应答；
+- `ctx.spawn(...)` 发起服务内并发任务；
+- `ctx.sleep_ms(...)` 通过时间轮休眠；
+- 服务主动退出与节点自动结束。
 
-第二行是重点：三个请求分别要睡 30/10/20 毫秒，总耗时接近最慢的 30ms 而不是三者之和，说明它们在对端是**并发**处理的；完成顺序也按实际睡眠时长排列，而不是发出顺序。时间轮内部仍是 10ms 一格，实际唤醒可能因刻度对齐和线程调度略晚，但不会提前。
+其他示例：
 
-## API 对照表
-
-| skynet (Lua) | rskynet |
-| --- | --- |
-| `skynet.send(addr, type, ...)` | `ctx.send(addr, mtype, payload)` / `ctx.post(addr, payload)` |
-| `skynet.call(addr, type, ...)` | `ctx.call(addr, mtype, payload).await` / `ctx.request(addr, payload).await` |
-| `skynet.ret(...)` | `ctx.reply(&msg, payload)` |
-| `skynet.fork(f)` | `ctx.spawn(future)` |
-| `skynet.sleep(ti)` | `ctx.sleep(ticks).await` / `ctx.sleep_ms(ms).await` |
-| `skynet.newservice(name)` | `ctx.launch(kind, args).await` |
-| `skynet.register(".name")` | `ctx.register_name("name")` |
-| `skynet.localname(".name")` | `ctx.query_name("name")` |
-| `skynet.exit()` / `skynet.kill(addr)` | `ctx.exit()` / `ctx.kill(addr)` |
-| `skynet.abort()` | `ctx.abort()` |
-| `skynet.now()` / `skynet.time()` | `ctx.now()` / `ctx.time()` |
-| `skynet.error(...)` | `ctx.log(...)` / `rskynet::log!(ctx, "...")` |
-| `skynet.stat("mqlen"/"message"/"cpu"/"endless")` | `node.service_stats(addr)` / `node.take_endless(addr)` |
-| `socket.listen(addr, port)` / `socket.start(id)` | `net::listen(&ctx, addr).await` / `net::start(&ctx, id).await` |
-| `socket.open(addr, port)` | `net::connect(&ctx, addr).await` |
-| `socket.write(id, data)` / `socket.lwrite(id, data)` | `net::send(&ctx, id, data)` / `net::send_low(&ctx, id, data)` |
-| `socket.close(id)` / `socket.shutdown(id)` | `net::close(&ctx, id).await` / `net::shutdown(&ctx, id)` |
-| `socket.udp(...)` / `socket.sendto(...)` | `net::udp(&ctx, bind).await` / `net::udp_send(&ctx, id, to, data)` |
-
-寻址方式也照搬：`":0100000a"` 是十六进制 handle，`".name"` 是本地名字，直接传 `Handle`（`u64`）则是 handle。handle 在节点生命周期内单调递增、永不复用；销毁只释放物理槽位。
-
-节点级观测也统一走 `NodeRef`：`node.stats()` 返回 service 总数、业务 service 数、
-运行队列长度与 uptime；`node.services()` / `service_stats(addr)` 返回每个 service 的
-kind、全部本地别名、生命周期、邮箱积压、活动 task、pending call、累计消息数与
-CPU 微秒数，并包含每个 service 的启动时间与运行时间。这些是可序列化的拥有型近似
-快照，适合监控线程和 HTTP UI；抓取过程不访问 service 的 `SvcCell`，也不阻塞它执行。
-
-## 过程宏与网络层
-
-默认启用的 `#[service]` / `#[exclusive]` 会生成对应 trait 实现；`#[msg]` 按协议号
-路由，并通过 `FromPayload` 取参数。有返回值且发送方在等待时会自动回包，自定义对象
-用 `boxed_payload!(Ask, Answer)` 声明负载转换：
-
-```rust
-#[rskynet::service]
-impl Calculator {
-    async fn init(&self, ctx: Ctx) -> Result<()> {
-        ctx.register_name("calculator");
-        Ok(())
-    }
-
-    #[msg(MsgType::USER)]
-    async fn add(&self, ask: Add) -> Sum { Sum(ask.0 + ask.1) }
-
-    #[msg(default)]
-    async fn other(&self, _ctx: Ctx, _msg: Message) {}
-}
-```
-
-网络层用 `net` feature 打开。配置中出现 `[net]`（空段也算）就会在业务 bootstrap
-之前自动启动；业务服务可直接调用 `listen` / `connect` / `start` / `send`，并用
-`#[msg(MsgType::SOCKET)]` 接收 `SocketEvent`。可直接运行
-`cargo run -p rskynet-examples -- config/examples/echo_server.toml`，再用
-`telnet 127.0.0.1 8888` 验证回声。
-
-`net::info(&ctx, id)` 查询单个 socket，`net::netstat(&ctx)` 则像 Skynet 的
-`socket.netstat()` 一样返回全部活跃 socket（释放后的连接不会保留）：
-
-```rust
-for socket in rskynet::net::netstat(&ctx).await? {
-    println!(
-        "{} owner=:{:08x} kind={:?} names={:?} read={} write={} pending={}",
-        socket.id,
-        socket.owner,
-        socket.owner_kind,
-        socket.owner_names,
-        socket.read_bytes,
-        socket.write_bytes,
-        socket.write_pending,
-    );
-}
-```
-
-统计还包含监听口 accept 次数、读写状态及最后成功收发时间；时间字段以节点启动为
-起点，单位为毫秒。尚未 `start`、正在连接和半关闭的过渡态也会显示。
-
-TLS 层用 `tls` feature 打开（会同时打开 `net`）。出现 `[tls]` 时会按
-`net → tls → 业务服务` 自动启动；缺少的 `[net]` 使用默认配置。`rskynet-tls` 不接管 socket，而是在网络层之上
-把 rustls 驱动成一个普通 actor 服务。客户端和服务端证书配置分别通过
-`ClientOptions` / `ServerOptions` 传入，支持系统根、Mozilla 根、自定义根、无密码
-私钥和带密码的 PKCS#8 私钥。
-
-HTTP/1.1 用 `http` feature 打开，HTTPS 用 `https`（会同时启用 `http` 与 `tls`）。
-`HttpClientService` 是共享连接池的客户端 actor；出现 `[http-client]` 时会自动按
-`net → tls（HTTPS 时）→ http-client → 业务服务` 启动，缺少的依赖段使用默认配置。`client::start` 返回流式 exchange，`client::request`
-是整包请求的便利入口。服务端没有全局 actor：业务服务持有 `HttpServer`，把自己的
-`SocketEvent` / `TlsEvent` 交给它解析，再处理返回的 `ServerRequest`。两侧都基于
-`ureq-proto` 的 Sans-IO HTTP/1.1 状态机，支持 keep-alive、chunked、
-`100-continue`、流式 body、超时和高低水位背压。
-
-节点 Dashboard 用 `dashboard` feature 打开。只有配置中出现 `[dashboard]` 才会按
-`net → dashboard → 业务服务` 自动启动，且监听地址必须显式提供：
-
-```toml
-[dashboard]
-address = "127.0.0.1:8080"
-```
-
-页面与 `/api/v1/stats` 都直接嵌入可执行文件，部署时不需要额外静态资源。页面通过
-“服务 / 网络”标签展示节点、service 与活跃 socket 统计、启动/运行时间及浏览器内
-短期趋势；`/api/v1/stats` 的同一份快照也包含 `services` 和 `sockets`。存在
-`[cluster]` 时还会显示本节点的 `node_id`。可运行
-`cargo run -p rskynet-examples -- config/examples/dashboard.toml` 预览。
-
-WebSocket 用 `websocket` feature 打开，协议和握手由 `tungstenite` 驱动。服务端仍
-内嵌在业务 actor 的 `HttpServer` 中；客户端则由业务 actor 自己持有
-`WebSocketClient`，不使用共享 `.http-client` 服务或 HTTP 连接池。`websocket`
-支持 `ws://`，同时启用 `https` 后支持由 `rskynet-tls` 承载的 `wss://`。运行时
-`ws://` 需要 `[net]`，`wss://` 需要 `[tls]`，但都不需要 `[http-client]`：
-
-```toml
-rskynet = { version = "0.1", features = ["websocket"] }          # ws
-rskynet = { version = "0.1", features = ["websocket", "https"] } # ws + wss
-```
-
-服务端在检查 Origin、Authorization 等业务头后升级请求；升级时会保留 HTTP 解析器
-尚未消费的首帧数据：
-
-```rust
-for request in self.http.on_socket(&ctx, event).await? {
-    if request.request.uri().path() == "/ws" {
-        let mut socket = request
-            .upgrade_websocket(
-                &ctx,
-                WebSocketUpgradeOptions::default().with_protocol("chat"),
-            )
-            .await?;
-        let task_ctx = ctx.clone();
-        ctx.spawn(async move {
-            while let Ok(Some(message)) = socket.recv(&task_ctx).await {
-                if message.is_text() || message.is_binary() {
-                    let _ = socket.send(&task_ctx, message).await;
-                }
-            }
-        });
-    }
-}
-```
-
-客户端连接应在 `init` 完成后启动的任务里创建：
-
-```rust
-let client = self.websockets.clone();
-let task_ctx = ctx.clone();
-ctx.spawn(async move {
-    let request = ClientRequestBuilder::new(
-        "wss://example.com/chat".parse().unwrap(),
-    )
-    .with_header("Authorization", "Bearer token")
-    .with_sub_protocol("chat");
-    let Ok((mut socket, _response)) = client.connect(&task_ctx, request).await else {
-        return;
-    };
-    while let Ok(Some(message)) = socket.recv(&task_ctx).await {
-        // 处理 message
-    }
-});
-```
-
-actor 把属于客户端的 transport 事件交回本地驱动器；同一 actor 还持有 HTTP 服务端
-时，先按 ID 路由客户端事件，剩余事件再交给 `HttpServer`：
-
-```rust
-#[msg(MsgType::SOCKET)]
-async fn on_socket(&self, ctx: Ctx, event: SocketEvent) {
-    if self.websockets.handles_socket(event.id()) {
-        let _ = self.websockets.on_socket(&ctx, event).await;
-    } else if self.http.handles_socket(&event) {
-        let _ = self.http.on_socket(&ctx, event).await;
-    } else if !event.is_gone() {
-        rskynet::log!(ctx, "忽略未知 socket 事件：{event:?}");
-    }
-}
-
-#[msg(MsgType::TLS)]
-async fn on_tls(&self, ctx: Ctx, event: TlsEvent) {
-    if self.websockets.handles_tls(event.id()) {
-        let _ = self.websockets.on_tls(&ctx, event).await;
-    } else if self.http.handles_tls(&event) {
-        let _ = self.http.on_tls(&ctx, event).await;
-    } else if !matches!(event, TlsEvent::Close { .. } | TlsEvent::Error { .. }) {
-        rskynet::log!(ctx, "忽略未知 TLS 事件：{event:?}");
-    }
-}
-```
-
-`handles_socket` / `handles_tls` 只借用事件，不复制数据；确认归属后再把事件按值交给
-对应驱动器。连接可能在主动关闭时先解除登记，随后再收到迟到的 `Close` / `Error`，
-这类终止事件可安全忽略。同一 actor 还持有原始 TCP、UDP 或其他协议连接时，也应使用
-相同方式分流。
-
-`WebSocket` 及其 `WebSocketSender` 只能在创建连接的 actor 内使用。其他 actor 应创建
-自己的连接，或通过业务消息请求属主 actor 代发。
-
-`[cluster]` 同样会自动补上 `net`。这些自动服务统一去重，不能再手工列入
-`[bootstrap].services`；配置了对应段却没有编译相应 feature 时，启动会明确报错。
-
-`ctx.launch(...).await` 现在以目标服务的 `init` Future 完整返回 `Ok(())` 为成功，
-返回的 handle 已经可以 dispatch。bootstrap 因而严格逐项等待：常驻循环、持续重试和
-长期握手应放进 `ctx.spawn`，`init` 只完成注册与有限的就绪工作，也不要等待清单中尚未
-启动的后续服务。初始化期间 RPC、timer 和 IO 回包仍可推进，普通业务消息会按 FIFO
-暂存到初始化成功之后。
-
-`cluster` feature 用 Protobuf 在 rskynet 节点间通信。消息的 TYPE_ID 和入站
-handler 都由宏提交到链接期自动注册表：
-
-```rust
-#[derive(Clone, PartialEq, prost::Message, rskynet::cluster::ClusterMessage)]
-#[cluster(type_id = 1001)]
-struct PingRequest {
-    #[prost(uint64, tag = "1")]
-    round: u64,
-}
-
-#[derive(Clone, PartialEq, prost::Message, rskynet::cluster::ClusterMessage)]
-#[cluster(type_id = 1002)]
-struct PongResponse {
-    #[prost(uint64, tag = "1")]
-    round: u64,
-}
-
-#[rskynet::cluster::handler("pong")]
-async fn pong(
-    remote: rskynet::cluster::RemoteContext,
-    ping: PingRequest,
-) -> Result<PongResponse, String> {
-    remote.log(format!("转交本地服务处理第 {} 轮 ping", ping.round));
-    let reply = remote
-        .request("pong-worker", rskynet::Payload::of(ping))
-        .await
-        .map_err(|error| error.to_string())?;
-    reply
-        .downcast::<PongResponse>()
-        .map(|response| *response)
-        .map_err(|_| "pong-worker 返回了错误的负载类型".to_owned())
-}
-```
-
-`RemoteContext` 提供自动附带路由、消息 `TYPE_ID`、来源节点和请求 ID 的日志，
-也可通过 `post` / `request` 把工作交给本地 actor。它还提供 `now`、`time`、
-`start_time`、`sleep`、`sleep_ms` 和 `yield_now` 等基础能力，但不会暴露内部
-`cluster` 服务的 handle 或关停能力。上例中的 `pong-worker` 是通过
-`Ctx::register_name` 注册的本地 actor；跨节点边界使用 Protobuf，本地转交仍使用
-`Payload::Boxed`，不会重复序列化。
-
-配置中出现 `[cluster]` 时，标准 `rskynet::start` / `rskynet::main::run`
-会自动注册 handler，并在业务服务之前启动 `net` 与 `cluster`；
-`[bootstrap].services` 不必再列这两项。需要运行时组合时仍可显式使用
-`HandlerRegistry` 和 `with_cluster`，显式注册优先。
-
-## 源码对照
-
-模块名刻意与 `skynet-src` 的文件名对齐，方便逐一比对：
-
-| rskynet | skynet | 内容 |
+| 示例 | 命令 | 说明 |
 | --- | --- | --- |
-| `message.rs` | `skynet_mq.h` | `Message` / `MsgType` / `Payload` |
-| `mq.rs` | `skynet_mq.c` | 每服务邮箱与四态状态机、运行队列（每 worker 一条 + injector）、唤醒与窃取、过载检测 |
-| `bwos.rs` | 无对应 | BWoS 块式工作窃取队列，移植自 stdexec 的 `bwos_lifo_queue.hpp` |
-| `handle.rs` | `skynet_handle.c` | 本地 `u64` handle 分配（单调递增、永不复用）、槽位倍增、本地名字表 |
-| `server.rs` | `skynet_server.c` | `ServiceContext`、`Node`、消息分发主循环、服务生命周期 |
-| `clock.rs` | 无对应 | `Timer` 抽象：内核只认它，实现由启动方注入 |
-| `module.rs` | `skynet_module.c` | 服务类型注册表（静态注册取代 `dlopen`） |
-| `monitor.rs` | `skynet_monitor.c` | 每 worker 的 Future poll 进度与死循环检测 |
-| `start.rs` | `skynet_start.c` | 配置、线程池、引导、退出 |
-| `context.rs` | `lualib/skynet.lua` | 用户侧 API：`call` / `send` / `fork` / `sleep` |
-| `session.rs` | `lualib/skynet.lua` | `session_id_coroutine` 的对应物 |
-| `task.rs` | Lua 协程池 | 服务内 executor、`SvcCell` |
-| `exclusive.rs` | 无对应 | 独占线程的服务：`Exclusive` 的 `idle` / `interrupt` 两个钩子与那条线程的主循环，见上文 |
-| `ext.rs` | 无对应 | 内核对外的扩展接口：`NodeRef` / `ReplyToken`，见下文 |
+| TCP echo | `cargo run -p rskynet-examples -- config/examples/echo_server.toml` | 监听 `127.0.0.1:8888`，原样返回收到的数据 |
+| HTTP | `cargo run -p rskynet-examples -- config/examples/http.toml` | 在随机本地端口完成一次 HTTP POST 回显后退出 |
+| WebSocket | `cargo run -p rskynet-examples -- config/examples/websocket.toml` | 完成一次 WebSocket 文本回显后退出 |
+| Dashboard | `cargo run -p rskynet-examples -- config/examples/dashboard.toml` | 在 `http://127.0.0.1:8080/` 展示节点状态 |
 
-内置服务一个都不在内核里，各是一个独立 crate（见下文「内核里为什么没有服务」）：
+TCP echo 和 Dashboard 会持续运行，可按 `Ctrl+C` 关停。
 
-| rskynet | skynet | 内容 |
-| --- | --- | --- |
-| `rskynet-logger` | `service_logger.c` | 日志服务（独占一条线程） |
-| `rskynet-timer` | `skynet_timer.c` + `thread_timer` | 分层时间轮（256 格近期轮 + 4 层 64 格，精度 10ms）与推着它走的定时器服务 |
-| `rskynet-bootstrap` | `bootstrap.lua` | 引导服务 |
-| `rskynet-signal` | OS signal / exception | 普通信号回调、优雅关停与独立崩溃报告进程 |
-| `rskynet-net` | `socket_server.c` | TCP / UDP 网络层、槽位状态机、背压与域名解析 |
-| `rskynet-tls` | 无对应 | 基于 rustls、复用网络层的双向 TLS 协议服务 |
-| `rskynet-http` | 无对应 | 基于 ureq-proto 的 HTTP/1.1 客户端连接池与可嵌入服务端 |
-| `rskynet-macros` | `lualib/skynet.lua` 的协议分发样板 | `service` / `exclusive` / `msg` 过程宏 |
+### 跨节点示例
 
-## 为什么服务状态可以不加锁
-
-调度器保证**同一个服务在任意时刻只会被一条线程执行**（由邮箱那个四态状态机维持：只有 `Queued → Running` 这一次取出的人才有执行权），所以服务内部天生是单线程访问的，只是「哪条线程」会随调度变化。换成工作窃取之后这条不变量照旧：一个服务同一时刻只躺在一条队列的一个槽位里，而 BWoS 保证每个槽位只会被取走一次，被偷走也只是换了个 worker 执行。独占线程的服务更是从头到尾只有那一条线程。`SvcCell<T>` 就建立在这条不变量上：它本质是 `RefCell`，只额外声明了 `Sync`，好让 `Arc<MyService>` 满足 `Send`。
-
-用它而不用 `Mutex` 是有意的：跨 `await` 持有 `Mutex` 会真的死锁，而 `SvcCell` 只会在借用冲突时 panic，能第一时间把 bug 暴露出来。
-
-```rust
-struct Counter { hits: SvcCell<u64> }
-
-*self.hits.borrow_mut() += 1;      // 没有锁，没有原子操作
-```
-
-内核自己也吃这条不变量：任务集（`Slab<TaskSlot>`）与 `SessionTable` 都是 `SvcCell`，不再有锁。`CURRENT_SERVICE` 线程局部量记着「本线程此刻在跑哪个服务」，整个消息处理、任务 poll、回包与销毁过程都处于这个所有权作用域。`Ctx::call` / `sleep` / `spawn` 等 service 本地接口会强制校验它；从外部 OS 线程调用会立即 panic。
-
-`Ctx` 仍然是 `Send`，因为 service 在一次 `await` 之后可能被另一条 worker 窃取并继续 poll。`launch` / `kill` / `abort`、名字与时间查询只是线程安全的 node 代理，可以跨线程调用；`call` / `sleep` / `spawn` / `send` / `reply` / `exit` 等 service 本地接口不能在任意线程调用。需要长期交给外部线程时仍推荐只导出 `NodeRef`，用它投消息、管理节点和抓取 `NodeStats` / `ServiceStats` 近似快照，或者用 `ReplyToken` 完成一次外部请求。任务数、session 数、消息数与 CPU 时长都由原子量镜像，观测线程不会碰 `SvcCell`。
-
-## 相对 C 版的几处有意改动
-
-- **全局队列换成每 worker 一条的窃取队列**：见上文「运行队列」。
-- **专用线程改成独占线程的服务**：C 版的定时器线程与 socket 线程是内核里两块独立代码，这里它们是普通服务，只是各占一条线程，见上文「独占一条线程的服务」。内核因此不必再为「跟着节点起落的线程」单开扩展点。
-- **内置服务全部搬出内核**：日志、信号、定时器、引导各是一个独立 crate，与网络层同一套接入方式；时间也随定时器一起搬走，内核只留一个必须注入的 `Timer` 抽象，见下文「内核里为什么没有服务」。
-- **投递即唤醒**：C 版 `skynet_globalmq_push` 不唤醒 worker，靠定时器线程每 2.5ms 顺手唤醒，代价是所有 worker 都睡着时消息最坏要等一个 tick。这里改成投递方按空闲位图点名叫一个具体的 worker，延迟更低；定时器那记兜底唤醒保留。
-- **消息路径上没有锁**：邮箱、injector、唤醒、handle 表原先各有一把锁，一条消息从发出到被处理要抢四把。现在邮箱与 injector 是无锁队列，唤醒是位图加 `park`/`unpark`，handle 表与名字表用 `arc-swap` 做快照读（`grab()` 常态下连 RMW 都没有，`ctx.request(".pong", …)` 这种每次按名字寻址的写法也不再抢锁）。挂定时器同样不再抢时间轮的锁：投递方把事件压进一条无锁队列，定时器服务每 tick 排空后插进轮子——精度本来就是 10ms，晚一个 tick 插入无影响。`parking_lot` 只留给写者互斥这类冷路径（handle 分配、槽位扩容）。
-- **节点不再是全局单例**：C 版用文件级静态变量，这里收进 `Arc<Node>`，同进程可以跑多个互不干扰的节点，单元测试因此能并行。
-- **字符串命令表换成类型化方法**：`skynet_command("LAUNCH", ...)` 这类字符串接口改成 `Ctx` 上的方法，编译期就能查错。
-- **消息负载可以是任意 Rust 对象**：同进程传递走 `Payload::Boxed`，零拷贝、不需要序列化；`Payload::Bytes` 用于文本日志，也为未来的跨节点序列化与传输保留字节流表示。
-
-## 现状与边界
-
-已实现：服务生命周期（launch / exit / kill / abort）、消息与自定义协议号、session RPC、服务内并发、本地名字表、分层时间轮、独占线程的服务、引导服务、TCP / UDP、双向 TLS、流式 HTTP/1.1 客户端与服务端、信号回调与默认优雅关停、独立进程 minidump/堆栈报告、过程宏、TOML 配置、基于争用的批量让渡调度与工作窃取、过载检测、monitor 死循环检测、退出时给在途请求回错误。
-
-可选的 `cluster` feature 提供 rskynet 节点间的 Protobuf 通信；本地 actor 依然直接传对象。
-尚未实现：gate / agent、debug_console。
-
-因为内核不碰 epoll/kqueue，目前是**跨平台**的，Windows 上可以直接 `cargo run`。
-
-## 性能
-
-Apple M1 Max，10 核，macOS arm64，rustc 1.97.1。release 为 workspace 默认 thin LTO。各场景单独进程，五轮取中位数：
-
-| 场景 | 吞吐 / 延迟 |
-| --- | --- |
-| 多服务调度吞吐（4 worker，64 个服务 × 64 个令牌接力） | 约 611 万次/秒 |
-| **worker 远多于负载**（16 worker，4 个服务 × 4 个令牌接力） | 约 262 万次/秒 |
-| 单服务消息吞吐（2 worker，一百万条消息） | 约 389 万条/秒 |
-| `call` 一个来回（4 worker，debug 构建，ping_pong 1000 轮） | 约 14µs |
-
-第二行量的是唤醒与窃取，不是队列本身：16 个 worker 只有 4 个服务可跑，大部分线程在「睡下、被叫醒、发现没自己的份、再睡」之间打转。skynet 那种全局队列加 `Condvar` 在这个场景下会被唤醒风暴压垮；这里靠自旋接住迟到的投递、靠 `searching` 不叫第二个人起来、靠 handoff 把活直接递到手上。
-
-第三行压的是「一个 worker 反复取自己邮箱里的消息」，本来就没有竞争。它的意义在于**确认没有回退**——邮箱那套状态机比原先的布尔量多了几次 CAS，值得盯一眼。
-
-本机读数有抖动（大小核调度与散热），所以上面的数字都是单独进程测五轮取中位数，单轮读数不必细究。
-
-压测跑法：
+先在一个终端启动 node 2：
 
 ```bash
-cargo test --release -- --ignored --nocapture
+cargo run -p rskynet-examples -- config/examples/cluster_pong.toml
 ```
 
-## 工程结构
+再在另一个终端启动 node 1：
 
-```
-Cargo.toml                 workspace 根
-config/dev.toml            节点配置示例
-crates/rskynet-core/       内核
-  src/                     按 skynet-src 的文件名组织（bwos.rs / clock.rs / exclusive.rs / ext.rs 例外，C 版没有对应物）
-crates/rskynet/            门面：按 feature 把下面几个拼在一处，使用方只依赖它
-  tests/kernel.rs          端到端测试
-  tests/exclusive.rs       独占线程服务的端到端验证
-  tests/builtins.rs        内置服务与内核的接缝：启动顺序、配置默认值、时间来源
-crates/rskynet-logger/     日志服务，一个独占线程的服务
-crates/rskynet-timer/      分层时间轮与定时器服务
-crates/rskynet-bootstrap/  引导服务
-crates/rskynet-macros/     service / exclusive / msg / signal 过程宏
-crates/rskynet-signal/     进程信号、优雅关停与独立崩溃报告
-crates/rskynet-net/        TCP + UDP 网络层，一个独占线程的服务
-crates/rskynet-tls/        基于 rustls、复用 net 的双向 TLS 协议服务
-crates/rskynet-http/       HTTP/1.1 客户端/服务端及可选 WebSocket
-crates/rskynet-dashboard/  节点统计 API 与内嵌 Dashboard
-crates/rskynet-cluster/    可选的 Protobuf 跨节点通信层
-examples/                  本地与跨节点 Ping / Pong / Echo 示例
+```bash
+cargo run -p rskynet-examples -- config/examples/cluster_ping.toml
 ```
 
-使用方只写一行依赖，要什么按 feature 开：
+node 1 会向 node 2 完成 10 次 Protobuf ping/pong，并请求两个节点退出。
+
+## 编写服务
+
+通常只需依赖门面 crate `rskynet`。从仓库路径开发时可这样配置：
 
 ```toml
-rskynet = { version = "0.1", features = ["net"] }   # macros / logger / timer / bootstrap / signal / main 默认已开
-rskynet = { version = "0.1", features = ["tls"] }   # TLS 会隐含启用 net
-rskynet = { version = "0.1", features = ["http"] }  # 明文 HTTP/1.1
-rskynet = { version = "0.1", features = ["dashboard"] } # 节点统计页面与 JSON API
-rskynet = { version = "0.1", features = ["https"] } # HTTP + TLS
-rskynet = { version = "0.1", features = ["websocket"] } # ws 客户端与服务端
-rskynet = { version = "0.1", features = ["websocket", "https"] } # ws + wss
+[dependencies]
+rskynet = { path = "path/to/rskynet/crates/rskynet" }
 ```
 
-业务代码不需要放进本仓：`rskynet` 是 lib crate，对外提供 `Service` trait 与 `rskynet::start(config, registry)`，使用方在自己的 app crate 里写 `main` 并注册服务——对应 skynet 里「内核是宿主、服务是外挂模块」的形态。
-
-服务也可以选择链接期自动注册。给服务宏写上 `name`，默认用 `Default` 创建实例；
-特殊构造函数可通过 `factory` 指定：
+定义一个具名服务：
 
 ```rust
+use rskynet::{Ctx, Error, MsgType, Result};
+
 #[derive(Default)]
 struct Echo;
 
 #[rskynet::service(name = "echo")]
-impl Echo {}
-```
+impl Echo {
+    async fn init(&self, ctx: Ctx) -> Result<()> {
+        if !ctx.register_name("echo") {
+            return Err(Error::service("名字 .echo 已被占用"));
+        }
+        ctx.log("echo 已启动");
+        Ok(())
+    }
 
-内置的 `logger`、`bootstrap` 和 `net` 都使用这种宏注册；其中 `net` 指定
-`factory = NetService::new`。`timer` 是例外：它的工厂需要捕获一个
-`Arc<WheelTimer>`，而且同一个时钟还要注入内核，无法由无参数的宏工厂独立完成，
-所以仍由 `BuilderExt::with_wheel_timer` 同时注册服务并注入时钟。
+    #[msg(MsgType::USER)]
+    async fn echo(&self, _ctx: Ctx, text: String) -> String {
+        text
+    }
+}
 
-默认启用的 `main` feature 提供标准入口：
-
-```rust
 fn main() -> std::process::ExitCode {
     rskynet::main::run()
 }
 ```
 
-标准入口会自动启动同一可执行文件的隐藏 crash helper。自定义入口要在解析自己的
-参数之前安装，并把 guard 留到进程结束：
+`name = "echo"` 会把服务构造函数提交到链接期注册表。标准入口 `rskynet::main::run()` 会读取唯一的命令行参数作为 TOML 路径，再通过 `Registry::from_auto()` 收集当前二进制中所有具名服务。
 
-```rust
-fn main() -> rskynet::Result<()> {
-    let _crash = rskynet::crash::install()?;
-    // 构造 Config / Registry，随后 rskynet::start(...)
-    Ok(())
-}
-```
-
-这是 fail-fast 的启动契约：`rskynet-core` 不恢复 panic，worker、exclusive、
-`Future::poll`、`Service::dispatch`、`Drop` 或运行时内部的 panic 都按进程级故障
-处理。workspace 的 dev / release profile 统一设置 `panic = "abort"`；普通
-`abort` 仍会执行 panic hook，所以上面的 handler 一定会先记录 PanicMetadata、
-backtrace 并让 helper 生成 dump，随后进程 abort。`cargo test` 的测试 harness
-强制 unwind，因此单元测试仍按测试语义运行。
-
-Unix 的 `SIGINT` 与 `SIGTERM`、Windows 的 Ctrl+C 默认调用 `NodeRef::abort()` 优雅
-关停。属性宏可以覆盖某个信号的默认行为：
-
-```rust
-#[rskynet::signal(SIGTERM)]
-fn on_term(ctx: &rskynet::Ctx) {
-    ctx.abort();
-}
-```
-
-回调固定为同步 `fn(&Ctx)`，在信号服务的独占线程上执行，不在 OS signal handler
-里运行。支持 `SIGINT` / `SIGTERM` / `SIGHUP` / `SIGQUIT` / `SIGUSR1` / `SIGUSR2`；
-致命信号由 crash helper 独占。同一信号只能注册一次，重复会产生同名导出符号并
-让编译失败。panic 或原生崩溃会在 `./crash/` 下生成同名的
-`<pid>-<毫秒时间戳>.log` 与 `.dmp`，文本报告也会打印到 stderr。
-原生访问违规测试默认跳过；需要手动验证时运行：
-
-```bash
-RSKYNET_RUN_NATIVE_CRASH_TEST=1 cargo test -p rskynet-signal --test native-crash
-```
-
-Windows 上等价写法：
-
-```powershell
-$env:RSKYNET_RUN_NATIVE_CRASH_TEST='1'
-cargo test -p rskynet-signal --test native-crash
-```
-
-测试报告固定临时写入 workspace 最外层的
-`<workspace>/crash/rskynet-native-crash-<pid>-<时间戳>/crash/`，不受运行测试时
-当前目录影响。测试成功后自动删除；
-测试失败时保留，便于检查 `.log`、`.dmp` 与 `child.stderr`。
-如需在测试成功后也保留目录，额外设置 `RSKYNET_KEEP_NATIVE_CRASH_TEST_DIR=1`（Windows 上为 `$env:RSKYNET_KEEP_NATIVE_CRASH_TEST_DIR='1'`）。
-
-保留时测试输出会打印临时目录的完整路径；只有变量值严格等于 `1` 才会生效。
-
-它要求命令行提供一份 TOML，并从已经链接进当前二进制的服务中构造注册表。配置
-只能选择启动哪些已链接服务，不能动态加载未成为应用依赖的 Rust crate。仓库内示例：
-
-```bash
-cargo run -p rskynet-examples -- config/examples/ping_pong.toml
-cargo run -p rskynet-examples -- config/examples/echo_server.toml
-cargo run -p rskynet-examples -- config/examples/http.toml
-cargo run -p rskynet-examples -- config/examples/websocket.toml
-```
-
-HTTP 与 WebSocket 示例会各自在随机本地端口启动服务端，由同一进程内的客户端完成
-一次 `POST /echo` 或文本帧回显，打印结果后自动退出。
-
-跨节点 ping/pong 要开两个终端，先启动 node 2 的 pong，再启动 node 1 的 ping：
-
-```bash
-# 终端 1
-cargo run -p rskynet-examples -- config/examples/cluster_pong.toml
-
-# 终端 2
-cargo run -p rskynet-examples -- config/examples/cluster_ping.toml
-```
-
-ping 完成 10 次 Protobuf request/reply 后会请求 pong 关闭，两个示例进程都会自行退出。
-
-### 内核里为什么没有服务
-
-日志、定时器、引导在 C 版都是内核的一部分，这里一个都不在：它们与网络层走同一条接入路子——用 `Registry` 注册类型，在配置里占一段，要独占线程就用 `with_exclusive`。图的和网络层拆出去是同一件事：**内核不碰系统调用**，不碰 epoll、不碰文件 IO、也不碰系统时钟，于是它是纯跨平台的，单元测试跑一条消息不必拉起这些东西。
-
-时间是其中最需要解释的一个。内核里没有时间轮，只有一个 `Timer` trait，实现必须在启动前注入：
-
-```rust
-pub trait Timer: Send + Sync + 'static {
-    fn timeout(&self, handle: Handle, session: u64, delay_ms: u32);
-    fn now(&self) -> u64;
-    fn wall_clock(&self) -> u64;
-    fn start_time(&self) -> u64;
-}
-```
-
-`timeout` / `sleep` 的延迟、`now()` 的相对时间以及 `wall_clock()` / `start_time()` 的 Unix 时间全部以毫秒计。`ctx.sleep()` 是往时间源记一笔账，`ctx.now()` 是问它要个数——都是同步的本地调用，不走消息（日志每写一行都要读时间，走一趟邮箱不划算）。`rskynet-timer` 提供的实现分成配合的两半：**记账**的那一半（`WheelTimer`，注入给内核的就是它）和**推刻度**的那一半（`TimerService`，一个独占线程的服务）。分家的好处是记账那一半在节点建起来之前就存在，于是引导期间挂的表一条都不会丢，哪怕那时推刻度的线程还没上线。
-
-启动顺序是**日志 → 信号 → 定时器 → 可选内置服务 → 引导**，每一步都等待完整
-`init`。可选服务按依赖稳定排序为 `net → tls → http-client → cluster`。日志最先，
-好让后面每一步的岔子都有人记；信号服务在业务服务之前就绪；定时器排在引导之前，
-于是引导期间刻度就在走。启动阶段服务数短暂归零不会提前关停；引导完成标记 booted
-时会重新检查，所以空业务清单仍会正常退出。
-
-内核为此保留四个约定名字（`logger` / `signal` / `timer` / `bootstrap`）与拉起顺序。类型名可以在配置里换成自己的实现，写成空串就是不拉起：
+对应配置：
 
 ```toml
-[logger]
-name = "logger"      # 换成自己的实现时改这里
-path = "run/rskynet.log"
-max_queue = 10000     # 积压超过此数时丢弃较旧日志；0 表示不限制
-[timer]
-name = ""            # 不起定时器服务，自己注入 Timer 实现
+thread = 4
+profile = true
+
+[bootstrap]
+services = [
+    { name = "echo" },
+]
 ```
 
-内置 logger 的邮箱超过 `max_queue` 后会跳过较旧的文本日志，优先追上最新状态；
-积压回落后会先写一条汇总，说明本轮共丢弃了多少条。控制消息不会被丢弃。
+运行：
 
-### 网络层为什么在内核之外
+```bash
+cargo run -- path/to/config.toml
+```
 
-C 版的 socket 线程与内核同住一个编译单元，`skynet_socket_*` 直接碰内部结构。这里把它拆出去，图的是**内核不碰 epoll/kqueue**：内核因此是纯跨平台的，单元测试也不必为了跑一条消息就拉起一套 IO。
+不使用标准入口时，也可以显式构造注册表和配置：
 
-拆出去之后，socket 层进内核的路只有「注册一个独占线程的服务」这一条——它需要的线程就是那条独占线程，需要的配置从 `ctx.node().section("net")` 读，需要投的消息走邮箱，都是服务本来就有的东西。`ext.rs` 只剩两件专供内核之外的线程用的东西：
+```rust
+use rskynet::{Config, ConfigExt, Registry, Result};
 
-| 扩展点 | 作用 | 对应 skynet |
+fn run() -> Result<()> {
+    let registry = Registry::new().with("echo", Echo::default);
+    let config = Config::default().with_bootstrap(["echo"]);
+    rskynet::start(config, registry)
+}
+```
+
+## 消息与并发
+
+常用操作如下：
+
+```rust,ignore
+// 单向投递 USER 消息
+ctx.post(".worker", rskynet::Payload::text("job"))?;
+
+// 请求并等待 RESPONSE / ERROR
+let reply = ctx
+    .request(".worker", rskynet::Payload::text("question"))
+    .await?;
+
+// 在当前服务内启动并发任务
+let task_ctx = ctx.clone();
+ctx.spawn(async move {
+    task_ctx.sleep_ms(100).await;
+    task_ctx.log("done");
+});
+```
+
+服务宏支持两种分发方式：
+
+- 实现 `async fn dispatch(&self, ctx: Ctx, msg: Message)`，自行解析整条消息；
+- 给方法添加 `#[msg(MsgType::...)]`，由宏按协议号解析负载并自动回复返回值。
+
+自定义对象负载可用 `rskynet::boxed_payload!(Type)` 接入 `FromPayload` / `IntoPayload`。需要专用线程时使用 `#[rskynet::exclusive]`，并按需实现同步的 `idle` 和 `interrupt` 钩子。
+
+## 配置与启动顺序
+
+顶层只有两个内核配置项：
+
+```toml
+# 共享 worker 数；默认取系统可用并行度，必须大于 0
+thread = 4
+
+# 是否记录服务消息数与处理耗时；默认 true
+profile = true
+```
+
+其余扩展配置必须写成 TOML section。每个服务通过 `ctx.node().section::<T>("name")` 读取自己的 section；顶层出现未知的普通键会被视为配置错误。
+
+默认 feature 下，节点依次启动 logger、signal、timer 和 bootstrap。可选基础设施由配置段触发，并在 bootstrap 业务服务之前按依赖顺序启动：
+
+```text
+net -> tls -> http-client -> cluster -> dashboard -> bootstrap services
+```
+
+仅会启动实际需要的项。例如存在 `[http-client]` 时会自动启动 HTTP 客户端及其底层 `net`；存在 `[dashboard]` 时会自动启动 Dashboard、HTTP 所需的网络层。不要再把 `net`、`tls`、`http-client`、`cluster` 或 `dashboard` 手工写入 `[bootstrap].services`。
+
+完整配置示例见 [config/dev.toml](config/dev.toml) 和 [config/examples](config/examples)。
+
+## Cargo features
+
+`rskynet` 的默认 features 为 `macros`、`logger`、`timer`、`bootstrap`、`signal` 和 `main`。
+
+| Feature | 能力 | 自动包含 |
 | --- | --- | --- |
-| `NodeRef` | 跨线程投消息、管理节点，并抓取 node/service 观测快照 | `skynet_context_push` + monitor |
-| `ReplyToken` | 一张可以跨线程搬的回执单，别的线程办完活调 `reply`，服务侧那句 `ctx.call_external(…).await` 就醒过来 | socket 线程回一条带 session 的 `PTYPE_RESPONSE` |
+| `macros` | `service`、`exclusive`、`msg`、`signal` 过程宏 | 默认启用 |
+| `logger` | 独占线程日志服务 | 默认启用 |
+| `timer` | 分层时间轮和定时器服务 | 默认启用 |
+| `bootstrap` | 按 TOML 清单顺序启动业务服务 | 默认启用 |
+| `signal` | 信号处理、优雅关停和崩溃报告 | 默认启用 |
+| `main` | 标准 TOML 命令行入口 | 默认启用 |
+| `net` | TCP/UDP socket 服务 | — |
+| `tls` | 基于 rustls 的 TLS 服务 | `net` |
+| `http` | HTTP/1.1 客户端与可嵌入服务端 | `net` |
+| `https` | HTTPS 客户端和 TLS 服务端传输 | `http`、`tls` |
+| `websocket` | WebSocket 客户端及服务端升级 | `http` |
+| `dashboard` | 节点统计 API 和内嵌 Web UI | `http` |
+| `cluster` | Protobuf 跨节点通信 | `net`、`bootstrap` |
 
-于是网络层写起来是这样的：socket 服务用 `with_exclusive` 注册，它的 `idle` 就是 `poll.poll(events, None)`，`interrupt` 敲 mio 的 `Waker`；业务服务的 `listen` / `connect` / `send` / `close` 是发给它的消息，办完由它 `reply`，调用方写成一句 `await`；socket 事件以 `MsgType::SOCKET` 投给连接的属主服务，与定时器回包同一条路径。真要再起子线程（比如把阻塞的域名解析挪出去），那条线程靠 `NodeRef` 与 `ReplyToken` 回话。
+例如：
 
-`crates/rskynet/tests/exclusive.rs` 拿一个最小的「轮询器」把这套路整个走了一遍：自定义阻塞、被 `interrupt` 叫醒、外部事件转成消息、被 kill 时线程自己退掉、关停时积压的消息一条不丢。
-
-## 测试
-
-```bash
-cargo test                                   # 单元测试 + 端到端测试
-cargo test --release -- --ignored            # 压测（单服务吞吐 + 两个调度吞吐）
-cargo run -p rskynet-examples -- config/examples/ping_pong.toml  # 示例
+```toml
+[dependencies]
+rskynet = {
+    path = "path/to/rskynet/crates/rskynet",
+    features = ["https", "websocket", "dashboard", "cluster"]
+}
 ```
 
-几个压测跑在同一个进程里会互相干扰，要单独看某一个的读数就加上用例名：
+如果关闭默认 features，必须自行提供被移除部分的职责。尤其是没有 `timer` 时，需通过 `Builder` 注入一个 `Timer` 实现；没有 `bootstrap` 时，需自行安排首个业务服务的启动。
+
+## Workspace 组成
+
+| Crate | 职责 |
+| --- | --- |
+| `rskynet` | 门面 crate、feature 组合、标准入口和自动基础设施启动 |
+| `rskynet-core` | Actor 内核、邮箱、调度器、Future 任务、session、配置与生命周期 |
+| `rskynet-macros` | 服务、独占服务、消息、信号和集群过程宏 |
+| `rskynet-bootstrap` | 按配置清单顺序启动业务服务 |
+| `rskynet-logger` | 独占线程日志写入 |
+| `rskynet-timer` | 10 ms 分层时间轮及定时器服务 |
+| `rskynet-signal` | 进程信号、优雅关停、崩溃日志和 minidump |
+| `rskynet-net` | 基于 `mio` 的 TCP/UDP 网络服务 |
+| `rskynet-tls` | 基于 `rustls`、运行于 `rskynet-net` 之上的 TLS 服务 |
+| `rskynet-http` | HTTP/1.1 客户端、服务端驱动和可选 WebSocket |
+| `rskynet-dashboard` | 节点及 socket 统计 API、内嵌 Dashboard |
+| `rskynet-cluster` | Prost 消息编码、节点连接和跨节点请求/应答 |
+
+## 运行时模型
+
+```mermaid
+flowchart LR
+    A[其他服务或外部事件] --> M[服务邮箱]
+    M --> Q[可运行服务队列]
+    W[Future 被唤醒] --> T[服务就绪任务队列]
+    T --> Q
+    Q --> P[共享 worker 池]
+    P --> S[Service]
+    S -->|request + session| M2[目标服务邮箱]
+    M2 -->|response + session| M
+    X[独占服务线程] -->|网络、定时器、日志事件| M
+```
+
+共享服务由 worker 池调度，空闲 worker 会从其他 worker 的运行队列窃取工作。邮箱和就绪任务共同决定一个服务是否可运行；调度器保证服务不会被并发执行。日志、定时器和网络服务使用独占线程，但仍通过普通地址、邮箱和消息参与节点生命周期。
+
+## 开发与验证
 
 ```bash
-cargo test --release --test kernel scheduling_throughput -- --ignored --nocapture
+# 全 workspace 测试
+cargo test --workspace --all-features
+
+# 静态检查
+cargo clippy --workspace --all-targets --all-features
+
+# 生成本地 API 文档
+cargo doc --workspace --all-features --no-deps
 ```
+
+workspace 的 dev/release profile 均使用 `panic = "abort"`。标准入口会在读取配置前安装崩溃处理器；如果编写自定义入口并启用了 `signal`，应首先调用 `rskynet::crash::install()`，并让返回的 guard 存活到进程结束。
+
+## License
+
+各 crate 的 Cargo manifest 声明为 MIT License。

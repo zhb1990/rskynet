@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 use rskynet_core::{BoxFuture, Ctx, Message, MsgType, Payload, Service, SvcCell, boxed_payload};
 use rskynet_net::SocketEvent;
@@ -19,10 +20,15 @@ use crate::transport::TransportId;
 use crate::{HttpError, Result};
 
 pub const NAME: &str = "http-client";
+static NEXT_START_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 enum Command {
-    Start(Request<BodySpec>),
+    Start {
+        token: u64,
+        alive: Weak<()>,
+        request: Request<BodySpec>,
+    },
     Write {
         id: u64,
         chunk: Vec<u8>,
@@ -31,6 +37,8 @@ enum Command {
     Response(u64),
     Next(u64),
     Cancel(u64),
+    CancelStart(u64),
+    ConfirmStart(u64),
     ContinueTimeout(u64),
     WaitTimeout {
         id: u64,
@@ -42,6 +50,8 @@ enum Command {
         generation: u64,
     },
     ResumeStart {
+        token: u64,
+        alive: Weak<()>,
         pending: Pending,
         request: Request<BodySpec>,
     },
@@ -148,7 +158,8 @@ struct State {
     active: HashMap<TransportId, u64>,
     origins: HashMap<TransportId, Origin>,
     idle: HashMap<Origin, VecDeque<TransportId>>,
-    pending_starts: VecDeque<(Pending, Request<BodySpec>)>,
+    pending_starts: VecDeque<(u64, Weak<()>, Pending, Request<BodySpec>)>,
+    start_tokens: HashMap<u64, u64>,
     connecting: HashMap<Origin, usize>,
     idle_generation: HashMap<TransportId, u64>,
     next_idle_generation: u64,
@@ -239,7 +250,14 @@ impl Service for HttpClientService {
 impl HttpClientService {
     async fn on_command(&self, ctx: &Ctx, pending: Pending, command: Command) {
         match command {
-            Command::Start(request) => self.start_exchange(ctx, pending, request).await,
+            Command::Start {
+                token,
+                alive,
+                request,
+            } => {
+                self.start_exchange(ctx, token, alive, pending, request)
+                    .await
+            }
             Command::Write { id, chunk } => {
                 let Some(chunk) = self.defer_continue_write(ctx, pending, id, chunk).await else {
                     return;
@@ -257,23 +275,45 @@ impl HttpClientService {
                 self.cancel(ctx, id, "exchange 已取消");
                 reply(ctx, pending, Answer::Done);
             }
+            Command::CancelStart(token) => self.cancel_start(ctx, token),
+            Command::ConfirmStart(token) => {
+                self.state.borrow_mut().start_tokens.remove(&token);
+            }
             Command::ContinueTimeout(id) => self.continue_timeout(ctx, id).await,
             Command::WaitTimeout { id, session, body } => self.wait_timeout(ctx, id, session, body),
             Command::IdleTimeout {
                 transport,
                 generation,
             } => self.idle_timeout(ctx, transport, generation),
-            Command::ResumeStart { pending, request } => {
-                self.start_exchange(ctx, pending, request).await
+            Command::ResumeStart {
+                token,
+                alive,
+                pending,
+                request,
+            } => {
+                self.start_exchange(ctx, token, alive, pending, request)
+                    .await
             }
         }
     }
 
-    async fn start_exchange(&self, ctx: &Ctx, pending: Pending, request: Request<BodySpec>) {
+    async fn start_exchange(
+        &self,
+        ctx: &Ctx,
+        token: u64,
+        alive: Weak<()>,
+        pending: Pending,
+        request: Request<BodySpec>,
+    ) {
+        if alive.upgrade().is_none() {
+            self.wake_queued(ctx);
+            return;
+        }
         let origin_hint = match Origin::from_uri(request.uri()) {
             Ok(value) => value,
             Err(error) => {
                 reply(ctx, pending, Answer::Failed(error));
+                self.wake_queued(ctx);
                 return;
             }
         };
@@ -281,19 +321,21 @@ impl HttpClientService {
             self.state
                 .borrow_mut()
                 .pending_starts
-                .push_back((pending, request));
+                .push_back((token, alive, pending, request));
             return;
         }
         let (mut parts, spec) = request.into_parts();
         parts.version = Version::HTTP_11;
         if let Err(error) = apply_body_headers(&mut parts.headers, spec) {
             reply(ctx, pending, Answer::Failed(error));
+            self.wake_queued(ctx);
             return;
         }
         let origin = match Origin::from_uri(&parts.uri) {
             Ok(v) => v,
             Err(e) => {
                 reply(ctx, pending, Answer::Failed(e));
+                self.wake_queued(ctx);
                 return;
             }
         };
@@ -302,6 +344,7 @@ impl HttpClientService {
             Ok(v) => v,
             Err(e) => {
                 reply(ctx, pending, Answer::Failed(e.into()));
+                self.wake_queued(ctx);
                 return;
             }
         };
@@ -313,12 +356,19 @@ impl HttpClientService {
                 return;
             }
         };
+        if alive.upgrade().is_none() {
+            transport.shutdown(ctx);
+            self.forget_transport(transport);
+            self.wake_queued(ctx);
+            return;
+        }
         let send = match serialize_request(call.proceed(), self.config.borrow().max_header_size) {
             Ok(v) => v,
             Err(e) => {
                 transport.shutdown(ctx);
                 self.forget_transport(transport);
                 reply(ctx, pending, Answer::Failed(e));
+                self.wake_queued(ctx);
                 return;
             }
         };
@@ -327,6 +377,7 @@ impl HttpClientService {
             state.next_id = state.next_id.wrapping_add(1).max(1);
             let id = state.next_id;
             state.active.insert(transport, id);
+            state.start_tokens.insert(token, id);
             state.exchanges.insert(
                 id,
                 Exchange {
@@ -360,6 +411,10 @@ impl HttpClientService {
             reply(ctx, pending, Answer::Failed(error));
             return;
         }
+        if alive.upgrade().is_none() {
+            self.cancel(ctx, id, "exchange 启动已取消");
+            return;
+        }
         if matches!(
             self.state
                 .borrow()
@@ -380,6 +435,21 @@ impl HttpClientService {
             });
         }
         reply(ctx, pending, Answer::Id(id));
+    }
+
+    fn cancel_start(&self, ctx: &Ctx, token: u64) {
+        let id = {
+            let mut state = self.state.borrow_mut();
+            state
+                .pending_starts
+                .retain(|(queued, _, _, _)| *queued != token);
+            state.start_tokens.remove(&token)
+        };
+        if let Some(id) = id {
+            self.cancel(ctx, id, "exchange 启动已取消");
+        } else {
+            self.wake_queued(ctx);
+        }
     }
 
     async fn acquire(&self, ctx: &Ctx, origin: &Origin) -> Result<TransportId> {
@@ -905,10 +975,6 @@ impl HttpClientService {
                         }
                     },
                     Proto::RecvResponse(mut call) => {
-                        if exchange.input.len() > self.config.borrow().max_header_size {
-                            exchange.error = Some("响应头超过上限".into());
-                            break;
-                        }
                         match call.try_response(&exchange.input, false) {
                             Ok((used, Some(response))) => {
                                 exchange.input.drain(..used);
@@ -942,7 +1008,11 @@ impl HttpClientService {
                                 continue;
                             }
                             Ok(_) => {
-                                exchange.proto = Some(Proto::RecvResponse(call));
+                                if exchange.input.len() > self.config.borrow().max_header_size {
+                                    exchange.error = Some("响应头超过上限".into());
+                                } else {
+                                    exchange.proto = Some(Proto::RecvResponse(call));
+                                }
                                 break;
                             }
                             Err(e) => {
@@ -1049,6 +1119,7 @@ impl HttpClientService {
         let id = self.state.borrow_mut().active.remove(&transport);
         self.forget_transport(transport);
         let Some(id) = id else {
+            self.wake_queued(ctx);
             return;
         };
         let close_delimited = {
@@ -1131,6 +1202,9 @@ impl HttpClientService {
             let Some(mut exchange) = state.exchanges.remove(&id) else {
                 return;
             };
+            state
+                .start_tokens
+                .retain(|_, exchange_id| *exchange_id != id);
             exchange.error = Some(reason.into());
             exchange.body_ended = true;
             (
@@ -1176,7 +1250,10 @@ impl HttpClientService {
     fn wake_queued(&self, ctx: &Ctx) {
         let job = {
             let mut state = self.state.borrow_mut();
-            let index = state.pending_starts.iter().position(|(_, request)| {
+            state
+                .pending_starts
+                .retain(|(_, alive, _, _)| alive.upgrade().is_some());
+            let index = state.pending_starts.iter().position(|(_, _, _, request)| {
                 Origin::from_uri(request.uri()).is_ok_and(|origin| {
                     if state.idle.get(&origin).is_some_and(|idle| !idle.is_empty()) {
                         return true;
@@ -1194,11 +1271,16 @@ impl HttpClientService {
             });
             index.and_then(|index| state.pending_starts.remove(index))
         };
-        if let Some((pending, request)) = job {
+        if let Some((token, alive, pending, request)) = job {
             let _ = ctx.send(
                 ctx.handle(),
                 MsgType::USER,
-                Payload::of(Command::ResumeStart { pending, request }),
+                Payload::of(Command::ResumeStart {
+                    token,
+                    alive,
+                    pending,
+                    request,
+                }),
             );
         }
     }
@@ -1362,6 +1444,28 @@ pub struct ClientExchange {
     active: bool,
 }
 
+struct StartGuard {
+    token: u64,
+    node: rskynet_core::NodeRef,
+    source: rskynet_core::Handle,
+    dest: rskynet_core::Handle,
+    active: bool,
+}
+
+impl Drop for StartGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.node.send(
+                self.source,
+                self.dest,
+                MsgType::USER,
+                0,
+                Payload::of(Command::CancelStart(self.token)),
+            );
+        }
+    }
+}
+
 impl ClientExchange {
     pub fn id(&self) -> u64 {
         self.id
@@ -1384,16 +1488,46 @@ impl ClientExchange {
 }
 
 pub async fn start(ctx: &Ctx, request: Request<BodySpec>) -> Result<ClientExchange> {
-    match ask(ctx, Command::Start(request)).await? {
-        Answer::Id(id) => Ok(ClientExchange {
-            id,
-            node: ctx.node(),
-            source: ctx.handle(),
-            dest: ctx
-                .query_name(NAME)
-                .ok_or_else(|| HttpError::ServiceUnavailable(NAME.into()))?,
-            active: true,
-        }),
+    let dest = ctx
+        .query_name(NAME)
+        .ok_or_else(|| HttpError::ServiceUnavailable(NAME.into()))?;
+    let alive = Arc::new(());
+    let mut token = NEXT_START_TOKEN.fetch_add(1, Ordering::Relaxed);
+    if token == 0 {
+        token = NEXT_START_TOKEN.fetch_add(1, Ordering::Relaxed);
+    }
+    let mut guard = StartGuard {
+        token,
+        node: ctx.node(),
+        source: ctx.handle(),
+        dest,
+        active: true,
+    };
+    match ask(
+        ctx,
+        Command::Start {
+            token,
+            alive: Arc::downgrade(&alive),
+            request,
+        },
+    )
+    .await?
+    {
+        Answer::Id(id) => {
+            ctx.send(
+                dest,
+                MsgType::USER,
+                Payload::of(Command::ConfirmStart(token)),
+            )?;
+            guard.active = false;
+            Ok(ClientExchange {
+                id,
+                node: ctx.node(),
+                source: ctx.handle(),
+                dest,
+                active: true,
+            })
+        }
         _ => Err(HttpError::ServiceUnavailable("启动应答错误".into())),
     }
 }

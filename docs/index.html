@@ -1,1853 +1,688 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>rskynet 架构说明</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&family=Noto+Sans+SC:wght@400;500;600;700&family=Syne:wght@600;700;800&display=swap" rel="stylesheet">
+  <meta name="description" content="rskynet 架构导览：从一次消息投递理解 Actor 内核、调度器、服务层与协议层。">
+  <title>rskynet — Actor 运行时解剖图</title>
   <style>
     :root {
-      --deck: #E4EAF0;
-      --paper: #F5F8FB;
-      --ink: #122033;
-      --slate: #3D5168;
-      --muted: #5B6E82;
-      --rule: #B7C4D2;
-      --line: #8A9AAB;
-      --amber: #C45C12;
-      --amber-soft: #F4DCC8;
-      --oxide: #0B6E7A;
-      --oxide-soft: #C8E4E7;
-      --idle: #D7DEE6;
-      --ok: #1F6B4A;
-      --ok-soft: #CDE6D8;
-      --focus: #0B6E7A;
-      --shadow: 0 1px 0 rgba(18, 32, 51, 0.06);
-      --display: "Syne", "Noto Sans SC", sans-serif;
-      --text: "Noto Sans SC", "IBM Plex Mono", sans-serif;
-      --mono: "IBM Plex Mono", ui-monospace, monospace;
-      --max: 1120px;
-      --gutter: clamp(16px, 3vw, 32px);
+      --paper: #edf3f5;
+      --paper-deep: #dfe9ec;
+      --ink: #102a35;
+      --muted: #58717a;
+      --line: #a9bbc0;
+      --navy: #123f52;
+      --pulse: #d56a35;
+      --wake: #168c88;
+      --remote: #7057a8;
+      --white: #f9fcfc;
+      --shadow: 0 18px 50px rgba(20, 55, 67, .10);
+      --display: "Arial Narrow", "Avenir Next Condensed", "PingFang SC", sans-serif;
+      --body: "Avenir Next", "PingFang SC", "Microsoft YaHei", sans-serif;
+      --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      --max: 1240px;
     }
-
     * { box-sizing: border-box; }
-    html { scroll-behavior: smooth; }
-    @media (prefers-reduced-motion: reduce) {
-      html { scroll-behavior: auto; }
-      *, *::before, *::after {
-        animation: none !important;
-        transition: none !important;
-      }
-    }
-
+    html { scroll-behavior: smooth; scroll-padding-top: 82px; }
     body {
       margin: 0;
-      background: var(--deck);
       color: var(--ink);
-      font-family: var(--text);
+      background:
+        linear-gradient(rgba(18, 63, 82, .035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(18, 63, 82, .035) 1px, transparent 1px),
+        var(--paper);
+      background-size: 24px 24px;
+      font-family: var(--body);
+      line-height: 1.7;
       font-size: 16px;
-      line-height: 1.65;
-      font-feature-settings: "palt" 1;
+      overflow-x: hidden;
     }
+    a { color: inherit; }
+    button, a { -webkit-tap-highlight-color: transparent; }
+    :focus-visible { outline: 3px solid var(--pulse); outline-offset: 4px; }
+    .skip { position: fixed; z-index: 100; left: 16px; top: -80px; padding: 10px 16px; background: var(--ink); color: white; }
+    .skip:focus { top: 16px; }
 
-    a { color: var(--oxide); text-underline-offset: 3px; }
-    a:hover { color: var(--ink); }
-    code {
-      font-family: var(--mono);
-      font-size: 0.86em;
-      background: color-mix(in srgb, var(--oxide-soft) 55%, var(--paper));
-      padding: 0.08em 0.32em;
-      overflow-wrap: anywhere;
+    .topbar {
+      position: sticky; z-index: 40; top: 0;
+      height: 64px; display: flex; align-items: center;
+      border-bottom: 1px solid rgba(18, 63, 82, .22);
+      background: rgba(237, 243, 245, .88); backdrop-filter: blur(16px);
     }
-    :focus-visible {
-      outline: 2px solid var(--focus);
-      outline-offset: 3px;
-    }
+    .topbar-inner { width: min(calc(100% - 40px), var(--max)); margin: auto; display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+    .brand { display: flex; align-items: center; gap: 11px; text-decoration: none; font: 800 18px/1 var(--mono); letter-spacing: -.04em; }
+    .brand-mark { width: 29px; height: 29px; position: relative; border: 2px solid var(--navy); transform: rotate(45deg); }
+    .brand-mark::before, .brand-mark::after { content: ""; position: absolute; background: var(--pulse); border-radius: 50%; width: 6px; height: 6px; }
+    .brand-mark::before { left: 3px; top: 3px; }
+    .brand-mark::after { right: 3px; bottom: 3px; }
+    .topnav { display: flex; gap: 4px; align-items: center; }
+    .topnav a { padding: 8px 11px; color: var(--muted); text-decoration: none; font-size: 13px; border-radius: 3px; }
+    .topnav a:hover, .topnav a.active { color: var(--navy); background: rgba(18, 63, 82, .08); }
+    .repo-link { border: 1px solid var(--navy); color: var(--navy) !important; margin-left: 8px; }
 
-    .skip {
-      position: absolute;
-      left: 12px;
-      top: -48px;
-      background: var(--ink);
-      color: var(--paper);
-      padding: 8px 12px;
-      z-index: 20;
-    }
-    .skip:focus { top: 12px; }
+    main { position: relative; }
+    .wrap { width: min(calc(100% - 40px), var(--max)); margin-inline: auto; }
+    .hero { min-height: calc(100vh - 64px); display: grid; align-items: center; padding: 58px 0 70px; position: relative; overflow: hidden; }
+    .hero::after { content: "RUNTIME / RUST 2024"; position: absolute; right: -32px; top: 50%; transform: rotate(90deg) translateX(50%); transform-origin: right bottom; color: rgba(18,63,82,.32); font: 11px/1 var(--mono); letter-spacing: .18em; }
+    .hero-grid { display: grid; grid-template-columns: minmax(0, .82fr) minmax(500px, 1.18fr); gap: clamp(36px, 6vw, 90px); align-items: center; }
+    .kicker { display: flex; align-items: center; gap: 12px; color: var(--pulse); font: 700 11px/1 var(--mono); letter-spacing: .17em; text-transform: uppercase; }
+    .kicker::before { content: ""; width: 32px; height: 2px; background: currentColor; }
+    h1, h2, h3 { margin: 0; text-wrap: balance; }
+    h1 { margin-top: 24px; max-width: 680px; font: 800 clamp(54px, 7.5vw, 104px)/.86 var(--display); letter-spacing: -.065em; color: var(--navy); }
+    h1 span { display: block; color: transparent; -webkit-text-stroke: 1.8px var(--navy); }
+    .hero-copy { margin: 30px 0 0; max-width: 570px; color: var(--muted); font-size: clamp(16px, 1.4vw, 19px); }
+    .hero-actions { margin-top: 30px; display: flex; flex-wrap: wrap; gap: 12px; }
+    .button { min-height: 44px; display: inline-flex; align-items: center; justify-content: center; gap: 10px; padding: 0 17px; border: 1px solid var(--navy); background: var(--navy); color: var(--white); text-decoration: none; font: 700 13px/1 var(--body); cursor: pointer; }
+    .button.secondary { color: var(--navy); background: transparent; }
+    .button:hover { transform: translateY(-2px); box-shadow: 0 8px 20px rgba(18, 63, 82, .15); }
+    .hero-note { margin-top: 24px; display: flex; gap: 18px; color: var(--muted); font: 11px/1.4 var(--mono); }
 
-    .rail {
-      position: sticky;
-      top: 0;
-      z-index: 8;
-      background: color-mix(in srgb, var(--deck) 88%, white);
-      backdrop-filter: blur(10px);
-      border-bottom: 1px solid var(--rule);
-    }
-    .rail-inner {
-      max-width: var(--max);
-      margin: 0 auto;
-      padding: 10px var(--gutter);
-      display: flex;
-      align-items: center;
-      gap: 18px;
-      min-width: 0;
-    }
-    .mark {
-      font-family: var(--display);
-      font-weight: 800;
-      letter-spacing: -0.04em;
-      font-size: 18px;
-      flex: 0 0 auto;
-    }
-    .mark span { color: var(--oxide); }
-    .handle-chip {
-      font-family: var(--mono);
-      font-size: 12px;
-      color: var(--oxide);
-      border: 1px solid var(--oxide-soft);
-      background: var(--paper);
-      padding: 2px 8px;
-      flex: 0 0 auto;
-    }
-    .toc {
-      display: flex;
-      gap: 4px 14px;
-      flex-wrap: wrap;
-      min-width: 0;
-      margin-left: auto;
-      justify-content: flex-end;
-    }
-    .toc a {
-      font-family: var(--mono);
-      font-size: 11px;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-      text-decoration: none;
-      color: var(--slate);
-    }
-    .toc a:hover, .toc a[aria-current="true"] { color: var(--ink); }
+    .runtime-console { position: relative; min-width: 0; overflow: hidden; background: rgba(249,252,252,.76); border: 1px solid var(--line); box-shadow: var(--shadow); }
+    .console-bar { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 50px; padding: 8px 14px 8px 18px; border-bottom: 1px solid var(--line); }
+    .console-label { font: 700 11px/1 var(--mono); letter-spacing: .08em; color: var(--muted); }
+    .mode-switch { display: flex; gap: 4px; }
+    .mode-switch button { border: 0; padding: 8px 10px; background: transparent; color: var(--muted); font: 700 11px/1 var(--mono); cursor: pointer; }
+    .mode-switch button[aria-pressed="true"] { background: var(--navy); color: white; }
+    .runtime-stage { position: relative; aspect-ratio: 1.13; min-height: 430px; overflow: hidden; }
+    .runtime-stage svg { width: 100%; height: 100%; display: block; }
+    .runtime-stage .mode-layer { opacity: 0; visibility: hidden; transition: opacity .28s ease; }
+    .runtime-stage .mode-layer.active { opacity: 1; visibility: visible; }
+    .runtime-stage .route { fill: none; stroke: var(--pulse); stroke-width: 2.4; stroke-dasharray: 7 7; animation: route 1.2s linear infinite; }
+    .runtime-stage .route.response-route { stroke: var(--wake); }
+    .runtime-stage .route.remote-route { stroke: var(--remote); }
+    .runtime-stage .node rect { fill: var(--white); stroke: var(--navy); stroke-width: 1.5; }
+    .runtime-stage .node circle { fill: var(--paper); stroke: var(--navy); }
+    .runtime-stage .mode-layer.active .node rect { filter: drop-shadow(0 3px 5px rgba(20,55,67,.10)); }
+    .runtime-stage text { font-family: var(--body); fill: var(--ink); }
+    .runtime-stage .label { font-size: 12px; font-weight: 750; }
+    .runtime-stage .sub { font-family: var(--mono); font-size: 8px; fill: var(--muted); }
+    .runtime-stage .step { font: 800 8px var(--mono); fill: var(--pulse); }
+    .runtime-stage .mode-note { font: 700 9px var(--mono); fill: var(--muted); letter-spacing: .08em; }
+    .runtime-stage .worker { fill: var(--navy); }
+    .runtime-stage .worker-text { fill: white; font: 700 11px var(--mono); }
+    .pulse-dot { fill: var(--pulse); filter: drop-shadow(0 0 5px rgba(213,106,53,.7)); }
+    .pulse-dot.response { fill: var(--wake); }
+    .pulse-dot.remote { fill: var(--remote); }
+    .console-readout { min-height: 84px; padding: 16px 18px; border-top: 1px solid var(--line); display: grid; grid-template-columns: 76px 1fr; gap: 14px; align-items: start; }
+    .readout-type { color: var(--pulse); font: 800 11px/1.4 var(--mono); text-transform: uppercase; }
+    .readout-copy { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.55; }
 
-    .wrap {
-      max-width: var(--max);
-      margin: 0 auto;
-      padding: 0 var(--gutter) 80px;
-    }
+    .section { padding: 110px 0; border-top: 1px solid rgba(18,63,82,.22); }
+    .section-head { display: grid; grid-template-columns: minmax(180px,.45fr) minmax(0,1.55fr); gap: 40px; margin-bottom: 54px; align-items: start; }
+    .section-tag { color: var(--pulse); font: 700 11px/1.5 var(--mono); letter-spacing: .14em; text-transform: uppercase; }
+    h2 { max-width: 900px; font: 800 clamp(36px, 5vw, 64px)/.98 var(--display); letter-spacing: -.045em; color: var(--navy); }
+    .section-intro { grid-column: 2; max-width: 780px; margin: -20px 0 0; color: var(--muted); font-size: 17px; }
+    h3 { font: 750 23px/1.2 var(--display); letter-spacing: -.02em; color: var(--navy); }
+    .eyebrow { color: var(--muted); font: 700 10px/1 var(--mono); letter-spacing: .1em; text-transform: uppercase; }
 
-    .hero {
-      padding: 36px 0 8px;
-    }
-    .eyebrow {
-      font-family: var(--mono);
-      font-size: 12px;
-      letter-spacing: 0.12em;
-      text-transform: uppercase;
-      color: var(--oxide);
-      margin: 0 0 10px;
-    }
-    .hero h1 {
-      font-family: var(--display);
-      font-weight: 800;
-      font-size: clamp(34px, 6vw, 64px);
-      line-height: 0.95;
-      letter-spacing: -0.045em;
-      margin: 0 0 16px;
-      max-width: 18ch;
-    }
-    .lede {
-      max-width: 62ch;
-      color: var(--slate);
-      margin: 0 0 28px;
-    }
+    .layer-stack { display: grid; gap: 10px; }
+    .layer { display: grid; grid-template-columns: 180px minmax(0,1fr); min-height: 112px; border: 1px solid var(--line); background: rgba(249,252,252,.68); transition: transform .25s, border-color .25s; }
+    .layer:hover { transform: translateX(6px); border-color: var(--navy); }
+    .layer-label { padding: 22px; display: flex; flex-direction: column; justify-content: space-between; background: var(--navy); color: white; }
+    .layer-label b { font: 800 17px/1 var(--display); }
+    .layer-label span { opacity: .65; font: 10px/1 var(--mono); }
+    .layer:nth-child(2) .layer-label { background: #1d5b6b; }
+    .layer:nth-child(3) .layer-label { background: #297477; }
+    .layer:nth-child(4) .layer-label { background: #6a648b; }
+    .layer-body { padding: 20px 24px; display: grid; grid-template-columns: repeat(auto-fit, minmax(145px,1fr)); gap: 10px; align-content: center; }
+    .module-pill { min-width: 0; border-left: 3px solid var(--pulse); padding: 8px 10px; background: var(--paper); }
+    .module-pill b { display: block; font: 700 13px/1.3 var(--mono); overflow-wrap: anywhere; }
+    .module-pill small { display: block; margin-top: 5px; color: var(--muted); font-size: 11px; line-height: 1.35; }
 
-    .instrument {
-      background: var(--paper);
-      border: 1px solid var(--rule);
-      box-shadow: var(--shadow);
-      overflow: hidden;
-    }
-    .inst-head {
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      align-items: baseline;
-      padding: 10px 14px;
-      border-bottom: 1px solid var(--rule);
-      background: color-mix(in srgb, var(--deck) 70%, white);
-      min-width: 0;
-    }
-    .inst-head h2,
-    .plate-head h2 {
-      margin: 0;
-      font-size: 14px;
-      font-weight: 600;
-      letter-spacing: 0.02em;
-    }
-    .dwg {
-      font-family: var(--mono);
-      font-size: 11px;
-      color: var(--muted);
-      white-space: nowrap;
-    }
-    .states {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 10px;
-      padding: 16px 14px 8px;
-    }
-    .state {
-      min-width: 0;
-      min-height: 118px;
-      border: 1px solid var(--rule);
-      background: var(--deck);
-      padding: 10px 10px 12px;
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-      overflow: hidden;
-    }
-    .state strong {
-      font-family: var(--mono);
-      font-size: 13px;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-    }
-    .state p {
-      margin: 0;
-      font-size: 13px;
-      line-height: 1.45;
-      color: var(--slate);
-    }
-    .state.is-live {
-      border-color: var(--amber);
-      background: var(--amber-soft);
-    }
-    .state.is-live strong { color: var(--amber); }
-    .state.is-live p { color: var(--ink); }
-    .inst-foot {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      gap: 10px 16px;
-      padding: 12px 14px 16px;
-      min-width: 0;
-    }
-    .inst-readout {
-      font-family: var(--mono);
-      font-size: 13px;
-      color: var(--ink);
-      flex: 1 1 240px;
-      min-width: 0;
-    }
-    .btn {
-      appearance: none;
-      border: 1px solid var(--ink);
-      background: var(--ink);
-      color: var(--paper);
-      font-family: var(--mono);
-      font-size: 12px;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      padding: 8px 14px;
-      cursor: pointer;
-    }
-    .btn.ghost {
-      background: transparent;
-      color: var(--ink);
-    }
-    .btn:hover { background: var(--oxide); border-color: var(--oxide); color: white; }
-    .btn.ghost:hover { background: var(--oxide-soft); color: var(--ink); border-color: var(--oxide); }
+    .flow-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+    .panel { min-width: 0; border: 1px solid var(--line); background: rgba(249,252,252,.7); box-shadow: 0 10px 30px rgba(20,55,67,.05); }
+    .panel-head { padding: 20px 22px; border-bottom: 1px solid var(--line); display: flex; align-items: end; justify-content: space-between; gap: 16px; }
+    .panel-head p { margin: 0; color: var(--muted); font: 11px/1.4 var(--mono); text-align: right; }
+    .panel-body { padding: 24px; }
+    .flow-list { list-style: none; padding: 0; margin: 0; position: relative; }
+    .flow-list::before { content: ""; position: absolute; left: 16px; top: 18px; bottom: 18px; width: 1px; background: var(--line); }
+    .flow-list li { position: relative; display: grid; grid-template-columns: 34px 1fr; gap: 14px; padding: 0 0 23px; }
+    .flow-list li:last-child { padding-bottom: 0; }
+    .flow-num { z-index: 1; width: 34px; height: 34px; display: grid; place-items: center; border: 1px solid var(--navy); background: var(--paper); color: var(--navy); font: 800 10px var(--mono); }
+    .flow-list b { font-size: 14px; }
+    .flow-list p { margin: 4px 0 0; color: var(--muted); font-size: 12px; line-height: 1.55; }
+    code { font-family: var(--mono); }
+    .token-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 20px; }
+    .token { padding: 14px 10px; text-align: center; background: var(--paper); border: 1px solid var(--line); }
+    .token b { display: block; font: 700 11px var(--mono); }
+    .token small { color: var(--muted); font-size: 10px; }
 
-    .thesis {
-      display: grid;
-      grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
-      gap: 20px;
-      margin: 22px 0 0;
-    }
-    .thesis p { margin: 0 0 10px; }
-    .note {
-      border-left: 3px solid var(--amber);
-      padding: 2px 0 2px 12px;
-      color: var(--slate);
-    }
+    .diagram-scroll { width: 100%; overflow-x: auto; overflow-y: hidden; scrollbar-color: var(--navy) transparent; }
+    .diagram { width: 100%; min-width: 760px; height: auto; display: block; }
+    .diagram text { font-family: var(--body); fill: var(--ink); }
+    .diagram .box { fill: var(--white); stroke: var(--navy); stroke-width: 1.5; }
+    .diagram .box-soft { fill: var(--paper-deep); stroke: var(--line); }
+    .diagram .title { font-size: 15px; font-weight: 750; }
+    .diagram .caption { font-family: var(--mono); font-size: 10px; fill: var(--muted); }
+    .diagram .edge { fill: none; stroke: var(--navy); stroke-width: 1.5; marker-end: url(#arrow); }
+    .diagram .edge-dash { fill: none; stroke: var(--wake); stroke-width: 2; stroke-dasharray: 6 5; marker-end: url(#arrowWake); }
+    .legend { padding: 15px 22px; border-top: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: 18px; color: var(--muted); font-size: 11px; }
+    .legend span::before { content: ""; display: inline-block; width: 19px; height: 2px; background: var(--navy); vertical-align: middle; margin-right: 7px; }
+    .legend span:nth-child(2)::before { background: var(--wake); }
+    .legend span:nth-child(3)::before { background: var(--remote); }
 
-    .doc { margin-top: 56px; }
-    .doc > h2 {
-      font-family: var(--display);
-      font-weight: 800;
-      letter-spacing: -0.04em;
-      font-size: clamp(26px, 4vw, 36px);
-      margin: 0 0 8px;
-    }
-    .doc > .intro {
-      max-width: 70ch;
-      color: var(--slate);
-      margin: 0 0 22px;
-    }
+    .scheduler-board { display: grid; grid-template-columns: 1fr 92px 1fr; gap: 18px; align-items: stretch; }
+    .scheduler-side { min-width: 0; padding: 26px; border: 1px solid var(--line); background: rgba(249,252,252,.72); }
+    .scheduler-side h3 { margin-bottom: 20px; }
+    .mailbox { display: grid; gap: 7px; }
+    .mail { padding: 12px; border: 1px solid var(--line); background: var(--paper); display: flex; justify-content: space-between; gap: 12px; font: 11px/1.4 var(--mono); }
+    .mail em { color: var(--pulse); font-style: normal; }
+    .worker-pool { display: grid; grid-template-columns: repeat(3,1fr); gap: 8px; margin-top: 16px; }
+    .worker-box { min-height: 92px; padding: 12px 8px; background: var(--navy); color: white; text-align: center; }
+    .worker-box b { font: 800 12px var(--mono); }
+    .worker-box span { display: block; margin-top: 9px; opacity: .67; font-size: 10px; line-height: 1.35; }
+    .scheduler-bridge { display: grid; place-items: center; color: var(--pulse); position: relative; }
+    .scheduler-bridge::before { content: ""; width: 100%; height: 2px; background: var(--pulse); position: absolute; top: 50%; }
+    .scheduler-bridge b { z-index: 1; padding: 8px; background: var(--paper); border: 1px solid var(--pulse); font: 800 10px var(--mono); writing-mode: vertical-rl; }
+    .rule-callout { margin-top: 18px; padding: 20px 24px; display: grid; grid-template-columns: auto 1fr; gap: 18px; background: var(--navy); color: white; }
+    .rule-callout strong { font: 800 40px/1 var(--display); color: var(--pulse); }
+    .rule-callout p { margin: 0; font-size: 13px; opacity: .8; }
+    .schedule-trace { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 10px; counter-reset: trace; }
+    .trace-step { position: relative; min-width: 0; min-height: 154px; padding: 20px 18px; border: 1px solid var(--line); background: rgba(249,252,252,.72); counter-increment: trace; }
+    .trace-step::before { content: counter(trace, decimal-leading-zero); display: block; margin-bottom: 18px; color: var(--pulse); font: 800 11px/1 var(--mono); }
+    .trace-step:not(:nth-child(4n))::after { content: ""; position: absolute; z-index: 2; right: -11px; top: 31px; width: 11px; height: 2px; background: var(--pulse); }
+    .trace-step b { display: block; font: 750 14px/1.35 var(--body); }
+    .trace-step p { margin: 8px 0 0; color: var(--muted); font-size: 11px; line-height: 1.55; }
+    .trace-step code { color: var(--navy); font-size: 10px; overflow-wrap: anywhere; }
+    .sched-split { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 18px; }
+    .state-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+    .state-box { min-width: 0; padding: 16px; border: 1px solid var(--line); background: var(--paper); }
+    .state-box.active-state { border-color: var(--pulse); box-shadow: inset 4px 0 var(--pulse); }
+    .state-box b { display: block; color: var(--navy); font: 800 12px/1 var(--mono); }
+    .state-box p { margin: 7px 0 0; color: var(--muted); font-size: 11px; line-height: 1.45; }
+    .transition-list { margin: 18px 0 0; padding: 0; list-style: none; border-top: 1px solid var(--line); }
+    .transition-list li { display: grid; grid-template-columns: 140px 1fr; gap: 12px; padding: 10px 0; border-bottom: 1px solid rgba(169,187,192,.55); color: var(--muted); font-size: 11px; }
+    .transition-list code { color: var(--navy); font-weight: 700; }
+    .worker-order { margin: 0; padding: 0; list-style: none; counter-reset: pickup; display: grid; gap: 7px; }
+    .worker-order li { counter-increment: pickup; position: relative; min-height: 55px; padding: 12px 14px 12px 52px; border: 1px solid var(--line); background: var(--paper); }
+    .worker-order li::before { content: counter(pickup); position: absolute; left: 14px; top: 13px; width: 24px; height: 24px; display: grid; place-items: center; border: 1px solid var(--navy); color: var(--navy); font: 800 10px var(--mono); }
+    .worker-order b { display: block; font: 750 12px/1.3 var(--mono); overflow-wrap: anywhere; }
+    .worker-order small { display: block; margin-top: 4px; color: var(--muted); font-size: 10px; line-height: 1.4; }
+    .loop-chart { display: grid; grid-template-columns: 1fr 42px 1fr 42px 1fr; gap: 8px; align-items: stretch; }
+    .loop-node { min-width: 0; min-height: 112px; padding: 17px; border: 1px solid var(--navy); background: var(--white); }
+    .loop-node.decision { border-color: var(--pulse); background: rgba(213,106,53,.055); }
+    .loop-node.result { color: white; background: var(--navy); }
+    .loop-node b { display: block; font: 750 12px/1.35 var(--mono); overflow-wrap: anywhere; }
+    .loop-node p { margin: 8px 0 0; color: var(--muted); font-size: 10px; line-height: 1.5; }
+    .loop-node.result p { color: rgba(255,255,255,.7); }
+    .loop-arrow { display: grid; place-items: center; color: var(--pulse); font: 800 20px/1 var(--mono); }
+    .loop-branches { display: grid; grid-template-columns: repeat(3,1fr); gap: 8px; margin-top: 8px; }
+    .branch { padding: 14px 16px; border-top: 3px solid var(--wake); background: rgba(249,252,252,.72); }
+    .branch:nth-child(2) { border-color: var(--pulse); }
+    .branch:nth-child(3) { border-color: var(--navy); }
+    .branch b { font: 800 11px/1 var(--mono); }
+    .branch p { margin: 6px 0 0; color: var(--muted); font-size: 10px; line-height: 1.45; }
+    .wakeup-race { display: grid; grid-template-columns: 1fr 64px 1fr; gap: 16px; align-items: stretch; }
+    .race-lane { padding: 20px; border: 1px solid var(--line); background: var(--paper); }
+    .race-lane h3 { font-size: 18px; }
+    .race-lane ol { margin: 16px 0 0; padding-left: 20px; color: var(--muted); font-size: 11px; }
+    .race-lane li { padding: 4px 0; }
+    .race-fence { display: grid; place-items: center; text-align: center; color: var(--pulse); font: 800 9px/1.4 var(--mono); }
+    .constants { display: grid; grid-template-columns: repeat(5,1fr); gap: 8px; margin-top: 18px; }
+    .constant { padding: 14px; border: 1px solid var(--line); background: rgba(249,252,252,.72); }
+    .constant b { display: block; color: var(--pulse); font: 800 19px/1 var(--mono); }
+    .constant span { display: block; margin-top: 7px; color: var(--muted); font-size: 10px; line-height: 1.35; }
 
-    .plate {
-      background: var(--paper);
-      border: 1px solid var(--rule);
-      margin: 0 0 18px;
-      overflow: hidden;
-    }
-    .plate-head {
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      align-items: baseline;
-      padding: 9px 14px;
-      border-bottom: 1px solid var(--rule);
-      background: color-mix(in srgb, var(--deck) 65%, white);
-      min-width: 0;
-    }
-    .plate-body { padding: 14px; overflow: hidden; }
-    .plate-cap {
-      margin: 0;
-      padding: 0 14px 14px;
-      font-size: 13px;
-      color: var(--slate);
-    }
+    .crate-map { display: grid; grid-template-columns: repeat(12, 1fr); gap: 10px; }
+    .crate-card { min-width: 0; padding: 20px; border: 1px solid var(--line); background: rgba(249,252,252,.72); }
+    .crate-card.core { grid-column: span 12; display: grid; grid-template-columns: 1fr 2fr; gap: 26px; background: var(--navy); color: white; border-color: var(--navy); }
+    .crate-card.facade { grid-column: span 12; border: 2px solid var(--pulse); }
+    .crate-card.third { grid-column: span 4; }
+    .crate-card.quarter { grid-column: span 3; }
+    .crate-card h3 { overflow-wrap: anywhere; }
+    .crate-card.core h3 { color: white; }
+    .crate-card p { margin: 10px 0 0; color: var(--muted); font-size: 13px; line-height: 1.55; }
+    .crate-card.core p { color: rgba(255,255,255,.7); }
+    .crate-card .deps { margin-top: 16px; color: var(--pulse); font: 10px/1.5 var(--mono); }
+    .core-parts { display: grid; grid-template-columns: repeat(3,1fr); gap: 7px; align-content: center; }
+    .core-parts span { padding: 9px; border: 1px solid rgba(255,255,255,.2); font: 10px/1.4 var(--mono); text-align: center; }
 
-    .stack {
-      display: grid;
-      gap: 8px;
-    }
-    .layer {
-      min-width: 0;
-      border: 1px solid var(--rule);
-      background: var(--deck);
-      padding: 10px 12px;
-      overflow: hidden;
-    }
-    .layer.core { border-color: var(--ink); background: #dbe3ec; }
-    .layer.facade { border-color: var(--oxide); background: var(--oxide-soft); }
-    .layer-k {
-      font-family: var(--mono);
-      font-size: 11px;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      color: var(--muted);
-      margin-bottom: 6px;
-    }
-    .chips {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-    }
-    .chip {
-      font-family: var(--mono);
-      font-size: 12px;
-      line-height: 1.3;
-      padding: 4px 8px;
-      border: 1px solid var(--rule);
-      background: var(--paper);
-      color: var(--ink);
-      max-width: 100%;
-      overflow: hidden;
-      overflow-wrap: anywhere;
-    }
-    .chip.hot { border-color: var(--amber); background: var(--amber-soft); }
-    .chip.ox { border-color: var(--oxide); background: var(--oxide-soft); }
+    .bootline { display: grid; grid-template-columns: repeat(8, 1fr); position: relative; margin: 40px 0 10px; }
+    .bootline::before { content: ""; position: absolute; left: 5%; right: 5%; top: 22px; height: 2px; background: var(--line); }
+    .boot-step { position: relative; text-align: center; min-width: 0; }
+    .boot-step::before { content: ""; position: relative; z-index: 1; display: block; width: 13px; height: 13px; margin: 16px auto 20px; background: var(--paper); border: 3px solid var(--navy); border-radius: 50%; }
+    .boot-step.optional::before { border-color: var(--pulse); }
+    .boot-step b { display: block; font: 700 10px/1.3 var(--mono); overflow-wrap: anywhere; }
+    .boot-step small { display: block; margin-top: 7px; color: var(--muted); font-size: 10px; line-height: 1.35; }
 
-    .grid-2, .grid-3, .grid-4 {
-      display: grid;
-      gap: 10px;
-      min-width: 0;
-    }
-    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-    .grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .class-layout { display: grid; grid-template-columns: 1.2fr .8fr; gap: 18px; }
+    .class-card { border: 1px solid var(--navy); background: var(--white); min-width: 0; }
+    .class-name { padding: 14px 17px; background: var(--navy); color: white; font: 750 15px/1 var(--mono); }
+    .class-fields, .class-methods { margin: 0; padding: 14px 17px; list-style: none; }
+    .class-fields { border-bottom: 1px solid var(--line); }
+    .class-card li { padding: 4px 0; color: var(--muted); font: 11px/1.45 var(--mono); overflow-wrap: anywhere; }
+    .class-card li::before { content: "+ "; color: var(--pulse); }
+    .class-primary { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .relation-notes { padding: 24px; border: 1px solid var(--line); background: rgba(249,252,252,.7); }
+    .relation-notes dl { margin: 20px 0 0; }
+    .relation-notes dt { color: var(--navy); font: 750 12px/1.5 var(--mono); }
+    .relation-notes dd { margin: 4px 0 18px; color: var(--muted); font-size: 12px; }
 
-    .cell, .uml, .step, .kv {
-      min-width: 0;
-      overflow: hidden;
-      border: 1px solid var(--rule);
-      background: var(--deck);
-      padding: 10px 12px;
-    }
-    .cell h3, .uml h3, .step h3, .kv h3 {
-      margin: 0 0 6px;
-      font-size: 14px;
-      font-weight: 600;
-      overflow-wrap: anywhere;
-    }
-    .cell p, .step p, .kv p {
-      margin: 0;
-      font-size: 13px;
-      line-height: 1.45;
-      color: var(--slate);
-    }
-    .cell.live { border-color: var(--amber); background: var(--amber-soft); }
-    .cell.ox { border-color: var(--oxide); background: var(--oxide-soft); }
-    .cell.ok { border-color: var(--ok); background: var(--ok-soft); }
+    .protocol-lanes { display: grid; gap: 10px; }
+    .lane { display: grid; grid-template-columns: 115px repeat(5, minmax(0,1fr)); border: 1px solid var(--line); min-height: 82px; background: rgba(249,252,252,.65); }
+    .lane-name { padding: 18px; display: grid; place-items: center start; background: var(--navy); color: white; font: 750 12px/1.3 var(--mono); }
+    .lane-cell { position: relative; min-width: 0; padding: 14px 12px; display: grid; align-content: center; border-left: 1px solid var(--line); }
+    .lane-cell:not(:last-child)::after { content: "›"; position: absolute; right: -6px; top: calc(50% - 13px); z-index: 2; color: var(--pulse); font-size: 22px; }
+    .lane-cell b { font-size: 12px; overflow-wrap: anywhere; }
+    .lane-cell small { margin-top: 4px; color: var(--muted); font-size: 10px; line-height: 1.35; }
+    .lane-cell.empty { background: repeating-linear-gradient(135deg, transparent, transparent 6px, rgba(18,63,82,.04) 6px, rgba(18,63,82,.04) 12px); }
 
-    .mono { font-family: var(--mono); }
-    .tiny { font-size: 12px; color: var(--muted); }
-    .label {
-      font-family: var(--mono);
-      font-size: 11px;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-      color: var(--muted);
-      display: block;
-      margin-bottom: 4px;
-    }
+    .code-grid { display: grid; grid-template-columns: 1fr .78fr; gap: 18px; align-items: stretch; }
+    .code-panel { min-width: 0; background: #102a35; color: #d9e7e9; border: 1px solid #102a35; }
+    .code-title { display: flex; justify-content: space-between; padding: 13px 17px; border-bottom: 1px solid rgba(255,255,255,.16); color: #8eb2ba; font: 10px/1 var(--mono); }
+    pre { margin: 0; padding: 22px; overflow: auto; font: 12px/1.7 var(--mono); tab-size: 2; }
+    .kw { color: #80cdc8; } .fn { color: #ef9a6f; } .str { color: #cab9ee; } .cm { color: #78949a; }
+    .config-explain { border: 1px solid var(--line); background: rgba(249,252,252,.7); }
+    .config-row { padding: 18px 20px; border-bottom: 1px solid var(--line); }
+    .config-row:last-child { border-bottom: 0; }
+    .config-row b { display: block; font: 750 12px/1.4 var(--mono); color: var(--navy); }
+    .config-row p { margin: 5px 0 0; color: var(--muted); font-size: 12px; }
 
-    .flow {
-      display: flex;
-      align-items: stretch;
-      gap: 6px;
-      min-width: 0;
-    }
-    .flow > .col {
-      flex: 1 1 0;
-      min-width: 0;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-    }
-    .arrow {
-      flex: 0 0 20px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      color: var(--oxide);
-      user-select: none;
-    }
-    .arrow::before {
-      content: "";
-      width: 8px;
-      height: 8px;
-      border-right: 2px solid var(--oxide);
-      border-bottom: 2px solid var(--oxide);
-      transform: rotate(-45deg);
-    }
-    .arrow.down {
-      flex: 0 0 auto;
-      min-height: 16px;
-      padding: 4px 0;
-    }
-    .arrow.down::before { transform: rotate(45deg); }
-    .vflow { display: grid; gap: 6px; }
+    .truth-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 18px; }
+    .truth { padding: 28px; border-top: 4px solid var(--pulse); background: rgba(249,252,252,.7); }
+    .truth h3 { font-size: 21px; }
+    .truth p { margin: 12px 0 0; color: var(--muted); font-size: 13px; }
+    .truth code { display: inline-block; margin-top: 16px; color: var(--pulse); font-size: 10px; }
 
-    .uml {
-      background: var(--paper);
-      padding: 0;
-    }
-    .uml h3 {
-      margin: 0;
-      padding: 8px 10px;
-      background: var(--ink);
-      color: var(--paper);
-      font-family: var(--mono);
-      font-size: 12px;
-      font-weight: 500;
-      letter-spacing: 0.02em;
-    }
-    .uml.trait h3 { background: var(--oxide); }
-    .uml.enum h3 { background: var(--amber); color: var(--paper); }
-    .uml.priv h3 { background: var(--slate); }
-    .uml ul {
-      list-style: none;
-      margin: 0;
-      padding: 8px 10px;
-      font-family: var(--mono);
-      font-size: 11.5px;
-      line-height: 1.45;
-      color: var(--ink);
-    }
-    .uml ul + ul { border-top: 1px solid var(--rule); }
-    .uml li {
-      overflow-wrap: anywhere;
-      word-break: break-word;
-    }
-    .rel {
-      text-align: center;
-      font-family: var(--mono);
-      font-size: 11px;
-      color: var(--oxide);
-      padding: 2px 0;
-      overflow: hidden;
-    }
+    footer { padding: 54px 0; border-top: 1px solid rgba(18,63,82,.22); background: var(--paper-deep); }
+    .footer-grid { display: grid; grid-template-columns: 1fr auto; gap: 30px; align-items: end; }
+    .footer-title { font: 800 clamp(30px,5vw,62px)/1 var(--display); letter-spacing: -.04em; color: var(--navy); }
+    .footer-copy { margin: 13px 0 0; color: var(--muted); max-width: 650px; }
+    .footer-meta { text-align: right; color: var(--muted); font: 10px/1.7 var(--mono); }
 
-    .compare {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-      gap: 10px;
+    .reveal { opacity: 0; transform: translateY(20px); transition: opacity .65s ease, transform .65s ease; }
+    .reveal.visible { opacity: 1; transform: none; }
+    @keyframes route { to { stroke-dashoffset: -32; } }
+    @media (max-width: 980px) {
+      .topnav a:not(.repo-link) { display: none; }
+      .hero { min-height: auto; }
+      .hero-grid { grid-template-columns: 1fr; }
+      .runtime-console { max-width: 720px; }
+      .flow-grid, .class-layout, .code-grid { grid-template-columns: 1fr; }
+      .schedule-trace { grid-template-columns: repeat(2, minmax(0,1fr)); }
+      .trace-step:not(:nth-child(4n))::after { display: none; }
+      .sched-split { grid-template-columns: 1fr; }
+      .constants { grid-template-columns: repeat(3,1fr); }
+      .crate-card.third { grid-column: span 6; }
+      .crate-card.quarter { grid-column: span 6; }
+      .bootline { grid-template-columns: repeat(4,1fr); row-gap: 26px; }
+      .bootline::before { display: none; }
+      .lane { grid-template-columns: 100px repeat(5, 145px); }
+      .protocol-lanes { overflow-x: auto; }
     }
-
-    table.data {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 13px;
+    @media (max-width: 680px) {
+      .wrap, .topbar-inner { width: min(calc(100% - 28px), var(--max)); }
+      .hero { padding-top: 40px; }
+      .hero::after { display: none; }
+      h1 { font-size: clamp(50px,17vw,78px); }
+      .runtime-stage { min-height: 0; height: 490px; aspect-ratio: auto; overflow: auto; }
+      .runtime-stage svg { width: 560px; max-width: none; height: auto; }
+      .mode-switch button { padding: 8px 7px; }
+      .console-bar { align-items: flex-start; flex-direction: column; }
+      .console-label { padding-top: 5px; }
+      .section { padding: 78px 0; }
+      .section-head { grid-template-columns: 1fr; gap: 16px; margin-bottom: 34px; }
+      .section-intro { grid-column: 1; margin: 0; }
+      .layer { grid-template-columns: 1fr; }
+      .layer-label { min-height: 70px; }
+      .flow-grid { gap: 12px; }
+      .scheduler-board { grid-template-columns: 1fr; }
+      .scheduler-bridge { min-height: 64px; }
+      .scheduler-bridge::before { width: 2px; height: 100%; top: 0; }
+      .scheduler-bridge b { writing-mode: initial; }
+      .schedule-trace { grid-template-columns: 1fr; }
+      .loop-chart { grid-template-columns: 1fr; }
+      .loop-arrow { min-height: 30px; transform: rotate(90deg); }
+      .loop-branches { grid-template-columns: 1fr; }
+      .wakeup-race { grid-template-columns: 1fr; }
+      .race-fence { min-height: 48px; }
+      .constants { grid-template-columns: 1fr 1fr; }
+      .transition-list li { grid-template-columns: 116px 1fr; }
+      .crate-card.core { grid-template-columns: 1fr; }
+      .crate-card.third, .crate-card.quarter { grid-column: span 12; }
+      .core-parts { grid-template-columns: 1fr 1fr; }
+      .bootline { grid-template-columns: repeat(2,1fr); }
+      .class-primary { grid-template-columns: 1fr; }
+      .truth-grid { grid-template-columns: 1fr; }
+      .footer-grid { grid-template-columns: 1fr; }
+      .footer-meta { text-align: left; }
     }
-    table.data th, table.data td {
-      border: 1px solid var(--rule);
-      padding: 7px 9px;
-      text-align: left;
-      vertical-align: top;
-      overflow-wrap: anywhere;
-    }
-    table.data th {
-      background: var(--deck);
-      font-weight: 600;
-      font-size: 12px;
-    }
-    table.data td.mono, table.data th.mono { font-family: var(--mono); font-size: 12px; }
-
-    .wheel {
-      display: grid;
-      grid-template-columns: minmax(0, 1.6fr) repeat(4, minmax(0, 1fr));
-      gap: 8px;
-    }
-    .slot-row {
-      display: grid;
-      grid-template-columns: repeat(8, minmax(0, 1fr));
-      gap: 3px;
-      margin-top: 8px;
-    }
-    .slot {
-      min-width: 0;
-      aspect-ratio: 1.4 / 1;
-      border: 1px solid var(--rule);
-      background: var(--paper);
-      font-family: var(--mono);
-      font-size: 10px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      color: var(--muted);
-    }
-    .slot.on { background: var(--amber-soft); border-color: var(--amber); color: var(--amber); }
-
-    .path {
-      display: grid;
-      gap: 6px;
-    }
-    .path-row {
-      display: grid;
-      grid-template-columns: 92px minmax(0, 1fr);
-      gap: 8px;
-      align-items: stretch;
-    }
-    .path-k {
-      font-family: var(--mono);
-      font-size: 11px;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-      color: var(--muted);
-      display: flex;
-      align-items: center;
-    }
-
-    footer.colophon {
-      margin-top: 48px;
-      padding-top: 16px;
-      border-top: 1px solid var(--rule);
-      font-size: 13px;
-      color: var(--muted);
-    }
-
-    @media (max-width: 900px) {
-      .thesis, .grid-3, .grid-4, .compare {
-        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-      }
-      .wheel, .flow {
-        display: grid;
-        grid-template-columns: minmax(0, 1fr);
-      }
-      .flow > .arrow {
-        min-height: 16px;
-        padding: 4px 0;
-      }
-      .flow > .arrow::before { transform: rotate(45deg); }
-      .states { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .path-row { grid-template-columns: 72px minmax(0, 1fr); }
-    }
-    @media (max-width: 640px) {
-      .toc { display: none; }
-      .thesis, .grid-2, .grid-3, .grid-4, .compare {
-        grid-template-columns: minmax(0, 1fr);
-      }
-      .states { grid-template-columns: minmax(0, 1fr); }
-      .path-row { grid-template-columns: minmax(0, 1fr); }
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+      .reveal { opacity: 1; transform: none; }
     }
   </style>
 </head>
 <body>
-  <a class="skip" href="#layers">跳到正文</a>
-  <header class="rail">
-    <div class="rail-inner">
-      <div class="mark">rs<span>kynet</span></div>
-      <div class="handle-chip">:00000000</div>
-      <nav class="toc" aria-label="章节">
-        <a href="#layers">层级</a>
-        <a href="#kernel">内核</a>
-        <a href="#schedule">调度</a>
-        <a href="#message">消息</a>
-        <a href="#modules">模块</a>
-        <a href="#classes">类图</a>
-        <a href="#life">起停</a>
+  <a class="skip" href="#content">跳到正文</a>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="#top" aria-label="返回顶部"><span class="brand-mark" aria-hidden="true"></span>rskynet</a>
+      <nav class="topnav" aria-label="章节导航">
+        <a href="#layers">层级</a><a href="#message">消息</a><a href="#scheduler">调度</a><a href="#modules">模块</a><a href="#types">类型</a>
+        <a class="repo-link" href="https://github.com/zhb1990/rskynet">GitHub ↗</a>
       </nav>
     </div>
   </header>
 
-  <main class="wrap">
-    <section class="hero">
-      <p class="eyebrow">Actor kernel / no Lua</p>
-      <h1>同一服务，一条线程。</h1>
-      <p class="lede">rskynet 用 Rust 复刻 skynet 的 Actor 内核。服务即 Actor，邮箱是无锁四态机，session 把 <code>call</code> 写成一句 <code>.await</code>。Lua 协程换成 Future 之后，语义一字不差，内核里一个服务都没有。</p>
+  <main id="content">
+    <section class="hero" id="top">
+      <div class="wrap hero-grid">
+        <div>
+          <div class="kicker">Actor runtime anatomy</div>
+          <h1>消息驱动<span>Rust 运行时</span></h1>
+          <p class="hero-copy">rskynet 保留 skynet 的服务、邮箱、地址与 session 模型，用 Rust Future 承载服务内异步流程。沿着一次消息投递，读懂从业务 API 到工作窃取调度器的完整路径。</p>
+          <div class="hero-actions"><a class="button" href="#message">追踪一条消息</a><a class="button secondary" href="#modules">浏览 crate 地图</a></div>
+          <div class="hero-note"><span>Rust 1.85+</span><span>Edition 2024</span><span>MIT</span></div>
+        </div>
 
-      <div class="instrument" id="mailbox-instrument">
-        <div class="inst-head">
-          <h2>邮箱状态机</h2>
-          <span class="dwg">DWG-MQ-01</span>
-        </div>
-        <div class="states" id="states">
-          <article class="state" data-state="idle">
-            <strong>Idle</strong>
-            <p>两条队列都空，服务不在运行队列里。</p>
-          </article>
-          <article class="state" data-state="queued">
-            <strong>Queued</strong>
-            <p>投递方 CAS 成功，由它负责把服务推进运行队列。</p>
-          </article>
-          <article class="state is-live" data-state="running">
-            <strong>Running</strong>
-            <p>唯一持有者。同一时刻不会有第二个 worker 执行它。</p>
-          </article>
-          <article class="state" data-state="notified">
-            <strong>Notified</strong>
-            <p>持有期间又来了新活。投递方不必再入队，消费方复位后重扫。</p>
-          </article>
-        </div>
-        <div class="inst-foot">
-          <p class="inst-readout" id="readout">服务创建时落在 Queued，worker 取走后进入 Running。</p>
-          <button class="btn ghost" type="button" id="reset">复位</button>
-          <button class="btn" type="button" id="step">推进一步</button>
+        <div class="runtime-console" aria-label="交互式消息路径演示">
+          <div class="console-bar">
+            <span class="console-label">LIVE MESSAGE TRACE</span>
+            <div class="mode-switch" role="group" aria-label="选择消息路径">
+              <button data-mode="post" aria-pressed="true">POST</button>
+              <button data-mode="request" aria-pressed="false">REQUEST</button>
+              <button data-mode="remote" aria-pressed="false">REMOTE</button>
+            </div>
+          </div>
+          <div class="runtime-stage">
+            <svg viewBox="0 0 620 540" role="img" aria-labelledby="runtime-title runtime-desc">
+              <title id="runtime-title">rskynet 真实消息运行路径</title><desc id="runtime-desc">POST 模式：消息先写入目标邮箱，由 notify 将服务提交 Scheduler；worker 取得服务后把消息转为 Future 任务，再从 ready 队列取出并 poll。</desc>
+
+              <g class="mode-layer active" data-mode-layer="post">
+                <text class="mode-note" x="28" y="28">LOCAL POST · ONE-WAY DELIVERY</text>
+                <path class="route" d="M111 77 L306 77 L501 77 L501 192 L306 192 L111 192 L111 307 L306 307 L501 307 L501 422"/>
+                <g class="node"><rect x="28" y="48" width="166" height="58"/><text class="step" x="39" y="64">01</text><text class="label" x="50" y="82">调用方 Ctx::post</text><text class="sub" x="50" y="97">resolve destination</text></g>
+                <g class="node"><rect x="223" y="48" width="166" height="58"/><text class="step" x="234" y="64">02</text><text class="label" x="245" y="82">Node::send_raw</text><text class="sub" x="245" y="97">grab ServiceContext</text></g>
+                <g class="node"><rect x="418" y="48" width="166" height="58"/><text class="step" x="429" y="64">03</text><text class="label" x="440" y="82">目标 Mailbox</text><text class="sub" x="440" y="97">push_message first</text></g>
+                <g class="node"><rect x="418" y="163" width="166" height="58"/><text class="step" x="429" y="179">04</text><text class="label" x="440" y="197">notify 状态机</text><text class="sub" x="440" y="212">IDLE → QUEUED</text></g>
+                <g class="node"><rect x="223" y="163" width="166" height="58"/><text class="step" x="234" y="179">05</text><text class="label" x="245" y="197">Scheduler::push</text><text class="sub" x="245" y="212">local / injector / handoff</text></g>
+                <g class="node"><rect x="28" y="163" width="166" height="58"/><text class="step" x="39" y="179">06</text><text class="label" x="50" y="197">worker::pop</text><text class="sub" x="50" y="212">mark RUNNING</text></g>
+                <g class="node"><rect x="28" y="278" width="166" height="58"/><text class="step" x="39" y="294">07</text><text class="label" x="50" y="312">take_work(Message)</text><text class="sub" x="50" y="327">dequeue once</text></g>
+                <g class="node"><rect x="223" y="278" width="166" height="58"/><text class="step" x="234" y="294">08</text><text class="label" x="245" y="312">Service::dispatch</text><text class="sub" x="245" y="327">install Task in TaskSet</text></g>
+                <g class="node"><rect x="418" y="278" width="166" height="58"/><text class="step" x="429" y="294">09</text><text class="label" x="440" y="312">ready queue</text><text class="sub" x="440" y="327">push Ready(TaskId)</text></g>
+                <g class="node"><rect x="418" y="393" width="166" height="58"/><text class="step" x="429" y="409">10</text><text class="label" x="440" y="427">worker poll Future</text><text class="sub" x="440" y="442">Ready or Pending</text></g>
+                <circle class="pulse-dot" r="5"><animateMotion dur="5.2s" repeatCount="indefinite" path="M111 77 L306 77 L501 77 L501 192 L306 192 L111 192 L111 307 L306 307 L501 307 L501 422"/></circle>
+              </g>
+
+              <g class="mode-layer" data-mode-layer="request">
+                <text class="mode-note" x="20" y="28">LOCAL REQUEST · OUTBOUND + RESPONSE + RESUME</text>
+                <path class="route" d="M85 77 L240 77 L395 77 L540 77 L540 189"/>
+                <path class="route response-route" d="M395 189 L240 189 L85 189 L85 301 L240 301 L395 301 L540 301 L540 413 L395 413"/>
+                <g class="node"><rect x="20" y="48" width="130" height="58"/><text class="step" x="29" y="64">01</text><text class="label" x="40" y="82">Ctx::request</text><text class="sub" x="40" y="97">allocate session</text></g>
+                <g class="node"><rect x="175" y="48" width="130" height="58"/><text class="step" x="184" y="64">02</text><text class="label" x="195" y="82">SessionTable</text><text class="sub" x="195" y="97">alloc + construct Call</text></g>
+                <g class="node"><rect x="330" y="48" width="130" height="58"/><text class="step" x="339" y="64">03</text><text class="label" x="350" y="82">目标 Mailbox</text><text class="sub" x="350" y="97">request Message</text></g>
+                <g class="node"><rect x="475" y="48" width="130" height="58"/><text class="step" x="484" y="64">04</text><text class="label" x="495" y="82">Scheduler</text><text class="sub" x="495" y="97">worker gets target</text></g>
+                <g class="node"><rect x="475" y="160" width="130" height="58"/><text class="step" x="484" y="176">05</text><text class="label" x="495" y="194">目标 Task</text><text class="sub" x="495" y="209">dispatch + poll</text></g>
+                <g class="node"><rect x="330" y="160" width="130" height="58"/><text class="step" x="339" y="176">06</text><text class="label" x="350" y="194">Ctx::reply</text><text class="sub" x="350" y="209">RESPONSE same session</text></g>
+                <g class="node"><rect x="175" y="160" width="130" height="58"/><text class="step" x="184" y="176">07</text><text class="label" x="195" y="194">调用方 Mailbox</text><text class="sub" x="195" y="209">push response</text></g>
+                <g class="node"><rect x="20" y="160" width="130" height="58"/><text class="step" x="29" y="176">08</text><text class="label" x="40" y="194">Scheduler</text><text class="sub" x="40" y="209">worker gets caller</text></g>
+                <g class="node"><rect x="20" y="272" width="130" height="58"/><text class="step" x="29" y="288">09</text><text class="label" x="40" y="306">handle reply</text><text class="sub" x="40" y="321">no dispatch Task</text></g>
+                <g class="node"><rect x="175" y="272" width="130" height="58"/><text class="step" x="184" y="288">10</text><text class="label" x="195" y="306">sessions.complete</text><text class="sub" x="195" y="321">store result + wake</text></g>
+                <g class="node"><rect x="330" y="272" width="130" height="58"/><text class="step" x="339" y="288">11</text><text class="label" x="350" y="306">TaskSignal</text><text class="sub" x="350" y="321">false → true once</text></g>
+                <g class="node"><rect x="475" y="272" width="130" height="58"/><text class="step" x="484" y="288">12</text><text class="label" x="495" y="306">ready queue</text><text class="sub" x="495" y="321">RUNNING → NOTIFIED</text></g>
+                <g class="node"><rect x="475" y="384" width="130" height="58"/><text class="step" x="484" y="400">13</text><text class="label" x="495" y="418">same run_service</text><text class="sub" x="495" y="433">take Ready(TaskId)</text></g>
+                <g class="node"><rect x="330" y="384" width="130" height="58"/><text class="step" x="339" y="400">14</text><text class="label" x="350" y="418">Call resumes</text><text class="sub" x="350" y="433">poll → Ready(payload)</text></g>
+                <circle class="pulse-dot" r="5"><animateMotion dur="2.8s" repeatCount="indefinite" path="M85 77 L240 77 L395 77 L540 77 L540 189"/></circle>
+                <circle class="pulse-dot response" r="5"><animateMotion dur="5.4s" repeatCount="indefinite" path="M395 189 L240 189 L85 189 L85 301 L240 301 L395 301 L540 301 L540 413 L395 413"/></circle>
+              </g>
+
+              <g class="mode-layer" data-mode-layer="remote">
+                <text class="mode-note" x="28" y="28">CLUSTER REQUEST · OUTBOUND TO REMOTE HANDLER</text>
+                <path class="route remote-route" d="M111 77 L306 77 L501 77 L501 192 L306 192 L111 192 L111 307 L306 307 L501 307 L501 422 L306 422 L111 422"/>
+                <g class="node"><rect x="28" y="48" width="166" height="58"/><text class="step" x="39" y="64">01</text><text class="label" x="50" y="82">cluster::request</text><text class="sub" x="50" y="97">encode ClusterMessage</text></g>
+                <g class="node"><rect x="223" y="48" width="166" height="58"/><text class="step" x="234" y="64">02</text><text class="label" x="245" y="82">ctx.call("cluster")</text><text class="sub" x="245" y="97">ordinary local request</text></g>
+                <g class="node"><rect x="418" y="48" width="166" height="58"/><text class="step" x="429" y="64">03</text><text class="label" x="440" y="82">Cluster Mailbox</text><text class="sub" x="440" y="97">Scheduler + worker</text></g>
+                <g class="node"><rect x="418" y="163" width="166" height="58"/><text class="step" x="429" y="179">04</text><text class="label" x="440" y="197">ClusterService</text><text class="sub" x="440" y="212">store request_id</text></g>
+                <g class="node"><rect x="223" y="163" width="166" height="58"/><text class="step" x="234" y="179">05</text><text class="label" x="245" y="197">Envelope</text><text class="sub" x="245" y="212">target + TYPE_ID</text></g>
+                <g class="node"><rect x="28" y="163" width="166" height="58"/><text class="step" x="39" y="179">06</text><text class="label" x="50" y="197">net::send</text><text class="sub" x="50" y="212">Command to .net</text></g>
+                <g class="node"><rect x="28" y="278" width="166" height="58"/><text class="step" x="39" y="294">07</text><text class="label" x="50" y="312">NetService</text><text class="sub" x="50" y="327">exclusive mio thread</text></g>
+                <g class="node"><rect x="223" y="278" width="166" height="58"/><text class="step" x="234" y="294">08</text><text class="label" x="245" y="312">TCP length frame</text><text class="sub" x="245" y="327">cross node boundary</text></g>
+                <g class="node"><rect x="418" y="278" width="166" height="58"/><text class="step" x="429" y="294">09</text><text class="label" x="440" y="312">远端 NetService</text><text class="sub" x="440" y="327">SocketEvent</text></g>
+                <g class="node"><rect x="418" y="393" width="166" height="58"/><text class="step" x="429" y="409">10</text><text class="label" x="440" y="427">远端 Cluster</text><text class="sub" x="440" y="442">mailbox + scheduler</text></g>
+                <g class="node"><rect x="223" y="393" width="166" height="58"/><text class="step" x="234" y="409">11</text><text class="label" x="245" y="427">HandlerRegistry</text><text class="sub" x="245" y="442">target + TYPE_ID</text></g>
+                <g class="node"><rect x="28" y="393" width="166" height="58"/><text class="step" x="39" y="409">12</text><text class="label" x="50" y="427">RemoteContext</text><text class="sub" x="50" y="442">poll handler Future</text></g>
+                <circle class="pulse-dot remote" r="5"><animateMotion dur="6.2s" repeatCount="indefinite" path="M111 77 L306 77 L501 77 L501 192 L306 192 L111 192 L111 307 L306 307 L501 307 L501 422 L306 422 L111 422"/></circle>
+              </g>
+            </svg>
+          </div>
+          <div class="console-readout"><span class="readout-type">POST</span><p class="readout-copy">真实路径：先写目标邮箱，再由 notify 把服务提交 Scheduler；worker 取得服务后，Message 先生成 Task，随后 Ready(TaskId) 才触发第一次 Future::poll。</p></div>
         </div>
       </div>
+    </section>
 
-      <div class="thesis">
-        <div>
-          <p>C 版靠一把邮箱锁把「队列已空」和「放生服务」绑在一起。无锁化之后，这两件事必须用四个状态显式绑住，否则会丢活：消费方看见空队列，投递方看见仍在队列里于是不再入队，那条消息从此无人处理。</p>
-          <p class="note">三条纪律：投递先压队列再改状态；入队先改状态再入队；销毁的最后一步才放生。</p>
-        </div>
-        <div>
-          <p>可运行条件从「邮箱非空」推广为「邮箱非空或有就绪任务」。定时器回包、RPC 回包、外部线程唤醒，走同一条路径，由这一个状态机同时管住消息与 Future。</p>
+    <section class="section" id="layers">
+      <div class="wrap">
+        <div class="section-head reveal"><div class="section-tag">System layers</div><h2>四层结构，一条统一的消息通道</h2><p class="section-intro">内核只解决 Actor 身份、邮箱、调度和生命周期。时间、日志、网络乃至跨节点能力都以服务形式接入，所以专用线程与普通业务 Actor 仍共享同一种地址和消息语义。</p></div>
+        <div class="layer-stack reveal">
+          <article class="layer"><div class="layer-label"><b>业务层</b><span>YOUR SERVICES</span></div><div class="layer-body"><div class="module-pill"><b>#[service]</b><small>具名 Actor 与消息分发</small></div><div class="module-pill"><b>Ctx</b><small>post、request、spawn、sleep</small></div><div class="module-pill"><b>Payload</b><small>字节、文本或类型擦除对象</small></div></div></article>
+          <article class="layer"><div class="layer-label"><b>协议层</b><span>OPTIONAL SERVICES</span></div><div class="layer-body"><div class="module-pill"><b>HTTP / WebSocket</b><small>状态机、流式 body、升级</small></div><div class="module-pill"><b>TLS</b><small>rustls 明密文转换</small></div><div class="module-pill"><b>Cluster</b><small>Protobuf 跨节点路由</small></div><div class="module-pill"><b>Dashboard</b><small>节点与 socket 统计</small></div></div></article>
+          <article class="layer"><div class="layer-label"><b>设施层</b><span>EXCLUSIVE ACTORS</span></div><div class="layer-body"><div class="module-pill"><b>Net</b><small>mio Poll 与 TCP/UDP</small></div><div class="module-pill"><b>Timer</b><small>10 ms 分层时间轮</small></div><div class="module-pill"><b>Logger</b><small>独占线程顺序写入</small></div><div class="module-pill"><b>Signal</b><small>关停与崩溃报告</small></div></div></article>
+          <article class="layer"><div class="layer-label"><b>内核层</b><span>RSKYNET-CORE</span></div><div class="layer-body"><div class="module-pill"><b>HandleStorage</b><small>单调递增服务身份</small></div><div class="module-pill"><b>Mailbox</b><small>消息与就绪任务</small></div><div class="module-pill"><b>Scheduler</b><small>工作窃取 worker 池</small></div><div class="module-pill"><b>TaskSet</b><small>Future 与 Waker</small></div><div class="module-pill"><b>SessionTable</b><small>请求/响应配对</small></div></div></article>
         </div>
       </div>
     </section>
 
-    <section class="doc" id="layers">
-      <h2>层级怎么叠</h2>
-      <p class="intro">使用方只依赖门面 crate <code>rskynet</code>。内核不碰 epoll、文件和系统时钟；日志、定时器、网络、TLS、HTTP、集群都是外面的普通服务。</p>
-
-      <figure class="plate">
-        <div class="plate-head"><h2>Crate 分层</h2><span class="dwg">DWG-LAY-01</span></div>
-        <div class="plate-body">
-          <div class="stack">
-            <div class="layer">
-              <div class="layer-k">应用</div>
-              <div class="chips">
-                <span class="chip">examples</span>
-                <span class="chip">业务 crate 自己的 main</span>
-                <span class="chip">TOML 配置</span>
-              </div>
-            </div>
-            <div class="arrow down" aria-hidden="true"></div>
-            <div class="layer facade">
-              <div class="layer-k">门面 rskynet</div>
-              <div class="chips">
-                <span class="chip ox">start / BuilderExt</span>
-                <span class="chip ox">main::run</span>
-                <span class="chip ox">rskynet-macros</span>
-                <span class="chip">按 feature 再导出各服务包</span>
-              </div>
-            </div>
-            <div class="arrow down" aria-hidden="true"></div>
-            <div class="layer">
-              <div class="layer-k">内置服务 全部在内核之外</div>
-              <div class="chips">
-                <span class="chip hot">logger 独占</span>
-                <span class="chip hot">signal 独占</span>
-                <span class="chip hot">timer 独占</span>
-                <span class="chip hot">net 独占</span>
-                <span class="chip">tls</span>
-                <span class="chip">http-client</span>
-                <span class="chip">dashboard</span>
-                <span class="chip">cluster</span>
-                <span class="chip">bootstrap</span>
-              </div>
-            </div>
-            <div class="arrow down" aria-hidden="true"></div>
-            <div class="layer core">
-              <div class="layer-k">内核 rskynet-core</div>
-              <div class="chips">
-                <span class="chip hot">Node</span>
-                <span class="chip">Scheduler / BWoS</span>
-                <span class="chip">Mailbox</span>
-                <span class="chip">HandleStorage</span>
-                <span class="chip">SessionTable</span>
-                <span class="chip">TaskSet</span>
-                <span class="chip">Monitor</span>
-                <span class="chip">Timer 抽象</span>
-              </div>
-            </div>
-            <div class="arrow down" aria-hidden="true"></div>
-            <div class="layer">
-              <div class="layer-k">宿主</div>
-              <div class="chips">
-                <span class="chip">OS 线程 park / unpark</span>
-                <span class="chip">mio poll</span>
-                <span class="chip">rustls</span>
-                <span class="chip">prost</span>
-                <span class="chip">minidump</span>
-              </div>
-            </div>
-          </div>
+    <section class="section" id="message">
+      <div class="wrap">
+        <div class="section-head reveal"><div class="section-tag">Message anatomy</div><h2>一次 request，实际跨过两条队列</h2><p class="section-intro">服务邮箱保存外部消息，TaskSet 的就绪队列保存可继续 poll 的 Future。两者最终都被折叠为“这个服务现在可运行”，因此 RPC 回包、定时器和外部唤醒走同一套调度路径。</p></div>
+        <div class="flow-grid">
+          <article class="panel reveal"><div class="panel-head"><h3>请求路径</h3><p>source → destination</p></div><div class="panel-body"><ol class="flow-list">
+            <li><span class="flow-num">01</span><div><b>分配 session</b><p><code>Ctx::request</code> 在调用方的 SessionTable 创建唯一编号。</p></div></li>
+            <li><span class="flow-num">02</span><div><b>解析目标地址</b><p><code>Addr::Handle</code> 直接定位；<code>Addr::Name</code> 查询节点名称表。</p></div></li>
+            <li><span class="flow-num">03</span><div><b>写入目标邮箱</b><p>Message 带着 source、session、MsgType 与 Payload 入队。</p></div></li>
+            <li><span class="flow-num">04</span><div><b>挂起调用 Future</b><p>Call 返回 Pending，保存 Waker，worker 可以处理其他服务。</p></div></li>
+          </ol><div class="token-row"><div class="token"><b>source</b><small>Handle</small></div><div class="token"><b>session</b><small>u64</small></div><div class="token"><b>mtype</b><small>u8</small></div></div></div></article>
+          <article class="panel reveal"><div class="panel-head"><h3>响应路径</h3><p>destination → source</p></div><div class="panel-body"><ol class="flow-list">
+            <li><span class="flow-num">05</span><div><b>调度目标服务</b><p>邮箱从空变为非空时，只把服务提交一次到运行队列。</p></div></li>
+            <li><span class="flow-num">06</span><div><b>分发并执行</b><p><code>Service::dispatch</code> 解析协议；宏可自动完成负载转换。</p></div></li>
+            <li><span class="flow-num">07</span><div><b>携原 session 回包</b><p>RESPONSE 或 ERROR 被投递回 source，不需要额外回调表。</p></div></li>
+            <li><span class="flow-num">08</span><div><b>唤醒原任务</b><p>SessionTable 取出等待项，把任务推入服务就绪队列继续 poll。</p></div></li>
+          </ol><div class="token-row"><div class="token"><b>RESPONSE</b><small>成功负载</small></div><div class="token"><b>ERROR</b><small>目标失败</small></div><div class="token"><b>Waker</b><small>继续 Future</small></div></div></div></article>
         </div>
-        <p class="plate-cap">越往下越少系统调用。内核只认消息、队列和时间抽象；独占线程服务才去阻塞在自己的事件源上。</p>
-      </figure>
 
-      <figure class="plate">
-        <div class="plate-head"><h2>节点内部切面</h2><span class="dwg">DWG-LAY-02</span></div>
-        <div class="plate-body">
-          <div class="flow">
-            <div class="col">
-              <span class="label">入口</span>
-              <div class="cell ox">
-                <h3>Builder / start</h3>
-                <p>注入 Timer，挂 Registry，按配置决定启动项。</p>
-              </div>
-              <div class="cell">
-                <h3>Registry</h3>
-                <p>类型名到工厂。独占服务同时交出 Exclusive 面孔。</p>
-              </div>
-            </div>
-            <div class="arrow" aria-hidden="true"></div>
-            <div class="col">
-              <span class="label">Node</span>
-              <div class="cell live">
-                <h3>Scheduler</h3>
-                <p>每 worker 一条 BWoS 本地队列，外加 injector 与空闲位图。</p>
-              </div>
-              <div class="cell">
-                <h3>HandleStorage</h3>
-                <p>单调递增、永不复用的 u64。读路径是 ArcSwap 快照。</p>
-              </div>
-              <div class="cell">
-                <h3>Timer</h3>
-                <p>trait 对象。记账在 WheelTimer，推轮在 TimerService。</p>
-              </div>
-            </div>
-            <div class="arrow" aria-hidden="true"></div>
-            <div class="col">
-              <span class="label">每个服务</span>
-              <div class="cell">
-                <h3>ServiceContext</h3>
-                <p>handle、Mailbox、SessionTable、TaskSet、dyn Service。</p>
-              </div>
-              <div class="cell ox">
-                <h3>Ctx</h3>
-                <p>服务视角的 API。Send，但本地接口只能在所有权作用域里调。</p>
-              </div>
-              <div class="cell">
-                <h3>NodeRef / ReplyToken</h3>
-                <p>给内核之外的线程投消息、回话。</p>
-              </div>
-            </div>
-          </div>
-        </div>
-      </figure>
-
-      <figure class="plate">
-        <div class="plate-head"><h2>Feature 与自动启动依赖</h2><span class="dwg">DWG-LAY-03</span></div>
-        <div class="plate-body">
-          <div class="path">
-            <div class="path-row">
-              <div class="path-k">默认开</div>
-              <div class="chips">
-                <span class="chip">macros</span>
-                <span class="chip">logger</span>
-                <span class="chip">timer</span>
-                <span class="chip">bootstrap</span>
-                <span class="chip">signal</span>
-                <span class="chip">main</span>
-              </div>
-            </div>
-            <div class="path-row">
-              <div class="path-k">可选</div>
-              <div class="chips">
-                <span class="chip">net</span>
-                <span class="chip">tls 隐含 net</span>
-                <span class="chip">http</span>
-                <span class="chip">https = http + tls</span>
-                <span class="chip">websocket</span>
-                <span class="chip">dashboard</span>
-                <span class="chip">cluster</span>
-              </div>
-            </div>
-            <div class="path-row">
-              <div class="path-k">配置段</div>
-              <div class="chips">
-                <span class="chip ox">[net]</span>
-                <span class="chip ox">[tls]</span>
-                <span class="chip ox">[http-client]</span>
-                <span class="chip ox">[cluster]</span>
-                <span class="chip ox">[dashboard]</span>
-              </div>
-            </div>
-            <div class="path-row">
-              <div class="path-k">排序</div>
-              <div class="chips">
-                <span class="chip hot">net</span>
-                <span class="chip">tls</span>
-                <span class="chip">http-client</span>
-                <span class="chip">cluster</span>
-                <span class="chip">dashboard</span>
-                <span class="chip">然后才是业务 bootstrap</span>
-              </div>
-            </div>
-          </div>
-        </div>
-        <p class="plate-cap">配置段出现就会自动补依赖并去重，不能再写进 <code>[bootstrap].services</code>。编了段却没开对应 feature，启动直接报错。</p>
-      </figure>
+        <article class="panel reveal" style="margin-top:18px"><div class="panel-head"><h3>请求 / 响应时序</h3><p>session = 42</p></div><div class="diagram-scroll"><svg class="diagram" viewBox="0 0 1000 430" role="img" aria-label="请求响应时序图">
+          <defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#123f52"/></marker><marker id="arrowWake" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#168c88"/></marker></defs>
+          <g><rect class="box" x="40" y="28" width="170" height="55"/><text class="title" x="125" y="52" text-anchor="middle">调用方 Service</text><text class="caption" x="125" y="70" text-anchor="middle">handle :00000001</text><line x1="125" y1="83" x2="125" y2="390" stroke="#a9bbc0" stroke-dasharray="4 5"/></g>
+          <g><rect class="box" x="295" y="28" width="170" height="55"/><text class="title" x="380" y="52" text-anchor="middle">SessionTable</text><text class="caption" x="380" y="70" text-anchor="middle">pending calls</text><line x1="380" y1="83" x2="380" y2="390" stroke="#a9bbc0" stroke-dasharray="4 5"/></g>
+          <g><rect class="box" x="535" y="28" width="170" height="55"/><text class="title" x="620" y="52" text-anchor="middle">目标 Mailbox</text><text class="caption" x="620" y="70" text-anchor="middle">message queue</text><line x1="620" y1="83" x2="620" y2="390" stroke="#a9bbc0" stroke-dasharray="4 5"/></g>
+          <g><rect class="box" x="790" y="28" width="170" height="55"/><text class="title" x="875" y="52" text-anchor="middle">目标 Service</text><text class="caption" x="875" y="70" text-anchor="middle">dispatch</text><line x1="875" y1="83" x2="875" y2="390" stroke="#a9bbc0" stroke-dasharray="4 5"/></g>
+          <path class="edge" d="M125 120 L370 120"/><text class="caption" x="245" y="111" text-anchor="middle">allocate(42)</text>
+          <path class="edge" d="M125 172 L610 172"/><text class="caption" x="365" y="163" text-anchor="middle">Message { source: 1, session: 42 }</text>
+          <rect x="92" y="196" width="66" height="42" fill="#dfe9ec" stroke="#a9bbc0"/><text class="caption" x="125" y="221" text-anchor="middle">PENDING</text>
+          <path class="edge" d="M620 250 L865 250"/><text class="caption" x="742" y="241" text-anchor="middle">dequeue + dispatch</text>
+          <path class="edge" d="M875 302 L135 302"/><text class="caption" x="505" y="293" text-anchor="middle">RESPONSE { session: 42, payload }</text>
+          <path class="edge-dash" d="M380 350 L135 350"/><text class="caption" x="258" y="341" text-anchor="middle">take(42) + wake</text>
+          <rect x="92" y="368" width="66" height="34" fill="#168c88"/><text x="125" y="390" text-anchor="middle" font-size="10" fill="white">READY</text>
+        </svg></div><div class="legend"><span>消息投递</span><span>Future 唤醒</span><span>跨节点封装</span></div></article>
+      </div>
     </section>
 
-    <section class="doc" id="kernel">
-      <h2>一个服务里有什么</h2>
-      <p class="intro">ServiceContext 是运行时的中心对象。调度器保证任意时刻只有一条线程执行它，所以内部容器可以是 SvcCell，不必上锁。</p>
+    <section class="section" id="scheduler">
+      <div class="wrap">
+        <div class="section-head reveal"><div class="section-tag">Scheduler / full trace</div><h2>从 push 到 park：调度器完整走一圈</h2><p class="section-intro">调度不是“邮箱非空就找个线程”这么简单。它要同时守住三条约束：不丢任何一次唤醒、同一服务永远只有一个执行者、空闲 worker 不制造全场争抢。下面把消息进入、服务排队、worker 取活、Future poll 与睡眠唤醒连成一条完整路径。</p></div>
 
-      <figure class="plate">
-        <div class="plate-head"><h2>ServiceContext 结构</h2><span class="dwg">DWG-SVC-01</span></div>
-        <div class="plate-body">
-          <div class="grid-3">
-            <div class="cell live">
-              <span class="label">身份</span>
-              <h3>handle / kind</h3>
-              <p>handle 是节点内单调递增的 u64，销毁只放槽位、不复用编号。kind 是 Registry 里的类型名。</p>
-            </div>
-            <div class="cell">
-              <span class="label">投递面</span>
-              <h3>Mailbox</h3>
-              <p>消息队列加就绪任务队列，外加四态原子机。push 返回是否需要入运行队列。</p>
-            </div>
-            <div class="cell">
-              <span class="label">配对</span>
-              <h3>SessionTable</h3>
-              <p>session 到 Waker。call 与 sleep 共用。编号单调递增，迟到回包查无此号。</p>
-            </div>
-            <div class="cell">
-              <span class="label">执行</span>
-              <h3>TaskSet</h3>
-              <p>服务内迷你 executor。一条消息开一个任务；spawn 再开并发任务。</p>
-            </div>
-            <div class="cell ox">
-              <span class="label">实现</span>
-              <h3>dyn Service</h3>
-              <p>init 与 dispatch。独占服务同时握一份 dyn Exclusive，用来 idle / interrupt。</p>
-            </div>
-            <div class="cell">
-              <span class="label">观测</span>
-              <h3>生命周期与计数</h3>
-              <p>Initializing / Running / Failed，邮箱长度、任务数、pending call、CPU 微秒都是原子镜像。</p>
-            </div>
-          </div>
+        <div class="schedule-trace reveal" aria-label="调度完整流程八步">
+          <article class="trace-step"><b>生产者先写入工作</b><p>消息走 <code>Mailbox::push_message</code>；Waker 走 <code>push_ready(TaskId)</code>。两条队列都是无锁 SegQueue，必须先写数据再改变状态。</p></article>
+          <article class="trace-step"><b>notify 决定是否递交服务</b><p><code>IDLE → QUEUED</code> 返回 true，由本次生产者负责将 ServiceContext 放入 Scheduler；其他状态不会重复排队。</p></article>
+          <article class="trace-step"><b>Scheduler 选择安置位置</b><p>有 searcher 时进 injector；有睡眠 worker 时定向 handoff；否则 worker 投本地 BWoS，外部线程投 injector。</p></article>
+          <article class="trace-step"><b>worker 按优先级取服务</b><p>先收定向 handoff，再按周期检查 injector，然后取本地队尾，最后从其他 worker 队头窃取。</p></article>
+          <article class="trace-step"><b>取出时标记 RUNNING</b><p><code>Scheduler::pop</code> 先获得唯一 ServiceContext，再执行 <code>mark_running</code>。从这一刻起该 worker 独占服务内部状态。</p></article>
+          <article class="trace-step"><b>run_service 逐件执行</b><p>优先处理初始化期间暂存消息，然后从 ready / message 两队列取 Work。Message 创建 Task；Ready(TaskId) poll Future 一次。</p></article>
+          <article class="trace-step"><b>每 64 件检查是否让渡</b><p>若仍有其他服务排队或节点收工，返回 Yielded；否则预算清零，当前服务继续跑到真正空闲。</p></article>
+          <article class="trace-step"><b>结束为三种结果</b><p><code>Idle</code> 放生邮箱；<code>Yielded</code> 重排自己并切换服务；<code>Dead</code> 销毁任务、session、邮箱并回错误。</p></article>
         </div>
-      </figure>
 
-      <figure class="plate">
-        <div class="plate-head"><h2>共享服务与独占服务</h2><span class="dwg">DWG-SVC-02</span></div>
-        <div class="plate-body">
-          <div class="compare">
-            <div class="cell">
-              <span class="label">共享服务</span>
-              <h3>进运行队列</h3>
-              <p>某个 worker 领走执行，可能被窃取。没活时去找别的服务，找不到才 park。适合业务：一万个服务只是一万个邮箱。</p>
-            </div>
-            <div class="cell live">
-              <span class="label">独占服务</span>
-              <h3>自己那条线程</h3>
-              <p>从不进运行队列。空了调 idle：日志 park，定时器推轮再 park_timeout(2.5ms)，网络层 poll.poll。有活先 unpark 再 interrupt。</p>
-            </div>
-          </div>
-        </div>
-        <p class="plate-cap">两者共用同一套邮箱状态机和 <code>Node::run_service</code>。init / dispatch 写法相同。独占线程的退出条件是自己被摘除，不是节点收工，这样 logger 能留到最后把积压写完。</p>
-      </figure>
+        <div class="sched-split">
+          <article class="panel reveal"><div class="panel-head"><h3>邮箱四态：防止丢活</h3><p>one service / one owner</p></div><div class="panel-body">
+            <div class="state-grid"><div class="state-box"><b>IDLE</b><p>不在运行队列，也没有 worker 持有。下一次投递者必须负责排队。</p></div><div class="state-box"><b>QUEUED</b><p>已经排在某条运行队列或 handoff 中，后续投递不能重复排队。</p></div><div class="state-box active-state"><b>RUNNING</b><p>某个 worker 正独占执行服务，SvcCell 与 TaskSet 可无锁访问。</p></div><div class="state-box active-state"><b>NOTIFIED</b><p>服务执行期间又有新工作；持有者结束前必须复位并重新扫描。</p></div></div>
+            <ul class="transition-list"><li><code>IDLE → QUEUED</code><span>投递者 CAS 成功，然后进入 Scheduler。</span></li><li><code>QUEUED → RUNNING</code><span>worker 从运行队列取走并取得所有权。</span></li><li><code>RUNNING → NOTIFIED</code><span>持有期间有消息或任务被唤醒，不再额外排队。</span></li><li><code>NOTIFIED → RUNNING</code><span>两条队列看空时发现通知，复位后重新扫描。</span></li><li><code>RUNNING → IDLE</code><span>队列为空且 CAS 成功，服务才真正放生。</span></li><li><code>RUNNING → QUEUED</code><span>预算耗尽且别人等待，先改状态再重新入队。</span></li></ul>
+          </div></article>
 
-      <figure class="plate">
-        <div class="plate-head"><h2>为什么状态可以不加锁</h2><span class="dwg">DWG-SVC-03</span></div>
-        <div class="plate-body">
-          <div class="grid-2">
-            <div class="cell">
-              <h3>不变量</h3>
-              <p>状态不为 Idle 时，服务要么排在某条队列的一个槽里，要么被唯一 worker 持有。BWoS 保证每个槽只会被取走一次。独占模式从头到尾只有一条线程。</p>
-            </div>
-            <div class="cell">
-              <h3>SvcCell</h3>
-              <p>语义等同 RefCell，额外声明 Sync，好让 Arc 服务能在 worker 间迁移。跨 await 持有 Mutex 会真死锁；SvcCell 借用冲突当场 panic。</p>
-            </div>
-            <div class="cell">
-              <h3>CURRENT_SERVICE</h3>
-              <p>线程局部量记下本线程正在跑哪个服务。call / sleep / spawn / send / reply 都会校验；从外部 OS 线程调用立即 panic。</p>
-            </div>
-            <div class="cell">
-              <h3>跨线程出口</h3>
-              <p>Ctx 仍是 Send，因为 await 之后可能被偷走继续 poll。长期交给外部线程只导出 NodeRef，或用 ReplyToken 完成一次外部请求。</p>
-            </div>
-          </div>
+          <article class="panel reveal"><div class="panel-head"><h3>worker 取活优先级</h3><p>Scheduler::pop_runnable</p></div><div class="panel-body"><ol class="worker-order">
+            <li><b>handoff slot</b><small>别人点名递给当前睡眠 worker 的单槽 ServiceContext，不能被 pending 快速判空跳过。</small></li>
+            <li><b>injector / every 64 pops</b><small>即使本地队列持续有活，也周期性查看全局注入队列，防止外部工作饥饿。</small></li>
+            <li><b>local.pop_back()</b><small>owner 从自己的 BWoS 队尾取，完全无锁并保持缓存热度。</small></li>
+            <li><b>injector.pop()</b><small>接收非 worker 线程投递、本地队列溢出和收工时转存的服务。</small></li>
+            <li><b>steal_front(victim)</b><small>用 stealable 位图筛选受害者，随机起点，每轮最多尝试 2 个，避免 O(N²) 扫描。</small></li>
+          </ol></div></article>
         </div>
-      </figure>
+
+        <div class="scheduler-board reveal">
+          <div class="scheduler-side"><span class="eyebrow">Level A / per service</span><h3>Mailbox::take_work</h3><div class="mailbox"><div class="mail"><span>Ready(Task 0x03)</span><em>优先</em></div><div class="mail"><span>Ready(Task 0x08)</span><em>优先</em></div><div class="mail"><span>Message #91</span><em>USER</em></div><div class="mail"><span>Message #92</span><em>RESPONSE</em></div></div><p style="margin:15px 0 0;color:var(--muted);font-size:11px">ready 默认领先，让被 resume 的 Future 尽快跑到下一次 Pending；连续 64 个 ready 后若消息已等待，强制先取一条消息。</p></div>
+          <div class="scheduler-bridge"><b>Work(handle)</b></div>
+          <div class="scheduler-side"><span class="eyebrow">Level B / per worker</span><h3>可窃取服务队列</h3><div class="worker-pool"><div class="worker-box"><b>W0</b><span>owner pop_back<br>:01 · :05</span></div><div class="worker-box"><b>W1</b><span>owner pop_back<br>:0a · :0c</span></div><div class="worker-box"><b>W2</b><span>thief steal_front<br>← W0</span></div></div><p style="margin:15px 0 0;color:var(--muted);font-size:11px">第二级队列装的不是 Message，而是“当前有工作可做的 ServiceContext”。同一服务最多出现一次。</p></div>
+        </div>
+
+        <article class="panel reveal" style="margin-top:18px"><div class="panel-head"><h3>run_service 内循环</h3><p>Message 不是直接执行用户 async 函数</p></div><div class="panel-body">
+          <div class="loop-chart"><div class="loop-node"><b>take_work()</b><p>先取 Ready；ready 连续 64 次后给 Message 一次机会。两队列都空才尝试 RUNNING → IDLE。</p></div><div class="loop-arrow">→</div><div class="loop-node decision"><b>Work 是哪一种？</b><p>Message 与 Ready 走不同入口，但最终都成为一次 Future poll。</p></div><div class="loop-arrow">→</div><div class="loop-node result"><b>done += 1</b><p>消息本身算一件；它创建出的任务下一次 poll 再算一件。</p></div></div>
+          <div class="loop-branches"><div class="branch"><b>Ready(TaskId)</b><p>TaskSet::take 暂时移出 Future，清 queued 信号，构造 Context 并 poll；Ready 则 remove，Pending 则 restore。</p></div><div class="branch"><b>Message / reply</b><p>RESPONSE 或 ERROR 直接完成 SessionTable 并唤醒等待者，不创建 dispatch 任务。</p></div><div class="branch"><b>Message / ordinary</b><p>Service::dispatch 同步构造 Future，install_task 写入 TaskSet，并立即推一个 Ready(TaskId)。</p></div></div>
+        </div></article>
+
+        <article class="panel reveal" style="margin-top:18px"><div class="panel-head"><h3>Future 自唤醒如何回到调度器</h3><p>deduplicated wake path</p></div><div class="panel-body">
+          <div class="diagram-scroll"><svg class="diagram" viewBox="0 0 1000 330" role="img" aria-label="Future Waker 返回调度器的流程图">
+            <defs><marker id="wakeArrow2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#168c88"/></marker></defs>
+            <rect class="box" x="35" y="105" width="155" height="78"/><text class="title" x="112" y="134" text-anchor="middle">Future::poll</text><text class="caption" x="112" y="155" text-anchor="middle">returns Pending</text><text class="caption" x="112" y="171" text-anchor="middle">may call wake_by_ref</text>
+            <rect class="box" x="240" y="105" width="165" height="78"/><text class="title" x="322" y="134" text-anchor="middle">TaskSignal</text><text class="caption" x="322" y="155" text-anchor="middle">queued: AtomicBool</text><text class="caption" x="322" y="171" text-anchor="middle">false → true only once</text>
+            <rect class="box" x="455" y="105" width="155" height="78"/><text class="title" x="532" y="134" text-anchor="middle">ready queue</text><text class="caption" x="532" y="155" text-anchor="middle">Ready(TaskId)</text><text class="caption" x="532" y="171" text-anchor="middle">generation checked</text>
+            <rect class="box" x="660" y="105" width="140" height="78"/><text class="title" x="730" y="134" text-anchor="middle">notify()</text><text class="caption" x="730" y="155" text-anchor="middle">mailbox state</text><text class="caption" x="730" y="171" text-anchor="middle">dedupe service</text>
+            <rect class="box" x="850" y="105" width="120" height="78"/><text class="title" x="910" y="134" text-anchor="middle">Scheduler</text><text class="caption" x="910" y="155" text-anchor="middle">only if IDLE</text><text class="caption" x="910" y="171" text-anchor="middle">→ QUEUED</text>
+            <path d="M190 144 L232 144" fill="none" stroke="#168c88" stroke-width="2" marker-end="url(#wakeArrow2)"/><path d="M405 144 L447 144" fill="none" stroke="#168c88" stroke-width="2" marker-end="url(#wakeArrow2)"/><path d="M610 144 L652 144" fill="none" stroke="#168c88" stroke-width="2" marker-end="url(#wakeArrow2)"/><path d="M800 144 L842 144" fill="none" stroke="#168c88" stroke-width="2" marker-end="url(#wakeArrow2)"/>
+            <path d="M532 190 C532 265 112 265 112 191" fill="none" stroke="#a9bbc0" stroke-width="1.5" stroke-dasharray="6 5" marker-end="url(#wakeArrow2)"/><text class="caption" x="322" y="254" text-anchor="middle">下一次 take(TaskId) 清 queued，再 poll</text>
+            <text class="caption" x="500" y="55" text-anchor="middle">Weak&lt;ServiceContext&gt;：外部长时间持有 Waker 不会吊住已销毁服务</text>
+          </svg></div>
+        </div></article>
+
+        <article class="panel reveal" style="margin-top:18px"><div class="panel-head"><h3>没活时如何安全睡眠</h3><p>producer / sleeper handshake</p></div><div class="panel-body"><div class="wakeup-race"><div class="race-lane"><h3>投递线程</h3><ol><li>先把 ServiceContext 放进可见队列</li><li>执行 SeqCst fence</li><li>若 searching &gt; 0，交给 injector</li><li>否则 claim 一个 idle worker</li><li>handoff 后定向 unpark</li></ol></div><div class="race-fence">TOTAL<br>ORDER<br>FENCE</div><div class="race-lane"><h3>空闲 worker</h3><ol><li>searching++，最多自旋 256 轮</li><li>仍无工作则先登记 idle 位</li><li>searching-- 并执行 SeqCst fence</li><li>睡前最后再 pop 一次</li><li>仍为空才 thread::park</li></ol></div></div><p style="margin:18px 0 0;color:var(--muted);font-size:11px">两侧屏障保证至少一方看见对方：要么生产者看见 idle 位并唤醒 worker，要么 worker 的睡前复查看到新工作。早到的 unpark 会保留令牌，因此不会丢唤醒。</p></div></article>
+
+        <div class="constants reveal"><div class="constant"><b>64</b><span>YIELD_INTERVAL：处理一批后检查是否有人等待</span></div><div class="constant"><b>64</b><span>READY_BURST：防止自唤醒任务饿死消息</span></div><div class="constant"><b>64</b><span>INJECT_INTERVAL：本地繁忙时定期看 injector</span></div><div class="constant"><b>256</b><span>SPIN_ROUNDS：挂起前的短暂主动搜索</span></div><div class="constant"><b>2</b><span>STEAL_ATTEMPTS：每轮最多尝试的受害者数</span></div></div>
+
+        <div class="rule-callout reveal"><strong>不变量</strong><p><code style="color:#ef9a6f">QUEUED / RUNNING / NOTIFIED</code> 都表示服务已经“有人管”。只有从 IDLE 成功切到 QUEUED 的那次投递需要把服务加入 Scheduler；只有 worker 从队列取出并标记 RUNNING 后才能访问 SvcCell。这正是“每个服务串行，整个节点并行”的实现落点。</p></div>
+      </div>
     </section>
 
-    <section class="doc" id="schedule">
-      <h2>调度怎么跑</h2>
-      <p class="intro">worker 从运行队列取一个服务，优先 poll 就绪任务，其次取消息。每 64 件活问一次有没有别人在等；有就让渡，没有就接着跑。</p>
-
-      <figure class="plate">
-        <div class="plate-head"><h2>worker 一轮</h2><span class="dwg">DWG-WK-01</span></div>
-        <div class="plate-body">
-          <div class="grid-4">
-            <div class="step">
-              <span class="label">取服务</span>
-              <h3>本地，injector，偷</h3>
-              <p>先看自己的 BWoS 尾部，再看 injector，再按 stealable 位图挑受害者。取不到先自旋，再 park。</p>
-            </div>
-            <div class="step">
-              <span class="label">取活</span>
-              <h3>ready 优先</h3>
-              <p>RESPONSE / ERROR 且带 session：直接唤醒等待任务。其它消息：开新任务跑 dispatch。ready 连续领先 64 轮后让一条消息先走。</p>
-            </div>
-            <div class="step">
-              <span class="label">让渡</span>
-              <h3>满 64 件问一次</h3>
-              <p>消息与就绪任务各算一件。收工信号也算该让渡。独占服务一次干到空，让渡没有意义。</p>
-            </div>
-            <div class="step">
-              <span class="label">放生</span>
-              <h3>CAS 回 Idle</h3>
-              <p>两条队列都空才尝试。失败说明已被 Notified，复位后重扫。让渡则先改成 Queued 再入队。</p>
-            </div>
-          </div>
+    <section class="section" id="modules">
+      <div class="wrap">
+        <div class="section-head reveal"><div class="section-tag">Workspace map</div><h2>12 个 crate，各自守住一条边界</h2><p class="section-intro">门面 crate 只做 feature 组合与启动编排。内核不依赖 mio、rustls 或系统时钟；可选能力通过 Registry 注册，与业务服务使用同一套接入方式。</p></div>
+        <div class="crate-map reveal">
+          <article class="crate-card facade"><span class="eyebrow">Facade</span><h3>rskynet</h3><p>统一导出 API、过程宏与可选协议；按配置推导基础设施依赖并编排启动顺序。</p><div class="deps">features → macros · timer · net · tls · http · dashboard · cluster</div></article>
+          <article class="crate-card core"><div><span class="eyebrow" style="color:#ef9a6f">Kernel</span><h3>rskynet-core</h3><p>Actor 身份、邮箱、任务、调度、session、生命周期、配置。这里没有任何内置服务。</p></div><div class="core-parts"><span>server</span><span>context</span><span>message</span><span>mq</span><span>task</span><span>session</span><span>handle</span><span>monitor</span><span>exclusive</span></div></article>
+          <article class="crate-card third"><span class="eyebrow">Compile time</span><h3>rskynet-macros</h3><p>生成 Service / Exclusive 实现，按 MsgType 解析负载并自动应答。</p></article>
+          <article class="crate-card third"><span class="eyebrow">Startup</span><h3>rskynet-bootstrap</h3><p>按 TOML 清单逐个等待业务服务完成 init，随后自身退出。</p></article>
+          <article class="crate-card third"><span class="eyebrow">Observability</span><h3>logger · signal</h3><p>顺序日志、进程信号、优雅关停、panic hook 与 minidump。</p></article>
+          <article class="crate-card quarter"><span class="eyebrow">Time</span><h3>rskynet-timer</h3><p>10 ms 分层时间轮，实现内核 Timer 抽象。</p><div class="deps">independent</div></article>
+          <article class="crate-card quarter"><span class="eyebrow">I/O</span><h3>rskynet-net</h3><p>mio 驱动 TCP/UDP，独占线程轮询并向 Actor 投递 SocketEvent。</p><div class="deps">base transport</div></article>
+          <article class="crate-card quarter"><span class="eyebrow">Security</span><h3>rskynet-tls</h3><p>rustls 状态机复用 net socket，对上层只暴露明文事件。</p><div class="deps">→ net</div></article>
+          <article class="crate-card quarter"><span class="eyebrow">Protocol</span><h3>rskynet-http</h3><p>HTTP/1.1 客户端、嵌入式服务端、流式 body 与 WebSocket。</p><div class="deps">→ net · tls?</div></article>
+          <article class="crate-card third"><span class="eyebrow">Remote actors</span><h3>rskynet-cluster</h3><p>Protobuf envelope、seed 连接、TYPE_ID 注册与远端请求/应答。</p><div class="deps">→ net · bootstrap</div></article>
+          <article class="crate-card third"><span class="eyebrow">Inspection</span><h3>rskynet-dashboard</h3><p>读取 NodeStats 与 socket 统计，通过内嵌 HTTP 页面展示。</p><div class="deps">→ http → net</div></article>
+          <article class="crate-card third"><span class="eyebrow">Examples</span><h3>rskynet-examples</h3><p>ping/pong、TCP echo、HTTP、WebSocket、cluster 与 dashboard。</p></article>
         </div>
-      </figure>
 
-      <figure class="plate">
-        <div class="plate-head"><h2>BWoS 运行队列</h2><span class="dwg">DWG-BWS-01</span></div>
-        <div class="plate-body">
-          <div class="flow">
-            <div class="col">
-              <span class="label">worker 0</span>
-              <div class="cell">
-                <h3>本地队列</h3>
-                <p>owner 只碰当前块的写指针。尾部弹出，后进先出，图的是缓存还热。</p>
-              </div>
-              <div class="cell ox">
-                <h3>handoff 槽</h3>
-                <p>单槽 AtomicPtr。被唤醒者先看自己的槽，占着才退回 injector。</p>
-              </div>
-            </div>
-            <div class="arrow" aria-hidden="true"></div>
-            <div class="col">
-              <span class="label">共享兜底</span>
-              <div class="cell live">
-                <h3>injector</h3>
-                <p>非 worker 投递、本地写满溢出、有人正在 searching 时的投递，都落这里。</p>
-              </div>
-              <div class="cell">
-                <h3>stealable 位图</h3>
-                <p>owner 跨块时置位，每 16 个元素一次。窃贼读一个字挑一位，不再扫全场。</p>
-              </div>
-            </div>
-            <div class="arrow" aria-hidden="true"></div>
-            <div class="col">
-              <span class="label">worker 1</span>
-              <div class="cell">
-                <h3>本地队列</h3>
-                <p>从别人头部偷最老的整块。并发窃取者不超过 worker 数的一半。</p>
-              </div>
-              <div class="cell">
-                <h3>空闲位图</h3>
-                <p>先 fetch_or 自己那一位再扫队列。投递方 fence 后读位图，清最低位，定向 unpark。</p>
-              </div>
-            </div>
-          </div>
-        </div>
-        <p class="plate-cap">searching 计数抑制无谓唤醒：已有人醒着扫队列，就不再叫第二个。worker 远多于负载时，靠自旋、searching 和 handoff 避免唤醒风暴。</p>
-      </figure>
-
-      <figure class="plate">
-        <div class="plate-head"><h2>唤醒路径</h2><span class="dwg">DWG-WK-02</span></div>
-        <div class="plate-body">
-          <div class="vflow">
-            <div class="cell ox"><strong>投递</strong> 先入队，再改邮箱状态。需要入运行队列时走 Scheduler::push。</div>
-            <div class="arrow down" aria-hidden="true"></div>
-            <div class="grid-3">
-              <div class="cell"><h3>有 searching</h3><p>活走 injector，不叫醒第二个人。</p></div>
-              <div class="cell"><h3>有人在睡</h3><p>CAS 清最低位，写入 handoff，unpark 那个具体 worker。</p></div>
-              <div class="cell"><h3>都醒着</h3><p>放进调用方本地队列；非 worker 则进 injector。</p></div>
-            </div>
-          </div>
-        </div>
-      </figure>
-
-      <figure class="plate">
-        <div class="plate-head"><h2>monitor</h2><span class="dwg">DWG-MON-01</span></div>
-        <div class="plate-body">
-          <div class="grid-3">
-            <div class="cell">
-              <h3>每 worker 一份进度</h3>
-              <p>poll Future 前后推进 version，并发布 source / destination。</p>
-            </div>
-            <div class="cell">
-              <h3>rskynet-monitor</h3>
-              <p>独立线程每 5 秒扫描。同一次 poll 跨过两个检查点仍未返回，记疑似死循环。</p>
-            </div>
-            <div class="cell">
-              <h3>只告警</h3>
-              <p>不强杀。监控方用 take_endless(handle) 读取并清除一次性标记。独占线程和同步 init 不在监测里。</p>
-            </div>
-          </div>
-        </div>
-      </figure>
+        <div class="panel reveal" style="margin-top:34px"><div class="panel-head"><h3>启动依赖顺序</h3><p>只启动配置实际需要的项</p></div><div class="panel-body"><div class="bootline">
+          <div class="boot-step"><b>logger</b><small>独占</small></div><div class="boot-step"><b>signal</b><small>独占</small></div><div class="boot-step"><b>timer</b><small>时间源</small></div><div class="boot-step optional"><b>net</b><small>可选基座</small></div><div class="boot-step optional"><b>tls</b><small>可选</small></div><div class="boot-step optional"><b>http-client</b><small>可选</small></div><div class="boot-step optional"><b>cluster / dashboard</b><small>可选</small></div><div class="boot-step"><b>bootstrap</b><small>业务清单</small></div>
+        </div></div></div>
+      </div>
     </section>
 
-    <section class="doc" id="message">
-      <h2>消息怎么走</h2>
-      <p class="intro">同进程传对象走 Payload::Boxed，零拷贝。跨节点才走 Protobuf。应答类消息不进 dispatch，由内核按 session 唤醒任务。</p>
-
-      <figure class="plate">
-        <div class="plate-head"><h2>send / call / reply</h2><span class="dwg">DWG-MSG-01</span></div>
-        <div class="plate-body">
-          <div class="flow">
-            <div class="col">
-              <div class="cell">
-                <h3>send / post</h3>
-                <p>session = 0，不等待。post 是 USER 快捷写法。</p>
-              </div>
-            </div>
-            <div class="arrow" aria-hidden="true"></div>
-            <div class="col">
-              <div class="cell live">
-                <h3>call / request</h3>
-                <p>分配 session，发送，挂起当前任务。服务继续处理其它消息。</p>
-              </div>
-            </div>
-            <div class="arrow" aria-hidden="true"></div>
-            <div class="col">
-              <div class="cell ox">
-                <h3>reply</h3>
-                <p>带回同一 session 的 RESPONSE。对端 complete 后 wake。没有 session 则忽略。</p>
-              </div>
-            </div>
+    <section class="section" id="types">
+      <div class="wrap">
+        <div class="section-head reveal"><div class="section-tag">Key types</div><h2>关键类型不是对象树，而是所有权图</h2><p class="section-intro">Ctx 持有服务上下文，ServiceContext 连接邮箱、任务和节点；Future 再捕获 Ctx，形成真实循环。服务销毁时由 Node::destroy 清空 TaskSet，显式打断这条引用环。</p></div>
+        <div class="class-layout reveal">
+          <div class="class-primary">
+            <article class="class-card"><div class="class-name">Node</div><ul class="class-fields"><li>handles: HandleStorage</li><li>scheduler: Scheduler</li><li>sessions: SessionTable</li><li>timer: Arc&lt;dyn Timer&gt;</li></ul><ul class="class-methods"><li>launch / post / destroy</li><li>run_service / shutdown</li></ul></article>
+            <article class="class-card"><div class="class-name">ServiceContext</div><ul class="class-fields"><li>handle: Handle</li><li>service: Arc&lt;dyn Service&gt;</li><li>mailbox: Mailbox</li><li>tasks: TaskSet</li></ul><ul class="class-methods"><li>dispatch / spawn</li><li>schedule / exit</li></ul></article>
+            <article class="class-card"><div class="class-name">Ctx</div><ul class="class-fields"><li>inner: Arc&lt;ServiceContext&gt;</li></ul><ul class="class-methods"><li>post / request / reply</li><li>spawn / sleep / yield_now</li><li>launch / kill / monitor</li></ul></article>
+            <article class="class-card"><div class="class-name">Message</div><ul class="class-fields"><li>source: Handle</li><li>session: u64</li><li>mtype: MsgType</li><li>payload: Payload</li></ul><ul class="class-methods"><li>take_payload()</li><li>is_request()</li></ul></article>
+            <article class="class-card"><div class="class-name">Scheduler</div><ul class="class-fields"><li>workers: WorkerSlot[]</li><li>global: injector queue</li><li>pending / shutdown</li></ul><ul class="class-methods"><li>schedule(handle)</li><li>steal / park / wake</li></ul></article>
+            <article class="class-card"><div class="class-name">TaskSet</div><ul class="class-fields"><li>tasks: Slab&lt;Future&gt;</li><li>ready: queue&lt;TaskId&gt;</li></ul><ul class="class-methods"><li>spawn / poll_ready</li><li>wake / clear</li></ul></article>
           </div>
+          <aside class="relation-notes"><span class="eyebrow">Relationship legend</span><h3 style="margin-top:10px">谁拥有谁</h3><dl><dt>Node 1 → N ServiceContext</dt><dd>HandleStorage 管理节点内所有服务；Handle 单调递增且永不复用。</dd><dt>ServiceContext 1 → 1 Mailbox</dt><dd>邮箱决定服务是否需要进入全局调度，并防止并发执行。</dd><dt>ServiceContext 1 → N Task</dt><dd>每个 ctx.spawn Future 属于当前服务，共享串行访问保证。</dd><dt>Ctx → Arc&lt;ServiceContext&gt;</dt><dd>业务 Future 可安全持有上下文，销毁阶段负责清环。</dd><dt>Exclusive extends Service</dt><dd>独占服务自带 idle / interrupt 钩子，但消息接口不变。</dd><dt>SvcCell&lt;T&gt; → scoped borrow</dt><dd>依赖“同一服务不并发”契约，无需给普通状态访问加锁。</dd></dl></aside>
         </div>
-      </figure>
-
-      <figure class="plate">
-        <div class="plate-head"><h2>session 配对</h2><span class="dwg">DWG-SES-01</span></div>
-        <div class="plate-body">
-          <div class="grid-4">
-            <div class="cell"><h3>alloc</h3><p>从 1 起单调加。0 留给不需应答的消息。</p></div>
-            <div class="cell"><h3>Waiting</h3><p>先占槽。第一次 poll 才写入 Waker，避免早到回包丢失。</p></div>
-            <div class="cell"><h3>Done</h3><p>回包已到、任务还没来取。下一次 poll 直接返回。</p></div>
-            <div class="cell"><h3>放弃</h3><p>Drop 删槽，不留墓碑。迟到回包查无此 session，丢弃。</p></div>
-          </div>
-        </div>
-        <p class="plate-cap">sleep 也走这张表：挂到 WheelTimer，到期投一条带同一 session 的 RESPONSE。</p>
-      </figure>
-
-      <figure class="plate">
-        <div class="plate-head"><h2>寻址</h2><span class="dwg">DWG-MSG-02</span></div>
-        <div class="plate-body">
-          <div class="grid-3">
-            <div class="cell mono"><h3>:0100000a</h3><p>十六进制 handle。</p></div>
-            <div class="cell mono"><h3>.pong</h3><p>本地名字。名字表 COW 快照读，按名寻址不抢锁。</p></div>
-            <div class="cell mono"><h3>Handle(u64)</h3><p>直接传数字。跨节点地址是 ClusterAddr，不编进本地 handle。</p></div>
-          </div>
-        </div>
-      </figure>
-
-      <figure class="plate">
-        <div class="plate-head"><h2>内置消息类型</h2><span class="dwg">DWG-MSG-03</span></div>
-        <div class="plate-body">
-          <div class="chips">
-            <span class="chip">0 TEXT</span>
-            <span class="chip hot">1 RESPONSE</span>
-            <span class="chip">2 MULTICAST</span>
-            <span class="chip">3 CLIENT</span>
-            <span class="chip">4 SYSTEM</span>
-            <span class="chip ox">5 SOCKET</span>
-            <span class="chip hot">6 ERROR</span>
-            <span class="chip">7 USER</span>
-            <span class="chip ox">8 TLS</span>
-          </div>
-        </div>
-        <p class="plate-cap">MsgType 是 newtype 不是 enum，业务可以自定协议号。RESPONSE 与 ERROR 由 is_reply() 识别，call 禁止用它们当请求类型。</p>
-      </figure>
+      </div>
     </section>
 
-    <section class="doc" id="modules">
-      <h2>各模块怎么工作</h2>
-      <p class="intro">模块名刻意对齐 skynet-src，方便对照。C 版没有对应物的是 Exclusive、ext、Timer 抽象和 BWoS。</p>
-
-      <figure class="plate">
-        <div class="plate-head"><h2>内核文件</h2><span class="dwg">DWG-MOD-01</span></div>
-        <div class="plate-body" style="overflow-x:auto">
-          <table class="data">
-            <thead>
-              <tr>
-                <th class="mono">rskynet-core</th>
-                <th>职责</th>
-                <th>对照</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr><td class="mono">message.rs</td><td>Message / MsgType / Payload / Addr</td><td>skynet_mq.h</td></tr>
-              <tr><td class="mono">mq.rs</td><td>Mailbox 四态机、Scheduler、唤醒与窃取</td><td>skynet_mq.c</td></tr>
-              <tr><td class="mono">bwos.rs</td><td>块式工作窃取队列</td><td>stdexec bwos_lifo_queue</td></tr>
-              <tr><td class="mono">handle.rs</td><td>handle 分配、槽位倍增、本地名字</td><td>skynet_handle.c</td></tr>
-              <tr><td class="mono">server.rs</td><td>ServiceContext、Node、分发主循环</td><td>skynet_server.c</td></tr>
-              <tr><td class="mono">context.rs</td><td>Ctx 与 Service trait</td><td>lualib/skynet.lua</td></tr>
-              <tr><td class="mono">session.rs</td><td>session 到 Waker</td><td>session_id_coroutine</td></tr>
-              <tr><td class="mono">task.rs</td><td>服务内 executor、SvcCell</td><td>Lua 协程池</td></tr>
-              <tr><td class="mono">exclusive.rs</td><td>独占线程的 idle / interrupt</td><td>ltask exclusive</td></tr>
-              <tr><td class="mono">ext.rs</td><td>NodeRef、ReplyToken、观测快照</td><td>skynet_context_push</td></tr>
-              <tr><td class="mono">clock.rs</td><td>Timer trait</td><td>无，时间轮在外面</td></tr>
-              <tr><td class="mono">module.rs</td><td>Registry / AutoService</td><td>skynet_module.c</td></tr>
-              <tr><td class="mono">monitor.rs</td><td>poll 进度与死循环检测</td><td>skynet_monitor.c</td></tr>
-              <tr><td class="mono">start.rs</td><td>Config、Builder、线程池</td><td>skynet_start.c</td></tr>
-            </tbody>
-          </table>
+    <section class="section" id="protocols">
+      <div class="wrap">
+        <div class="section-head reveal"><div class="section-tag">I/O pipelines</div><h2>协议向上组合，事件向下归一</h2><p class="section-intro">网络线程只理解 socket；TLS 把密文转成明文事件；HTTP 维护协议状态机；Cluster 把远端消息包装成 Protobuf 帧。每层只持有自己需要的状态。</p></div>
+        <div class="protocol-lanes reveal">
+          <div class="lane"><div class="lane-name">TCP / UDP</div><div class="lane-cell"><b>业务 Command</b><small>connect / listen / send</small></div><div class="lane-cell"><b>NetService</b><small>socket slab</small></div><div class="lane-cell"><b>mio::Poll</b><small>独占线程</small></div><div class="lane-cell"><b>SocketEvent</b><small>data / close / error</small></div><div class="lane-cell"><b>目标 Actor</b><small>MsgType::SOCKET</small></div></div>
+          <div class="lane"><div class="lane-name">HTTPS</div><div class="lane-cell"><b>HTTP Request</b><small>BodySpec</small></div><div class="lane-cell"><b>ureq-proto</b><small>HTTP/1.1 状态机</small></div><div class="lane-cell"><b>TlsService</b><small>rustls records</small></div><div class="lane-cell"><b>NetService</b><small>TCP bytes</small></div><div class="lane-cell"><b>IncomingBody</b><small>流式消费</small></div></div>
+          <div class="lane"><div class="lane-name">WebSocket</div><div class="lane-cell"><b>HTTP Upgrade</b><small>handshake</small></div><div class="lane-cell"><b>WebSocket</b><small>frame codec</small></div><div class="lane-cell"><b>TLS?</b><small>可选传输</small></div><div class="lane-cell"><b>NetService</b><small>backpressure</small></div><div class="lane-cell"><b>Sender / Stream</b><small>业务收发</small></div></div>
+          <div class="lane"><div class="lane-name">Cluster</div><div class="lane-cell"><b>ClusterMessage</b><small>TYPE_ID</small></div><div class="lane-cell"><b>Envelope</b><small>request_id + target</small></div><div class="lane-cell"><b>length frame</b><small>上限 8 MiB</small></div><div class="lane-cell"><b>NetService</b><small>seed TCP</small></div><div class="lane-cell"><b>RemoteContext</b><small>handler Future</small></div></div>
         </div>
-      </figure>
-
-      <figure class="plate">
-        <div class="plate-head"><h2>时间轮</h2><span class="dwg">DWG-TMR-01</span></div>
-        <div class="plate-body">
-          <div class="wheel">
-            <div class="cell live">
-              <span class="label">近轮</span>
-              <h3>256 格 / 10ms</h3>
-              <div class="slot-row" aria-hidden="true">
-                <span class="slot">0</span><span class="slot">1</span><span class="slot on">2</span><span class="slot">3</span>
-                <span class="slot">4</span><span class="slot">5</span><span class="slot">6</span><span class="slot">…</span>
-              </div>
-            </div>
-            <div class="cell"><span class="label">L1</span><h3>64 格</h3><p>溢出上浮</p></div>
-            <div class="cell"><span class="label">L2</span><h3>64 格</h3><p>再上浮</p></div>
-            <div class="cell"><span class="label">L3</span><h3>64 格</h3><p>再上浮</p></div>
-            <div class="cell"><span class="label">L4</span><h3>64 格</h3><p>最远档</p></div>
-          </div>
-        </div>
-        <p class="plate-cap">WheelTimer 注入内核，任意线程把事件压进无锁 incoming。TimerService 每 tick 排空再插入轮子，到期投 RESPONSE。记账在节点建立前就存在，引导期间挂的表不会丢。</p>
-      </figure>
-
-      <figure class="plate">
-        <div class="plate-head"><h2>网络到应用</h2><span class="dwg">DWG-NET-01</span></div>
-        <div class="plate-body">
-          <div class="stack">
-            <div class="layer">
-              <div class="layer-k">业务 actor</div>
-              <div class="chips">
-                <span class="chip">HttpServer 嵌入本服务</span>
-                <span class="chip">WebSocketClient 本服务持有</span>
-                <span class="chip">#[msg(SOCKET)] / #[msg(TLS)]</span>
-              </div>
-            </div>
-            <div class="arrow down" aria-hidden="true"></div>
-            <div class="grid-3">
-              <div class="cell"><h3>http-client</h3><p>共享连接池 actor。client::request 整包，client::start 流式。</p></div>
-              <div class="cell"><h3>dashboard</h3><p>内嵌页面与 /api/v1/stats，读 NodeRef 快照，不碰 SvcCell。</p></div>
-              <div class="cell"><h3>cluster</h3><p>Protobuf 信封。本地转交仍用 Boxed，不重复序列化。</p></div>
-            </div>
-            <div class="arrow down" aria-hidden="true"></div>
-            <div class="cell ox">
-              <h3>tls</h3>
-              <p>普通共享服务。不接管 socket，用 rustls 把明文事件投给属主，协议号 8。</p>
-            </div>
-            <div class="arrow down" aria-hidden="true"></div>
-            <div class="cell live">
-              <h3>net 独占线程</h3>
-              <p>idle 里 poll.poll。listen / connect / send / close 是发给它的消息，办完 reply。事件以 SOCKET 投给属主。阻塞 DNS 走 call_external + ReplyToken。</p>
-            </div>
-          </div>
-        </div>
-      </figure>
-
-      <figure class="plate">
-        <div class="plate-head"><h2>WebSocket 分流</h2><span class="dwg">DWG-NET-02</span></div>
-        <div class="plate-body">
-          <div class="grid-3">
-            <div class="cell">
-              <h3>先问客户端</h3>
-              <p>websockets.handles_socket(id) 为真，把事件交给本地驱动器。</p>
-            </div>
-            <div class="cell">
-              <h3>再问 HTTP 服务端</h3>
-              <p>剩余事件给 HttpServer。升级时保留尚未消费的首帧。</p>
-            </div>
-            <div class="cell">
-              <h3>其余忽略</h3>
-              <p>主动关闭后可能迟到 Close / Error，可安全丢掉。连接与 sender 不能跨 actor 使用。</p>
-            </div>
-          </div>
-        </div>
-      </figure>
-
-      <figure class="plate">
-        <div class="plate-head"><h2>集群边界</h2><span class="dwg">DWG-CLU-01</span></div>
-        <div class="plate-body">
-          <div class="flow">
-            <div class="col">
-              <div class="cell">
-                <h3>节点 A</h3>
-                <p>业务 handler 收到 PingRequest，可用 RemoteContext.post / request 交给本地 actor。</p>
-              </div>
-            </div>
-            <div class="arrow" aria-hidden="true"></div>
-            <div class="col">
-              <div class="cell live">
-                <h3>cluster 服务</h3>
-                <p>信封带 TYPE_ID、来源节点、请求 ID。handler 与类型由链接期自动注册表收集。</p>
-              </div>
-            </div>
-            <div class="arrow" aria-hidden="true"></div>
-            <div class="col">
-              <div class="cell">
-                <h3>节点 B</h3>
-                <p>本地仍是 Payload::Boxed。RemoteContext 不暴露内部 handle，也不能关停节点。</p>
-              </div>
-            </div>
-          </div>
-        </div>
-      </figure>
-
-      <figure class="plate">
-        <div class="plate-head"><h2>日志、信号、引导</h2><span class="dwg">DWG-SYS-01</span></div>
-        <div class="plate-body">
-          <div class="grid-3">
-            <div class="cell">
-              <h3>logger</h3>
-              <p>独占线程，纯消息驱动，idle 默认 park。邮箱超过 max_queue 丢旧文本、保留控制消息，回落后写一条汇总。</p>
-            </div>
-            <div class="cell">
-              <h3>signal</h3>
-              <p>独占线程执行同步回调，不在 OS handler 里跑。SIGINT / SIGTERM 默认 abort。崩溃由独立 helper 写 log 与 dmp。</p>
-            </div>
-            <div class="cell">
-              <h3>bootstrap</h3>
-              <p>共享服务。按清单逐项 launch 并等待 init 成功。长期循环必须 spawn，不要写在 init 里。</p>
-            </div>
-          </div>
-        </div>
-      </figure>
-
-      <figure class="plate">
-        <div class="plate-head"><h2>过程宏</h2><span class="dwg">DWG-MAC-01</span></div>
-        <div class="plate-body">
-          <div class="grid-4">
-            <div class="cell"><h3>#[service]</h3><p>生成 Service。可带 name / factory 做链接期注册。</p></div>
-            <div class="cell"><h3>#[exclusive]</h3><p>再生成 Exclusive。net / logger / signal 走这条。</p></div>
-            <div class="cell"><h3>#[msg]</h3><p>按协议号路由，FromPayload 取参。有返回值且对方在等则自动回包。</p></div>
-            <div class="cell"><h3>#[signal]</h3><p>注册同步 fn(&amp;Ctx)。同一信号只能一次，重复会在链接期冲突。</p></div>
-          </div>
-        </div>
-      </figure>
+      </div>
     </section>
 
-    <section class="doc" id="classes">
-      <h2>关键类图</h2>
-      <p class="intro">公开类型在门面里再导出。带「crate」标记的是内核内部类型，但它们才是调度真正踩着的地面。</p>
+    <section class="section" id="start">
+      <div class="wrap">
+        <div class="section-head reveal"><div class="section-tag">From config to actor</div><h2>配置声明“要什么”，门面推导“先起什么”</h2><p class="section-intro">标准入口先安装崩溃处理器，再读取唯一的 TOML 路径，通过 inventory 收集链接进二进制的具名服务。未知顶层键会直接报错，扩展配置必须放在各自 section 中。</p></div>
+        <div class="code-grid reveal">
+          <div class="code-panel"><div class="code-title"><span>config/examples/ping_pong.toml</span><span>TOML</span></div><pre><span class="cm"># 共享 worker 数；必须大于 0</span>
+thread = 4
+profile = true
 
-      <figure class="plate">
-        <div class="plate-head"><h2>节点与服务上下文</h2><span class="dwg">DWG-CLS-01</span></div>
-        <div class="plate-body">
-          <div class="flow">
-            <div class="col">
-              <article class="uml">
-                <h3>Ctx</h3>
-                <ul>
-                  <li>inner: Arc&lt;ServiceContext&gt;</li>
-                </ul>
-                <ul>
-                  <li>handle() kind() node()</li>
-                  <li>send / post / call / request</li>
-                  <li>reply / reply_error</li>
-                  <li>spawn / sleep / launch / exit</li>
-                  <li>call_external(token)</li>
-                </ul>
-              </article>
-              <p class="rel">包装</p>
-              <article class="uml priv">
-                <h3>crate ServiceContext</h3>
-                <ul>
-                  <li>handle: Handle</li>
-                  <li>kind: String</li>
-                  <li>node: Arc&lt;Node&gt;</li>
-                  <li>mailbox: Mailbox</li>
-                  <li>sessions: SessionTable</li>
-                  <li>tasks: TaskSet</li>
-                  <li>service: Arc&lt;dyn Service&gt;</li>
-                  <li>exclusive: Option&lt;Arc&lt;dyn Exclusive&gt;&gt;</li>
-                  <li>lifecycle / reserved / dead</li>
-                </ul>
-              </article>
-            </div>
-            <div class="arrow" aria-hidden="true"></div>
-            <div class="col">
-              <article class="uml priv">
-                <h3>crate Node</h3>
-                <ul>
-                  <li>sched: Scheduler</li>
-                  <li>handles: HandleStorage</li>
-                  <li>timer: Arc&lt;dyn Timer&gt;</li>
-                  <li>modules: Registry</li>
-                  <li>exclusives: Map&lt;Handle, JoinHandle&gt;</li>
-                  <li>total / booted / logger</li>
-                  <li>config: Config</li>
-                </ul>
-                <ul>
-                  <li>new_service / send_raw</li>
-                  <li>run_service / retire / destroy</li>
-                </ul>
-              </article>
-              <p class="rel">对外只露</p>
-              <article class="uml">
-                <h3>NodeRef</h3>
-                <ul>
-                  <li>node: Arc&lt;Node&gt;</li>
-                </ul>
-                <ul>
-                  <li>send / resolve / query_name</li>
-                  <li>launch / kill / abort</li>
-                  <li>stats / services / section</li>
-                  <li>take_endless</li>
-                </ul>
-              </article>
-            </div>
-            <div class="arrow" aria-hidden="true"></div>
-            <div class="col">
-              <article class="uml">
-                <h3>ReplyToken</h3>
-                <ul>
-                  <li>node, dest, session</li>
-                </ul>
-                <ul>
-                  <li>reply(payload)</li>
-                  <li>Drop 未回话则 ERROR</li>
-                </ul>
-              </article>
-              <article class="uml">
-                <h3>Idler</h3>
-                <ul>
-                  <li>park()</li>
-                  <li>park_timeout(dur)</li>
-                </ul>
-              </article>
-              <article class="uml">
-                <h3>NewService</h3>
-                <ul>
-                  <li>handle: Handle</li>
-                  <li>init: InitTicket</li>
-                </ul>
-              </article>
-            </div>
-          </div>
-        </div>
-        <p class="plate-cap">Node 本身不公开，避免把邮箱和调度器焊进稳定 API。外部线程只拿得到 NodeRef。</p>
-      </figure>
+[bootstrap]
+services = [
+  { name = <span class="str">"pong"</span> },
+  { name = <span class="str">"ping"</span>, args = <span class="str">"10"</span> },
+]
 
-      <figure class="plate">
-        <div class="plate-head"><h2>服务契约</h2><span class="dwg">DWG-CLS-02</span></div>
-        <div class="plate-body">
-          <div class="flow">
-            <div class="col">
-              <article class="uml trait">
-                <h3>&lt;&lt;trait&gt;&gt; Service</h3>
-                <ul>
-                  <li>init(ctx, args) -&gt; BoxFuture&lt;Result&gt;</li>
-                  <li>dispatch(ctx, msg) -&gt; BoxFuture&lt;()&gt;</li>
-                </ul>
-              </article>
-              <p class="rel">继承</p>
-              <article class="uml trait">
-                <h3>&lt;&lt;trait&gt;&gt; Exclusive</h3>
-                <ul>
-                  <li>idle(&amp;self, ctx, idler)</li>
-                  <li>interrupt(&amp;self)</li>
-                </ul>
-              </article>
-            </div>
-            <div class="arrow" aria-hidden="true"></div>
-            <div class="col">
-              <article class="uml trait">
-                <h3>&lt;&lt;trait&gt;&gt; Timer</h3>
-                <ul>
-                  <li>timeout(handle, session, delay_ms)</li>
-                  <li>now() / wall_clock() / start_time()</li>
-                </ul>
-              </article>
-              <article class="uml">
-                <h3>WheelTimer</h3>
-                <ul>
-                  <li>incoming: SegQueue</li>
-                  <li>实现 Timer，注入 Node</li>
-                </ul>
-              </article>
-              <article class="uml">
-                <h3>TimerService</h3>
-                <ul>
-                  <li>Exclusive：推轮 + park_timeout</li>
-                </ul>
-              </article>
-            </div>
-            <div class="arrow" aria-hidden="true"></div>
-            <div class="col">
-              <article class="uml">
-                <h3>Registry</h3>
-                <ul>
-                  <li>factories: Map&lt;kind, Factory&gt;</li>
-                </ul>
-                <ul>
-                  <li>register / with</li>
-                  <li>with_exclusive</li>
-                  <li>from_auto()</li>
-                </ul>
-              </article>
-              <article class="uml">
-                <h3>AutoService</h3>
-                <ul>
-                  <li>name / exclusive / source</li>
-                  <li>register: fn(&amp;mut Registry)</li>
-                </ul>
-              </article>
-              <article class="uml priv">
-                <h3>crate Instance</h3>
-                <ul>
-                  <li>service: Arc&lt;dyn Service&gt;</li>
-                  <li>exclusive: Option&lt;Arc&lt;dyn Exclusive&gt;&gt;</li>
-                </ul>
-              </article>
-            </div>
-          </div>
+<span class="cm"># 出现此 section 才会启动网络层</span>
+[net]
+event_capacity = 1024</pre></div>
+          <div class="config-explain"><div class="config-row"><b>1 / crash::install()</b><p>覆盖启动、运行与关停阶段；内核遵循 fail-fast，不恢复 panic。</p></div><div class="config-row"><b>2 / Registry::from_auto()</b><p>过程宏把构造函数提交到链接期 inventory，重复名字在启动前失败。</p></div><div class="config-row"><b>3 / Builder::with_builtins()</b><p>按 feature 注册内置服务，并注入 Timer 实现。</p></div><div class="config-row"><b>4 / dependency expansion</b><p>例如 dashboard 自动要求 http 与 net；https 自动要求 http、tls 与 net。</p></div><div class="config-row"><b>5 / bootstrap manifest</b><p>业务服务严格按清单顺序等待 init 完成，便于建立具名依赖。</p></div></div>
         </div>
-      </figure>
-
-      <figure class="plate">
-        <div class="plate-head"><h2>消息与负载</h2><span class="dwg">DWG-CLS-03</span></div>
-        <div class="plate-body">
-          <div class="grid-4">
-            <article class="uml">
-              <h3>Message</h3>
-              <ul>
-                <li>source: Handle</li>
-                <li>session: u64</li>
-                <li>mtype: MsgType</li>
-                <li>payload: Payload</li>
-              </ul>
-              <ul>
-                <li>take_payload()</li>
-                <li>needs_reply()</li>
-              </ul>
-            </article>
-            <article class="uml enum">
-              <h3>&lt;&lt;enum&gt;&gt; Payload</h3>
-              <ul>
-                <li>None</li>
-                <li>Bytes(Vec&lt;u8&gt;)</li>
-                <li>Boxed(Box&lt;dyn Any+Send&gt;)</li>
-              </ul>
-              <ul>
-                <li>of / text / downcast</li>
-              </ul>
-            </article>
-            <article class="uml enum">
-              <h3>&lt;&lt;enum&gt;&gt; Addr</h3>
-              <ul>
-                <li>Handle(u64)</li>
-                <li>Name(String)</li>
-              </ul>
-            </article>
-            <article class="uml">
-              <h3>MsgType</h3>
-              <ul>
-                <li>newtype u8</li>
-                <li>TEXT … TLS</li>
-                <li>is_reply()</li>
-              </ul>
-            </article>
-          </div>
-        </div>
-      </figure>
-
-      <figure class="plate">
-        <div class="plate-head"><h2>调度器与邮箱</h2><span class="dwg">DWG-CLS-04</span></div>
-        <div class="plate-body">
-          <div class="flow">
-            <div class="col">
-              <article class="uml priv">
-                <h3>crate Mailbox</h3>
-                <ul>
-                  <li>queue: SegQueue&lt;Message&gt;</li>
-                  <li>ready: SegQueue&lt;Ready&gt;</li>
-                  <li>state: AtomicU8</li>
-                  <li>len / overload / ready_streak</li>
-                </ul>
-                <ul>
-                  <li>push_message / push_ready</li>
-                  <li>notify() -&gt; 是否入队</li>
-                  <li>take_work() -&gt; Work</li>
-                </ul>
-              </article>
-              <article class="uml enum">
-                <h3>&lt;&lt;enum&gt;&gt; Work</h3>
-                <ul>
-                  <li>Message(Message)</li>
-                  <li>Ready(TaskId)</li>
-                </ul>
-              </article>
-            </div>
-            <div class="arrow" aria-hidden="true"></div>
-            <div class="col">
-              <article class="uml priv">
-                <h3>crate Scheduler</h3>
-                <ul>
-                  <li>locals: Vec&lt;Owner&lt;Arc&lt;SC&gt;&gt;&gt;</li>
-                  <li>stealers: Vec&lt;Stealer&gt;</li>
-                  <li>injector: SegQueue</li>
-                  <li>idle / stealable 位图</li>
-                  <li>searching / pending / quit</li>
-                </ul>
-                <ul>
-                  <li>push / pop / steal</li>
-                  <li>should_yield</li>
-                </ul>
-              </article>
-            </div>
-            <div class="arrow" aria-hidden="true"></div>
-            <div class="col">
-              <article class="uml priv">
-                <h3>crate Owner / Stealer</h3>
-                <ul>
-                  <li>BWoS 块式环缓</li>
-                  <li>owner 写当前块</li>
-                  <li>stealer 只碰已交出的块</li>
-                </ul>
-              </article>
-              <article class="uml priv">
-                <h3>crate Handoff</h3>
-                <ul>
-                  <li>每 worker 单槽 AtomicPtr</li>
-                </ul>
-              </article>
-              <article class="uml priv">
-                <h3>crate HandleStorage</h3>
-                <ul>
-                  <li>slots: ArcSwap</li>
-                  <li>names: ArcSwap&lt;BTreeMap&gt;</li>
-                  <li>alloc: Mutex&lt;Handle&gt;</li>
-                </ul>
-              </article>
-            </div>
-          </div>
-        </div>
-      </figure>
-
-      <figure class="plate">
-        <div class="plate-head"><h2>任务、session、启动</h2><span class="dwg">DWG-CLS-05</span></div>
-        <div class="plate-body">
-          <div class="grid-3">
-            <div>
-              <article class="uml">
-                <h3>SvcCell&lt;T&gt;</h3>
-                <ul>
-                  <li>inner: RefCell&lt;T&gt;</li>
-                  <li>borrowed: AtomicBool</li>
-                </ul>
-                <ul>
-                  <li>borrow() -&gt; SvcRef</li>
-                  <li>borrow_mut() -&gt; SvcRefMut</li>
-                </ul>
-              </article>
-              <p class="rel">被 TaskSet / SessionTable 使用</p>
-              <article class="uml priv">
-                <h3>crate TaskSet</h3>
-                <ul>
-                  <li>Slab&lt;TaskSlot&gt;</li>
-                  <li>spawn / poll / drop_all</li>
-                </ul>
-              </article>
-            </div>
-            <div>
-              <article class="uml priv">
-                <h3>crate SessionTable</h3>
-                <ul>
-                  <li>inner: SvcCell&lt;slots&gt;</li>
-                  <li>active: AtomicUsize</li>
-                </ul>
-                <ul>
-                  <li>alloc / complete / take</li>
-                </ul>
-              </article>
-              <p class="rel">槽位</p>
-              <article class="uml enum">
-                <h3>&lt;&lt;enum&gt;&gt; Slot</h3>
-                <ul>
-                  <li>Waiting(Option&lt;Waker&gt;)</li>
-                  <li>Done(Result&lt;Payload&gt;)</li>
-                </ul>
-              </article>
-            </div>
-            <div>
-              <article class="uml">
-                <h3>Config</h3>
-                <ul>
-                  <li>thread / profile</li>
-                  <li>sections: toml::Table</li>
-                </ul>
-                <ul>
-                  <li>from_toml_file</li>
-                  <li>section / has_section</li>
-                </ul>
-              </article>
-              <article class="uml">
-                <h3>Builder</h3>
-                <ul>
-                  <li>config / registry / timer</li>
-                  <li>startup_services</li>
-                </ul>
-                <ul>
-                  <li>service / exclusive_service</li>
-                  <li>timer / run</li>
-                </ul>
-              </article>
-            </div>
-          </div>
-        </div>
-      </figure>
-
-      <figure class="plate">
-        <div class="plate-head"><h2>观测快照</h2><span class="dwg">DWG-CLS-06</span></div>
-        <div class="plate-body">
-          <div class="grid-3">
-            <article class="uml enum">
-              <h3>&lt;&lt;enum&gt;&gt; ServiceLifecycle</h3>
-              <ul>
-                <li>Initializing</li>
-                <li>Running</li>
-                <li>Failed</li>
-              </ul>
-            </article>
-            <article class="uml">
-              <h3>NodeStats</h3>
-              <ul>
-                <li>service_count</li>
-                <li>business_service_count</li>
-                <li>runnable_services</li>
-                <li>uptime_ms</li>
-              </ul>
-            </article>
-            <article class="uml">
-              <h3>ServiceStats</h3>
-              <ul>
-                <li>handle / kind / names</li>
-                <li>exclusive / reserved</li>
-                <li>mailbox_len / task_count</li>
-                <li>pending_calls / message_count</li>
-                <li>cpu_time_micros / endless</li>
-              </ul>
-            </article>
-          </div>
-        </div>
-        <p class="plate-cap">快照可序列化、各字段独立采样。抓取不访问 SvcCell，也不阻塞服务执行。dashboard 读的就是这一份。</p>
-      </figure>
-
-      <figure class="plate">
-        <div class="plate-head"><h2>服务 crate 类型</h2><span class="dwg">DWG-CLS-07</span></div>
-        <div class="plate-body">
-          <div class="grid-4">
-            <article class="uml"><h3>Logger</h3><ul><li>Exclusive</li><li>TEXT 消息</li><li>max_queue 丢旧</li></ul></article>
-            <article class="uml"><h3>SignalService</h3><ul><li>Exclusive</li><li>回调 fn(&amp;Ctx)</li><li>crash helper</li></ul></article>
-            <article class="uml"><h3>NetService</h3><ul><li>Exclusive</li><li>mio Poll</li><li>SocketEvent</li></ul></article>
-            <article class="uml"><h3>TlsService</h3><ul><li>Service</li><li>rustls</li><li>TlsEvent</li></ul></article>
-            <article class="uml"><h3>HttpClientService</h3><ul><li>连接池 actor</li><li>ureq-proto</li></ul></article>
-            <article class="uml"><h3>HttpServer</h3><ul><li>嵌入业务服务</li><li>upgrade_websocket</li></ul></article>
-            <article class="uml"><h3>ClusterService</h3><ul><li>HandlerRegistry</li><li>NodeId / ClusterAddr</li></ul></article>
-            <article class="uml"><h3>DashboardService</h3><ul><li>内嵌静态页</li><li>/api/v1/stats</li></ul></article>
-          </div>
-        </div>
-      </figure>
-
-      <figure class="plate">
-        <div class="plate-head"><h2>集群类型</h2><span class="dwg">DWG-CLS-08</span></div>
-        <div class="plate-body">
-          <div class="grid-3">
-            <article class="uml">
-              <h3>NodeId</h3>
-              <ul>
-                <li>newtype u32，禁止 0</li>
-              </ul>
-            </article>
-            <article class="uml">
-              <h3>ClusterAddr</h3>
-              <ul>
-                <li>node: NodeId</li>
-                <li>service: Addr</li>
-              </ul>
-            </article>
-            <article class="uml">
-              <h3>RemoteContext</h3>
-              <ul>
-                <li>log / post / request</li>
-                <li>now / sleep / yield_now</li>
-                <li>不暴露内部 handle</li>
-              </ul>
-            </article>
-          </div>
-        </div>
-      </figure>
+      </div>
     </section>
 
-    <section class="doc" id="life">
-      <h2>启动与收工</h2>
-      <p class="intro">启动顺序是固定的，因为后面每一步都要有人记日志、有时间可挂、有信号可中断。</p>
-
-      <figure class="plate">
-        <div class="plate-head"><h2>启动顺序</h2><span class="dwg">DWG-BOOT-01</span></div>
-        <div class="plate-body">
-          <div class="grid-4">
-            <div class="cell"><span class="label">先</span><h3>crash::install</h3><p>自定义入口必须最先装，guard 留到进程结束。</p></div>
-            <div class="cell"><span class="label">系统</span><h3>logger</h3><p>后面每一步的岔子都有人记。</p></div>
-            <div class="cell"><span class="label">系统</span><h3>signal</h3><p>业务起来之前就能优雅关停。</p></div>
-            <div class="cell"><span class="label">系统</span><h3>timer</h3><p>引导期间刻度已经在走。</p></div>
-          </div>
-          <div class="arrow down" aria-hidden="true"></div>
-          <div class="chips" style="margin: 10px 0">
-            <span class="chip ox">net</span>
-            <span class="chip">tls</span>
-            <span class="chip">http-client</span>
-            <span class="chip">cluster</span>
-            <span class="chip">dashboard</span>
-          </div>
-          <div class="arrow down" aria-hidden="true"></div>
-          <div class="cell live">
-            <h3>bootstrap 再拉业务</h3>
-            <p>逐项等待 init 完整返回 Ok。初始化期间 RPC、timer、IO 回包仍可推进；普通业务消息 FIFO 暂存，成功后再放行。启动阶段服务数短暂归零不会提前关停，booted 之后才重新检查退出条件。</p>
-          </div>
-        </div>
-      </figure>
-
-      <figure class="plate">
-        <div class="plate-head"><h2>关停顺序</h2><span class="dwg">DWG-BOOT-02</span></div>
-        <div class="plate-body">
-          <div class="flow">
-            <div class="col">
-              <div class="cell"><h3>abort</h3><p>置收工。在途 call 收到 ERROR，不再永久挂起。</p></div>
-            </div>
-            <div class="arrow" aria-hidden="true"></div>
-            <div class="col">
-              <div class="cell"><h3>retire_all</h3><p>送走普通服务，join 它们的独占线程（若有）。</p></div>
-            </div>
-            <div class="arrow" aria-hidden="true"></div>
-            <div class="col">
-              <div class="cell live"><h3>最后摘保留服务</h3><p>logger 与 timer 留到最后。独占线程发现自己已死，先排空邮箱再销毁。</p></div>
-            </div>
-          </div>
-        </div>
-      </figure>
-
-      <figure class="plate">
-        <div class="plate-head"><h2>panic 契约</h2><span class="dwg">DWG-BOOT-03</span></div>
-        <div class="plate-body">
-          <div class="grid-2">
-            <div class="cell">
-              <h3>内核不恢复 panic</h3>
-              <p>worker、exclusive、Future::poll、dispatch、Drop 里的 panic 都是进程级故障。profile 统一 panic = abort，hook 仍会跑，由 rskynet-signal 写报告。</p>
-            </div>
-            <div class="cell">
-              <h3>测试例外</h3>
-              <p>cargo test 的 harness 强制 unwind。原生崩溃测试默认跳过，需要时设 RSKYNET_RUN_NATIVE_CRASH_TEST=1。</p>
-            </div>
-          </div>
-        </div>
-      </figure>
-
-      <figure class="plate">
-        <div class="plate-head"><h2>本机读数 仅作量级</h2><span class="dwg">DWG-PERF-01</span></div>
-        <div class="plate-body" style="overflow-x:auto">
-          <table class="data">
-            <thead>
-              <tr><th>场景</th><th>读数</th></tr>
-            </thead>
-            <tbody>
-              <tr><td>4 worker，64 服务 × 64 令牌接力</td><td>约 611 万次/秒</td></tr>
-              <tr><td>16 worker，4 服务 × 4 令牌（测唤醒）</td><td>约 262 万次/秒</td></tr>
-              <tr><td>2 worker，单服务一百万条消息</td><td>约 389 万条/秒</td></tr>
-              <tr><td>debug，ping_pong 1000 轮</td><td>约 14 微秒一个来回</td></tr>
-            </tbody>
-          </table>
-        </div>
-        <p class="plate-cap">Apple M1 Max，五轮中位数，thin LTO。尚未实现 gate / agent 与 debug_console。节点不是全局单例，同进程可跑多个。</p>
-      </figure>
+    <section class="section">
+      <div class="wrap">
+        <div class="section-head reveal"><div class="section-tag">Runtime contracts</div><h2>理解这三条，就理解了 rskynet</h2></div>
+        <div class="truth-grid reveal"><article class="truth"><h3>服务就是隔离边界</h3><p>每个服务有独立地址、邮箱与任务集。业务状态属于服务，不在节点间共享。</p><code>Handle → Mailbox → Service</code></article><article class="truth"><h3>串行不是单线程</h3><p>单个服务任意时刻只被一个 worker 执行；多个服务仍在可窃取线程池上并行。</p><code>one actor / one executor at a time</code></article><article class="truth"><h3>等待不会堵住 worker</h3><p>request、sleep 与外部事件都挂起 Future；Waker 只让所属服务重新进入调度。</p><code>Pending → Ready(TaskId)</code></article></div>
+      </div>
     </section>
-
-    <footer class="colophon">
-      rskynet 0.1 · 架构说明页 · 源码在 crates/ · 这份页面只描述当前树，不代替 crate 文档。
-    </footer>
   </main>
 
+  <footer><div class="wrap footer-grid"><div><div class="footer-title">从一条消息，进入整个运行时。</div><p class="footer-copy">运行示例：<code>cargo run -p rskynet-examples -- config/examples/ping_pong.toml</code></p></div><div class="footer-meta">rskynet 0.1.0<br>Rust 2024 · MIT<br>architecture guide</div></div></footer>
+
   <script>
-    (function () {
-      var scenes = [
-        { state: "queued", text: "服务创建时落在 Queued，保证 init 完成前不会被第二个执行者领走。" },
-        { state: "running", text: "worker 从运行队列取到，CAS 进入 Running，开始独占执行。" },
-        { state: "notified", text: "持有期间又有投递。状态改为 Notified，投递方不必再入队。" },
-        { state: "running", text: "消费方看见 Notified，复位后重扫。队列里一定有东西，循环收敛。" },
-        { state: "idle", text: "两条队列都空，CAS 回到 Idle，服务脱离运行队列。" },
-        { state: "queued", text: "新的投递：先压队列，再 CAS Idle 到 Queued，由投递方负责入队。" }
-      ];
-      var i = 1;
-      var states = document.querySelectorAll("#states .state");
-      var readout = document.getElementById("readout");
+    const modes = {
+      post: { type: 'POST', copy: '真实路径：先写目标邮箱，再由 notify 把服务提交 Scheduler；worker 取得服务后，Message 先生成 Task，随后 Ready(TaskId) 才触发第一次 Future::poll。', desc: 'POST 模式：消息先写入目标邮箱，由 notify 将服务提交 Scheduler；worker 取得服务后把消息转为 Future 任务，再从 ready 队列取出并 poll。' },
+      request: { type: 'REQUEST', copy: '回包不会直接唤醒调用代码：RESPONSE 先进入调用方邮箱并让服务被调度；run_service 处理回包、完成 SessionTable、推入 Ready(TaskId)，再由同一执行权继续 poll 原 Call。', desc: 'REQUEST 模式：请求经目标邮箱和 Scheduler 执行；响应再次经过调用方邮箱和 Scheduler，SessionTable 完成后将原任务推入 ready 队列并恢复 Call。' },
+      remote: { type: 'REMOTE', copy: '跨节点调用首先是一次发往本地 .cluster Actor 的普通 request；ClusterService 保存 request_id、编码 Envelope，再通过 .net 独占线程发送。远端仍经 Net、Cluster 邮箱与 Scheduler 后才执行 handler。', desc: 'REMOTE 模式：调用先调度本地 ClusterService，再经 NetService 和 TCP 到远端 NetService；远端 ClusterService 经邮箱调度后按 target 与 TYPE_ID 执行 handler。' }
+    };
+    const stage = document.querySelector('.runtime-stage');
+    document.querySelectorAll('.mode-switch button').forEach(button => button.addEventListener('click', () => {
+      const mode = button.dataset.mode, data = modes[mode];
+      document.querySelectorAll('.mode-switch button').forEach(b => b.setAttribute('aria-pressed', String(b === button)));
+      stage.querySelectorAll('.mode-layer').forEach(layer => layer.classList.toggle('active', layer.dataset.modeLayer === mode));
+      stage.querySelector('#runtime-desc').textContent = data.desc;
+      document.querySelector('.readout-type').textContent = data.type;
+      document.querySelector('.readout-copy').textContent = data.copy;
+    }));
 
-      function paint() {
-        var scene = scenes[i];
-        states.forEach(function (el) {
-          el.classList.toggle("is-live", el.getAttribute("data-state") === scene.state);
-        });
-        readout.textContent = scene.text;
-      }
+    const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const reveals = document.querySelectorAll('.reveal');
+    if (reduced || !('IntersectionObserver' in window)) reveals.forEach(el => el.classList.add('visible'));
+    else {
+      const observer = new IntersectionObserver(entries => entries.forEach(entry => {
+        if (entry.isIntersecting) { entry.target.classList.add('visible'); observer.unobserve(entry.target); }
+      }), { threshold: .08 });
+      reveals.forEach(el => observer.observe(el));
+    }
 
-      document.getElementById("step").addEventListener("click", function () {
-        i = (i + 1) % scenes.length;
-        paint();
-      });
-      document.getElementById("reset").addEventListener("click", function () {
-        i = 1;
-        paint();
-      });
-
-      var links = Array.prototype.slice.call(document.querySelectorAll(".toc a"));
-      var sections = links.map(function (a) {
-        return document.querySelector(a.getAttribute("href"));
-      }).filter(Boolean);
-
-      if ("IntersectionObserver" in window && sections.length) {
-        var io = new IntersectionObserver(function (entries) {
-          entries.forEach(function (entry) {
-            if (!entry.isIntersecting) return;
-            links.forEach(function (a) {
-              a.setAttribute("aria-current", a.getAttribute("href") === "#" + entry.target.id ? "true" : "false");
-            });
-          });
-        }, { rootMargin: "-30% 0px -60% 0px", threshold: 0 });
-        sections.forEach(function (s) { io.observe(s); });
-      }
-    })();
+    const sections = [...document.querySelectorAll('main section[id]')];
+    const links = [...document.querySelectorAll('.topnav a[href^="#"]')];
+    const syncNav = () => {
+      const y = window.scrollY + 140;
+      let current = sections[0]?.id;
+      sections.forEach(section => { if (section.offsetTop <= y) current = section.id; });
+      links.forEach(link => link.classList.toggle('active', link.hash === '#' + current));
+    };
+    addEventListener('scroll', syncNav, { passive: true }); syncNav();
   </script>
 </body>
 </html>

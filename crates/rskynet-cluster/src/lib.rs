@@ -498,6 +498,20 @@ struct Peer {
     buffer: Vec<u8>,
 }
 
+impl Peer {
+    fn claim(&mut self, node: NodeId) -> bool {
+        if self.node.is_some() {
+            return false;
+        }
+        self.node = Some(node);
+        true
+    }
+
+    fn reconnect_node(&self) -> Option<NodeId> {
+        self.expected.or(self.node)
+    }
+}
+
 #[derive(Default)]
 struct State {
     next_request: u64,
@@ -813,6 +827,15 @@ impl ClusterService {
             let _ = net::shutdown(ctx, socket);
             return;
         }
+        if state
+            .peers
+            .get_mut(&socket)
+            .is_some_and(|peer| !peer.claim(node))
+        {
+            drop(state);
+            let _ = net::shutdown(ctx, socket);
+            return;
+        }
         // 两边同时建连时，统一保留由较小 NodeId 发起的那条；只有一条时
         // 无论谁发起都接受。这样两端不会各自关掉对方选中的连接。
         let local = self.node_id.borrow().unwrap();
@@ -835,7 +858,6 @@ impl ClusterService {
                 return;
             }
         }
-        state.peers.get_mut(&socket).unwrap().node = Some(node);
         if let Some(old) = state.nodes.insert(node, socket) {
             if old != socket {
                 state.peers.remove(&old);
@@ -935,7 +957,17 @@ impl ClusterService {
 
     fn disconnected(&self, ctx: &Ctx, socket: SocketId) {
         let mut state = self.state.borrow_mut();
-        let node = state.peers.remove(&socket).and_then(|peer| peer.node);
+        let node = state.peers.remove(&socket).and_then(|peer| {
+            let node = peer.reconnect_node()?;
+            if state
+                .nodes
+                .get(&node)
+                .is_some_and(|active| *active != socket)
+            {
+                return None;
+            }
+            Some(node)
+        });
         if let Some(node) = node {
             if state.nodes.get(&node) == Some(&socket) {
                 state.nodes.remove(&node);
@@ -1128,5 +1160,32 @@ mod tests {
             ServiceKey::Name("direct-send".into()),
             DirectNotice::TYPE_ID,
         )));
+    }
+
+    #[test]
+    fn peer_identity_is_claimed_once() {
+        let first = NodeId::new(2).unwrap();
+        let second = NodeId::new(3).unwrap();
+        let mut peer = Peer {
+            node: None,
+            expected: None,
+            buffer: Vec::new(),
+        };
+
+        assert!(peer.claim(first));
+        assert!(!peer.claim(second));
+        assert_eq!(peer.node, Some(first));
+    }
+
+    #[test]
+    fn outbound_peer_reconnects_before_hello() {
+        let expected = NodeId::new(7).unwrap();
+        let peer = Peer {
+            node: None,
+            expected: Some(expected),
+            buffer: Vec::new(),
+        };
+
+        assert_eq!(peer.reconnect_node(), Some(expected));
     }
 }

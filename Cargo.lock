@@ -1754,6 +1754,7 @@ dependencies = [
 name = "rskynet-http"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "rcgen",
  "rskynet-bootstrap",
  "rskynet-core",
@@ -1790,6 +1791,7 @@ dependencies = [
 name = "rskynet-net"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "mio 1.2.2",
  "rskynet-core",
  "rskynet-macros",

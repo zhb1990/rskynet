@@ -502,25 +502,22 @@ impl TlsService {
         data: Vec<u8>,
         high: bool,
     ) -> Answer {
-        let write = {
-            let mut state = self.state.borrow_mut();
-            let Some(connection) = state.connections.get_mut(&id) else {
-                return missing(id);
-            };
-            if connection.owner != source {
-                return denied(id);
-            }
-            if !connection.announced || connection.closing {
-                return Answer::Failed(format!("{id} 当前不能发送明文"));
-            }
-            connection.connection.writer().write_all(&data)
+        let (socket, encrypted) = match self.encrypt_plaintext(id, source, &data) {
+            Ok(encoded) => encoded,
+            Err(reason) => return Answer::Failed(reason),
         };
-        if let Err(error) = write {
-            return Answer::Failed(format!("TLS 写入失败：{error}"));
+        if encrypted.is_empty() {
+            return Answer::Done;
         }
-        match self.flush_tls(ctx, id, high) {
+        let sent = if high {
+            net::send(ctx, socket, encrypted)
+        } else {
+            net::send_low(ctx, socket, encrypted)
+        };
+        match sent {
             Ok(()) => Answer::Done,
-            Err(reason) => {
+            Err(error) => {
+                let reason = format!("发送 TLS 密文失败：{error}");
                 self.fail(ctx, id, reason.clone());
                 Answer::Failed(reason)
             }
@@ -535,29 +532,68 @@ impl TlsService {
         data: Vec<u8>,
         high: bool,
     ) -> Answer {
-        let write = {
-            let mut state = self.state.borrow_mut();
-            let Some(connection) = state.connections.get_mut(&id) else {
-                return missing(id);
-            };
-            if connection.owner != source {
-                return denied(id);
-            }
-            if !connection.announced || connection.closing {
-                return Answer::Failed(format!("{id} 当前不能发送明文"));
-            }
-            connection.connection.writer().write_all(&data)
+        let (socket, encrypted) = match self.encrypt_plaintext(id, source, &data) {
+            Ok(encoded) => encoded,
+            Err(reason) => return Answer::Failed(reason),
         };
-        if let Err(error) = write {
-            return Answer::Failed(format!("TLS 写入失败：{error}"));
+        if encrypted.is_empty() {
+            return Answer::Done;
         }
-        match self.flush_tls_wait(ctx, id, high).await {
+        let sent = if high {
+            net::send_wait(ctx, socket, encrypted).await
+        } else {
+            net::send_low_wait(ctx, socket, encrypted).await
+        };
+        match sent {
             Ok(()) => Answer::Done,
-            Err(reason) => {
+            Err(error) => {
+                let reason = format!("发送 TLS 密文失败：{error}");
                 self.fail(ctx, id, reason.clone());
                 Answer::Failed(reason)
             }
         }
+    }
+
+    /// 把任意大小的明文分段喂给 rustls。`set_buffer_limit` 同时限制 rustls 的
+    /// 明文与密文缓冲，因此每接受一段就立刻抽走密文，不能用 `write_all` 在内部
+    /// 缓冲满后留下一个已接受但未发送的前缀。
+    fn encrypt_plaintext(
+        &self,
+        id: TlsId,
+        source: rskynet_core::Handle,
+        data: &[u8],
+    ) -> std::result::Result<(SocketId, Vec<u8>), String> {
+        let mut state = self.state.borrow_mut();
+        let Some(connection) = state.connections.get_mut(&id) else {
+            return Err(format!("{id} 不存在或已经关闭"));
+        };
+        if connection.owner != source {
+            return Err(format!("调用方不是 {id} 的 owner"));
+        }
+        if !connection.announced || connection.closing {
+            return Err(format!("{id} 当前不能发送明文"));
+        }
+
+        let mut encrypted = Vec::new();
+        let mut offset = 0;
+        while offset < data.len() {
+            let written = connection
+                .connection
+                .writer()
+                .write(&data[offset..])
+                .map_err(|error| format!("TLS 写入失败：{error}"))?;
+            if written == 0 {
+                return Err("TLS buffer_limit 太小，无法编码明文".into());
+            }
+            offset += written;
+            while connection.connection.wants_write() {
+                connection
+                    .connection
+                    .write_tls(&mut encrypted)
+                    .map_err(|error| format!("生成 TLS 密文失败：{error}"))?;
+            }
+        }
+        Ok((connection.socket, encrypted))
     }
 
     async fn pause(&self, ctx: &Ctx, id: TlsId, source: rskynet_core::Handle) -> Answer {
@@ -848,38 +884,6 @@ impl TlsService {
             net::send(ctx, socket, encrypted)
         } else {
             net::send_low(ctx, socket, encrypted)
-        };
-        result.map_err(|error| format!("发送 TLS 密文失败：{error}"))
-    }
-
-    async fn flush_tls_wait(
-        &self,
-        ctx: &Ctx,
-        id: TlsId,
-        high: bool,
-    ) -> std::result::Result<(), String> {
-        let (socket, encrypted) = {
-            let mut state = self.state.borrow_mut();
-            let connection = state
-                .connections
-                .get_mut(&id)
-                .ok_or_else(|| format!("{id} 已不存在"))?;
-            let mut encrypted = Vec::new();
-            while connection.connection.wants_write() {
-                connection
-                    .connection
-                    .write_tls(&mut encrypted)
-                    .map_err(|error| format!("生成 TLS 密文失败：{error}"))?;
-            }
-            (connection.socket, encrypted)
-        };
-        if encrypted.is_empty() {
-            return Ok(());
-        }
-        let result = if high {
-            net::send_wait(ctx, socket, encrypted).await
-        } else {
-            net::send_low_wait(ctx, socket, encrypted).await
         };
         result.map_err(|error| format!("发送 TLS 密文失败：{error}"))
     }

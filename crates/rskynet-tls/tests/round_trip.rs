@@ -51,6 +51,10 @@ struct Client {
     config: ClientTlsConfig,
 }
 
+fn large_payload() -> Vec<u8> {
+    (0..512 * 1024 + 123).map(|index| index as u8).collect()
+}
+
 #[rskynet_macros::service(crate = ::rskynet_core)]
 impl Client {
     async fn init(&self, ctx: Ctx) -> Result<()> {
@@ -75,13 +79,14 @@ impl Client {
                 )
                 .await?;
                 rskynet_tls::pause(&task_ctx, id).await?;
-                rskynet_tls::send(&task_ctx, id, b"hello over tls".to_vec())?;
+                let payload = large_payload();
+                rskynet_tls::send_wait(&task_ctx, id, payload.clone()).await?;
                 task_ctx.sleep_ms(50).await;
                 *board.paused_was_silent.lock().unwrap() =
                     board.received.lock().unwrap().is_empty();
                 rskynet_tls::start(&task_ctx, id).await?;
                 for _ in 0..500 {
-                    if board.received.lock().unwrap().as_slice() == b"hello over tls" {
+                    if board.received.lock().unwrap().as_slice() == payload {
                         break;
                     }
                     task_ctx.sleep_ms(10).await;
@@ -144,6 +149,9 @@ fn client_and_server_exchange_plaintext_over_net() {
     config
         .section_mut("signal")
         .insert("name".into(), "".into());
+    config
+        .section_mut("tls")
+        .insert("buffer_limit".into(), 1024.into());
     Builder::new(config)
         .registry(registry)
         .with_wheel_timer()
@@ -153,7 +161,7 @@ fn client_and_server_exchange_plaintext_over_net() {
         .run()
         .expect("TLS 测试节点应正常退出");
 
-    assert_eq!(board.received.lock().unwrap().as_slice(), b"hello over tls");
+    assert_eq!(*board.received.lock().unwrap(), large_payload());
     assert!(
         *board.paused_was_silent.lock().unwrap(),
         "TLS pause 期间不应投递解密后的明文"

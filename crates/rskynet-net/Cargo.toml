@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 rskynet-core = { workspace = true }
 rskynet-macros = { workspace = true }
+futures-util = { workspace = true }
 mio = { workspace = true }
 serde = { workspace = true }
 

@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use rskynet_core::{Ctx, SvcCell};
+use rskynet_core::{Ctx, MsgType, Payload, SvcCell};
 use rskynet_net::SocketEvent;
 use ureq_proto::http::{Request, Response};
 use ureq_proto::server::state::{ProvideResponse, RecvBody, RecvRequest, Send100, SendBody};
@@ -376,7 +376,6 @@ impl ServerRequest {
     }
 }
 
-#[derive(Clone)]
 pub struct ServerResponder {
     handle: ServerBodyHandle,
     active: bool,
@@ -884,52 +883,50 @@ impl ServerCore {
                 break;
             };
             match proto {
-                ServerProto::RecvRequest(mut call) => {
-                    if connection.input.len() > self.config.max_header_size {
-                        return Err(HttpError::BackpressureLimit {
-                            actual: connection.input.len(),
-                            limit: self.config.max_header_size,
+                ServerProto::RecvRequest(mut call) => match call.try_request(&connection.input)? {
+                    (used, Some(request)) => {
+                        connection.input.drain(..used);
+                        let next = call.proceed().expect("request parsed");
+                        connection.body_ended = false;
+                        connection.proto = Some(match next {
+                            RecvRequestResult::Send100(v) => ServerProto::Await100(v),
+                            RecvRequestResult::RecvBody(v) => ServerProto::RecvBody(v),
+                            RecvRequestResult::ProvideResponse(v) => {
+                                connection.body_ended = true;
+                                ServerProto::Provide(v)
+                            }
                         });
+                        let handle = ServerBodyHandle {
+                            core: self.clone(),
+                            transport,
+                        };
+                        let (parts, _) = request.into_parts();
+                        result.push(ServerRequest {
+                            request: Request::from_parts(
+                                parts,
+                                IncomingBody::server(handle.clone()),
+                            ),
+                            peer: connection.peer,
+                            tls: connection.tls,
+                            listener: connection.listener,
+                            responder: ServerResponder {
+                                handle,
+                                active: true,
+                            },
+                        });
+                        continue;
                     }
-                    match call.try_request(&connection.input)? {
-                        (used, Some(request)) => {
-                            connection.input.drain(..used);
-                            let next = call.proceed().expect("request parsed");
-                            connection.body_ended = false;
-                            connection.proto = Some(match next {
-                                RecvRequestResult::Send100(v) => ServerProto::Await100(v),
-                                RecvRequestResult::RecvBody(v) => ServerProto::RecvBody(v),
-                                RecvRequestResult::ProvideResponse(v) => {
-                                    connection.body_ended = true;
-                                    ServerProto::Provide(v)
-                                }
+                    (_, None) => {
+                        if connection.input.len() > self.config.max_header_size {
+                            return Err(HttpError::BackpressureLimit {
+                                actual: connection.input.len(),
+                                limit: self.config.max_header_size,
                             });
-                            let handle = ServerBodyHandle {
-                                core: self.clone(),
-                                transport,
-                            };
-                            let (parts, _) = request.into_parts();
-                            result.push(ServerRequest {
-                                request: Request::from_parts(
-                                    parts,
-                                    IncomingBody::server(handle.clone()),
-                                ),
-                                peer: connection.peer,
-                                tls: connection.tls,
-                                listener: connection.listener,
-                                responder: ServerResponder {
-                                    handle,
-                                    active: true,
-                                },
-                            });
-                            continue;
                         }
-                        (_, None) => {
-                            connection.proto = Some(ServerProto::RecvRequest(call));
-                            break;
-                        }
+                        connection.proto = Some(ServerProto::RecvRequest(call));
+                        break;
                     }
-                }
+                },
                 ServerProto::RecvBody(mut call) => {
                     if connection.input.is_empty() {
                         connection.proto = Some(ServerProto::RecvBody(call));
@@ -1013,7 +1010,7 @@ impl ServerCore {
             self.remove_connection(transport);
             return;
         };
-        let generation = {
+        let (generation, buffered) = {
             let mut state = self.state.borrow_mut();
             let Some(connection) = state.connections.get_mut(&transport) else {
                 return;
@@ -1025,9 +1022,31 @@ impl ServerCore {
             connection.response_expected = None;
             connection.response_written = 0;
             connection.header_generation = connection.header_generation.wrapping_add(1).max(1);
-            connection.header_generation
+            (connection.header_generation, !connection.input.is_empty())
         };
         self.arm_header_timeout(ctx, transport, generation);
+        if buffered {
+            // HTTP/1.1 pipelining 可能把下一条请求留在当前 input 中。投一条空数据
+            // 事件让嵌入本 HttpServer 的业务服务重新进入公开事件入口并取走请求。
+            let event = match transport {
+                TransportId::Plain(id) => (
+                    MsgType::SOCKET,
+                    Payload::of(SocketEvent::Data {
+                        id,
+                        data: Vec::new(),
+                    }),
+                ),
+                #[cfg(feature = "tls")]
+                TransportId::Tls(id) => (
+                    MsgType::TLS,
+                    Payload::of(TlsEvent::Data {
+                        id,
+                        data: Vec::new(),
+                    }),
+                ),
+            };
+            let _ = ctx.send(ctx.handle(), event.0, event.1);
+        }
     }
 
     fn arm_header_timeout(self: &Arc<Self>, ctx: &Ctx, transport: TransportId, generation: u64) {

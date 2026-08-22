@@ -1,10 +1,13 @@
-use std::net::SocketAddr;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use futures_util::future::{Either, select};
 use rskynet_bootstrap::ConfigExt as _;
 use rskynet_core::{Builder, Config, Ctx, MsgType, Registry, Result};
 use rskynet_http::http::{Request, Response};
-use rskynet_http::{BodySpec, HttpServer, RegistryExt as _, ServerRequest};
+use rskynet_http::{BodySpec, HttpServer, HttpServerConfig, RegistryExt as _, ServerRequest};
 use rskynet_net::{RegistryExt as _, SocketEvent};
 use rskynet_timer::BuilderExt as _;
 
@@ -13,6 +16,8 @@ struct Board {
     address: Mutex<Option<SocketAddr>>,
     responses: Mutex<Vec<Vec<u8>>>,
     accepted: Mutex<usize>,
+    served: Mutex<Vec<String>>,
+    pipeline_ok: Mutex<bool>,
 }
 
 struct Api {
@@ -50,8 +55,78 @@ impl Api {
             return;
         };
         for request in requests {
+            self.board
+                .served
+                .lock()
+                .unwrap()
+                .push(request.request.uri().path().to_owned());
             let _ = serve(&ctx, request).await;
         }
+    }
+}
+
+struct PipelineClient {
+    board: Arc<Board>,
+}
+
+#[rskynet_macros::service(crate = ::rskynet_core)]
+impl PipelineClient {
+    async fn init(&self, ctx: Ctx) -> Result<()> {
+        let board = self.board.clone();
+        let node = ctx.node();
+        std::thread::spawn(move || {
+            let outcome = (|| -> std::io::Result<bool> {
+                let address = loop {
+                    if let Some(address) = *board.address.lock().unwrap() {
+                        break address;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                };
+                let mut stream = TcpStream::connect(address)?;
+                stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                let mut request = format!(
+                    "POST /echo HTTP/1.1\r\nHost: {address}\r\nContent-Length: 1024\r\n\r\n"
+                )
+                .into_bytes();
+                request.extend(std::iter::repeat_n(b'a', 1024));
+                request.extend_from_slice(
+                    format!("GET /second HTTP/1.1\r\nHost: {address}\r\n\r\n").as_bytes(),
+                );
+                stream.write_all(&request)?;
+
+                let mut received = Vec::new();
+                let mut buffer = [0u8; 4096];
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(size) => {
+                            received.extend_from_slice(&buffer[..size]);
+                            if received
+                                .windows(b"HTTP/1.1 200".len())
+                                .filter(|window| *window == b"HTTP/1.1 200")
+                                .count()
+                                == 2
+                            {
+                                return Ok(true);
+                            }
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            break;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                Ok(false)
+            })();
+            *board.pipeline_ok.lock().unwrap() = outcome.unwrap_or(false);
+            node.abort();
+        });
+        Ok(())
     }
 }
 
@@ -200,11 +275,56 @@ impl Client {
                     .await
                     .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
                 board.responses.lock().unwrap().push(b"rejected".to_vec());
+
+                // 占住唯一连接，再取消一个已经进入连接池等待队列的 start。释放首个
+                // exchange 后，第三个请求必须能继续，不能被孤儿 start 吞掉容量。
+                let held = Request::get(format!("http://{address}/large"))
+                    .body(BodySpec::Empty)
+                    .unwrap();
+                let mut held = rskynet_http::client::start(&ctx, held)
+                    .await
+                    .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
+                let queued = Request::get(format!("http://{address}/echo"))
+                    .body(BodySpec::Empty)
+                    .unwrap();
+                match select(
+                    Box::pin(rskynet_http::client::start(&ctx, queued)),
+                    Box::pin(ctx.sleep_ms(20)),
+                )
+                .await
+                {
+                    Either::Right(((), _)) => {}
+                    Either::Left((_result, _)) => {
+                        return Err(rskynet_core::Error::Service(
+                            "连接池已满时 start 不应提前完成".into(),
+                        ));
+                    }
+                }
+                held.response(&ctx)
+                    .await
+                    .map_err(|e| rskynet_core::Error::Service(e.to_string()))?
+                    .into_body()
+                    .discard(&ctx)
+                    .await
+                    .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
+                let final_response = rskynet_http::client::request(
+                    &ctx,
+                    Request::get(format!("http://{address}/echo"))
+                        .body(Vec::new())
+                        .unwrap(),
+                )
+                .await
+                .map_err(|e| rskynet_core::Error::Service(e.to_string()))?
+                .into_body()
+                .collect(&ctx, 1024)
+                .await
+                .map_err(|e| rskynet_core::Error::Service(e.to_string()))?;
+                board.responses.lock().unwrap().push(final_response);
                 Ok(())
             }
             .await;
-            assert!(result.is_ok(), "HTTP 客户端流程失败: {result:?}");
             task_ctx.abort();
+            assert!(result.is_ok(), "HTTP 客户端流程失败: {result:?}");
         });
         Ok(())
     }
@@ -241,6 +361,24 @@ fn streams_requests_responses_and_reuses_plain_connection() {
     config
         .section_mut("http-client")
         .insert("max_chunk_size".into(), 64.into());
+    config
+        .section_mut("http-client")
+        .insert("max_header_size".into(), 256.into());
+    config
+        .section_mut("http-client")
+        .insert("max_connections".into(), 1.into());
+    config
+        .section_mut("http-client")
+        .insert("max_connections_per_origin".into(), 1.into());
+    config
+        .section_mut("http-client")
+        .insert("max_idle_connections".into(), 1.into());
+    config
+        .section_mut("http-client")
+        .insert("max_idle_connections_per_origin".into(), 1.into());
+    config
+        .section_mut("net")
+        .insert("min_read_buffer".into(), 4096.into());
     Builder::new(config)
         .registry(registry)
         .with_wheel_timer()
@@ -257,7 +395,55 @@ fn streams_requests_responses_and_reuses_plain_connection() {
             vec![b'x'; 512],
             b"continued".to_vec(),
             b"rejected".to_vec(),
+            b"empty".to_vec(),
         ]
     );
-    assert_eq!(*board.accepted.lock().unwrap(), 1, "两次请求应复用同一连接");
+    assert_eq!(
+        *board.accepted.lock().unwrap(),
+        2,
+        "常规请求应复用连接；拒绝未发送的 Expect body 后允许重建一次"
+    );
+}
+
+#[test]
+fn coalesced_body_and_pipelined_request_are_processed_without_more_input() {
+    let board = Arc::new(Board::default());
+    let api_board = board.clone();
+    let client_board = board.clone();
+    let http_config = HttpServerConfig {
+        max_header_size: 256,
+        ..HttpServerConfig::default()
+    };
+    let registry = Registry::new()
+        .with_net()
+        .with("api", move || Api {
+            http: HttpServer::new(http_config.clone()),
+            board: api_board.clone(),
+        })
+        .with("pipeline-client", move || PipelineClient {
+            board: client_board.clone(),
+        });
+    let mut config = Config::default().with_bootstrap(["api", "pipeline-client"]);
+    config
+        .section_mut("logger")
+        .insert("name".into(), "".into());
+    config
+        .section_mut("signal")
+        .insert("name".into(), "".into());
+    config
+        .section_mut("net")
+        .insert("min_read_buffer".into(), 4096.into());
+    Builder::new(config)
+        .registry(registry)
+        .with_wheel_timer()
+        .service("bootstrap", || rskynet_bootstrap::Bootstrap)
+        .startup_service(rskynet_net::NAME, "")
+        .run()
+        .unwrap();
+
+    assert!(*board.pipeline_ok.lock().unwrap());
+    assert_eq!(
+        *board.served.lock().unwrap(),
+        vec!["/echo".to_string(), "/second".to_string()]
+    );
 }

@@ -24,6 +24,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::future::{Either, select};
 use mio::event::Event;
 use mio::net::{TcpListener, TcpStream, UdpSocket};
 use mio::{Events, Poll, Registry, Token, Waker};
@@ -76,7 +77,7 @@ enum Step {
 /// 地址得先解析才办得了的命令。
 enum Deferred {
     Listen,
-    Connect { timeout_ms: Option<u64> },
+    Connect { deadline_ms: Option<u64> },
     Udp,
     UdpConnect { id: SocketId },
 }
@@ -384,6 +385,9 @@ impl NetService {
                 let Some(socket) = sockets.get(id) else {
                     return;
                 };
+                if socket.paused {
+                    return;
+                }
                 let Kind::Udp(udp) = &socket.kind else {
                     return;
                 };
@@ -638,22 +642,23 @@ impl NetService {
             Command::Connect { addr } => match parse(&addr) {
                 Some(addr) => self.do_connect(ctx, addr, waiting, None),
                 None => {
-                    return self.defer(ctx, addr, waiting, Deferred::Connect { timeout_ms: None });
+                    return self.defer(ctx, addr, waiting, Deferred::Connect { deadline_ms: None });
                 }
             },
-            Command::ConnectWithTimeout { addr, timeout_ms } => match parse(&addr) {
-                Some(addr) => self.do_connect(ctx, addr, waiting, Some(timeout_ms)),
-                None => {
-                    return self.defer(
+            Command::ConnectWithTimeout { addr, timeout_ms } => {
+                let deadline_ms = Some(ctx.now().saturating_add(timeout_ms));
+                match parse(&addr) {
+                    Some(addr) => self.do_connect_candidates(
                         ctx,
-                        addr,
+                        VecDeque::from([addr]),
                         waiting,
-                        Deferred::Connect {
-                            timeout_ms: Some(timeout_ms),
-                        },
-                    );
+                        deadline_ms,
+                    ),
+                    None => {
+                        return self.defer(ctx, addr, waiting, Deferred::Connect { deadline_ms });
+                    }
                 }
-            },
+            }
             Command::Udp { bind } => {
                 let bind = bind.unwrap_or_else(|| ANY_UDP.to_string());
                 match parse(&bind) {
@@ -1065,7 +1070,11 @@ impl NetService {
         let me = self.clone();
         let task = ctx.clone();
         ctx.spawn(async move {
-            let answer = match me.resolve(&task, host).await {
+            let deadline_ms = match &then {
+                Deferred::Connect { deadline_ms } => *deadline_ms,
+                _ => None,
+            };
+            let answer = match me.resolve(&task, host, deadline_ms).await {
                 Ok(addrs) => me.after_resolve(&task, then, addrs, waiting),
                 Err(reason) => Some(Answer::Failed(reason)),
             };
@@ -1079,6 +1088,7 @@ impl NetService {
         &self,
         ctx: &Ctx,
         host: String,
+        deadline_ms: Option<u64>,
     ) -> std::result::Result<Vec<SocketAddr>, String> {
         if self.resolver.borrow().is_none() {
             match Resolver::spawn() {
@@ -1089,13 +1099,24 @@ impl NetService {
             }
         }
         // 闭包在 await 之前就同步跑完，所以这个借用不会跨过挂起点
-        let replied = ctx
-            .call_external(|token| {
-                if let Some(resolver) = self.resolver.borrow().as_ref() {
-                    resolver.submit(host, token);
+        let replied = ctx.call_external(|token| {
+            if let Some(resolver) = self.resolver.borrow().as_ref() {
+                resolver.submit(host, token);
+            }
+        });
+        let replied = match deadline_ms {
+            Some(deadline) => {
+                let remaining = deadline.saturating_sub(ctx.now());
+                if remaining == 0 {
+                    return Err("域名解析超时".to_string());
                 }
-            })
-            .await;
+                match select(Box::pin(replied), Box::pin(ctx.sleep_ms(remaining))).await {
+                    Either::Left((replied, _)) => replied,
+                    Either::Right(((), _)) => return Err("域名解析超时".to_string()),
+                }
+            }
+            None => replied.await,
+        };
         match replied {
             Ok(payload) => match payload.downcast::<Resolved>() {
                 Ok(resolved) => resolved.0,
@@ -1117,8 +1138,7 @@ impl NetService {
         };
         match then {
             Deferred::Listen => Some(self.do_listen(addr, waiting.source)),
-            Deferred::Connect { timeout_ms } => {
-                let deadline_ms = timeout_ms.map(|timeout| ctx.now().saturating_add(timeout));
+            Deferred::Connect { deadline_ms } => {
                 self.do_connect_candidates(ctx, addrs.into(), waiting, deadline_ms)
             }
             Deferred::Udp => Some(self.do_udp(addr, waiting.source)),
