@@ -18,8 +18,8 @@ profile = true
 [logger]
 # 服务类型名。换成自己的实现就改这里，留空表示不起日志服务（退回 stderr）。
 name = "logger"
-# 日志文件路径。留空则只写标准输出。
-path = ""
+# 日志文件基础路径。实际文件名会追加 .YYYYMMDD.HHMMSS.NNN；留空则只写标准输出。
+path = "/Users/zhb/dev/rust/rskynet/crash/dev.log"
 # 本地日期变化时滚动日志文件。
 rotate_daily = true
 # 单个活动日志文件最大字节数；0 表示不按大小滚动。默认 100 MiB。

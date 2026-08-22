@@ -14,7 +14,7 @@
 //! [logger]
 //! # 换成自己的实现就改这里，内核按它去注册表里找
 //! name = "logger"
-//! # 日志文件路径，留空则只写标准输出
+//! # 日志文件基础路径，留空则只写标准输出；实际文件名会带时间与序号
 //! path = "run/rskynet.log"
 //! # 本地日期变化时滚动日志文件
 //! rotate_daily = true
@@ -41,7 +41,7 @@ const DEFAULT_MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 struct LoggerConfig {
-    /// 日志文件路径，留空表示只写标准输出。
+    /// 日志文件基础路径，留空表示只写标准输出。
     path: String,
     /// 本地日期变化时是否滚动日志文件。
     rotate_daily: bool,
@@ -65,6 +65,7 @@ impl Default for LoggerConfig {
 #[derive(Debug)]
 struct LogFile {
     file: File,
+    path: PathBuf,
     date: NaiveDate,
     len: u64,
 }
@@ -78,7 +79,12 @@ impl LogFile {
         }
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         let len = file.metadata()?.len();
-        Ok(Self { file, date, len })
+        Ok(Self {
+            file,
+            path: path.to_owned(),
+            date,
+            len,
+        })
     }
 }
 
@@ -109,7 +115,7 @@ fn should_rotate(
             && file.len.saturating_add(next_line_len) > config.max_file_size)
 }
 
-fn archive_path(path: &Path, timestamp: NaiveDateTime, sequence: u64) -> PathBuf {
+fn log_path(path: &Path, timestamp: NaiveDateTime, sequence: u64) -> PathBuf {
     let file_name = path.file_name().unwrap_or_default().to_string_lossy();
     let stem = path
         .file_stem()
@@ -123,9 +129,9 @@ fn archive_path(path: &Path, timestamp: NaiveDateTime, sequence: u64) -> PathBuf
     path.with_file_name(archive_name)
 }
 
-fn next_archive_path(path: &Path, timestamp: NaiveDateTime) -> Result<PathBuf> {
+fn next_log_path(path: &Path, timestamp: NaiveDateTime) -> Result<PathBuf> {
     for sequence in 1.. {
-        let candidate = archive_path(path, timestamp, sequence);
+        let candidate = log_path(path, timestamp, sequence);
         if !candidate.try_exists()? {
             return Ok(candidate);
         }
@@ -171,7 +177,7 @@ impl Backpressure {
 
 #[derive(Default)]
 pub struct Logger {
-    /// 日志文件路径，空表示只写标准输出。
+    /// 日志文件基础路径，空表示只写标准输出。
     path: SvcCell<String>,
     file: SvcCell<Option<LogFile>>,
     rotation: SvcCell<RotationConfig>,
@@ -179,33 +185,25 @@ pub struct Logger {
 }
 
 impl Logger {
-    fn open(&self, path: &Path, now: DateTime<Local>) -> Result<()> {
-        let file = LogFile::open(path, now.date_naive())?;
+    fn open_new(&self, path: &Path, now: DateTime<Local>) -> Result<()> {
+        let path = next_log_path(path, now.naive_local())?;
+        let file = LogFile::open(&path, now.date_naive())?;
         *self.file.borrow_mut() = Some(file);
         Ok(())
     }
 
     fn rotate(&self, path: &Path, now: DateTime<Local>) -> Result<()> {
-        // Windows 上重命名前必须先释放文件句柄；其它平台也能确保归档内容完整。
-        *self.file.borrow_mut() = None;
-        let archive = match next_archive_path(path, now.naive_local()) {
-            Ok(archive) => archive,
-            Err(error) => {
-                let _ = self.open(path, now);
-                return Err(error);
-            }
+        // 每个活动文件从创建起就带时间和序号；打开新文件失败时保留旧句柄继续写入。
+        self.open_new(path, now)
+    }
+
+    fn reopen(&self, base_path: &Path, now: DateTime<Local>) -> Result<()> {
+        let active_path = self.file.borrow().as_ref().map(|file| file.path.clone());
+        let Some(active_path) = active_path else {
+            return self.open_new(base_path, now);
         };
-        if let Err(error) = std::fs::rename(path, &archive) {
-            // 归档失败时尽力恢复活动文件，保证后续日志仍有机会落盘。
-            let _ = self.open(path, now);
-            return Err(error.into());
-        }
-        if let Err(error) = self.open(path, now) {
-            // 新文件打不开时把归档还原成活动文件，再尝试恢复原来的追加写入。
-            let _ = std::fs::rename(&archive, path);
-            let _ = self.open(path, now);
-            return Err(error);
-        }
+        let file = LogFile::open(&active_path, now.date_naive())?;
+        *self.file.borrow_mut() = Some(file);
         Ok(())
     }
 
@@ -268,7 +266,7 @@ impl Logger {
         };
         let path = config.path.trim().to_string();
         if !path.is_empty() {
-            self.open(Path::new(&path), Local::now())?;
+            self.open_new(Path::new(&path), Local::now())?;
             *self.path.borrow_mut() = path;
         }
         Ok(())
@@ -299,8 +297,7 @@ impl Logger {
             MsgType::SYSTEM => {
                 let path = self.path.borrow().clone();
                 if !path.is_empty() {
-                    *self.file.borrow_mut() = None;
-                    if let Err(err) = self.open(Path::new(&path), Local::now()) {
+                    if let Err(err) = self.reopen(Path::new(&path), Local::now()) {
                         self.write(&ctx, ctx.handle(), &format!("重开日志文件失败：{err}"));
                     }
                 }
@@ -472,18 +469,18 @@ mod tests {
     }
 
     #[test]
-    fn archive_names_include_timestamp_and_never_overwrite() {
+    fn log_names_include_timestamp_and_never_overwrite() {
         let dir = TestDir::new();
         let path = dir.path().join("rskynet.log");
         let timestamp = date(2026, 8, 22).and_hms_opt(15, 30, 45).unwrap();
 
-        let first = next_archive_path(&path, timestamp).unwrap();
+        let first = next_log_path(&path, timestamp).unwrap();
         assert_eq!(
             first.file_name().unwrap().to_string_lossy(),
             "rskynet.20260822.153045.001.log"
         );
         fs::write(&first, []).unwrap();
-        let second = next_archive_path(&path, timestamp).unwrap();
+        let second = next_log_path(&path, timestamp).unwrap();
         assert_eq!(
             second.file_name().unwrap().to_string_lossy(),
             "rskynet.20260822.153045.002.log"
@@ -491,25 +488,36 @@ mod tests {
     }
 
     #[test]
-    fn opening_existing_file_tracks_size_and_rotation_continues_writing() {
+    fn opening_existing_file_tracks_size() {
         let dir = TestDir::new();
         let path = dir.path().join("rskynet.log");
         fs::write(&path, "before\n").unwrap();
+
+        let opened = LogFile::open(&path, date(2026, 8, 22)).unwrap();
+        assert_eq!(opened.len, 7);
+    }
+
+    #[test]
+    fn new_log_files_are_timestamped_from_start_and_after_rotation() {
+        let dir = TestDir::new();
+        let path = dir.path().join("rskynet.log");
         let now = local_datetime(2026, 8, 22, 15, 30, 45);
 
-        let opened = LogFile::open(&path, now.date_naive()).unwrap();
-        assert_eq!(opened.len, 7);
-
         let logger = Logger::default();
-        logger.open(&path, now).unwrap();
+        logger.open_new(&path, now).unwrap();
         *logger.path.borrow_mut() = path.to_string_lossy().into_owned();
+        logger.write_unrotated("first");
         logger.rotate(&path, now).unwrap();
-        logger.write_unrotated("after");
+        logger.write_unrotated("second");
 
-        assert_eq!(fs::read_to_string(&path).unwrap(), "after\n");
+        assert!(!path.exists(), "基础路径本身不应被创建为活动日志");
         assert_eq!(
             fs::read_to_string(dir.path().join("rskynet.20260822.153045.001.log")).unwrap(),
-            "before\n"
+            "first\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("rskynet.20260822.153045.002.log")).unwrap(),
+            "second\n"
         );
     }
 }
