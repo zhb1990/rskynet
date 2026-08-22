@@ -16,19 +16,26 @@
 //! name = "logger"
 //! # 日志文件路径，留空则只写标准输出
 //! path = "run/rskynet.log"
+//! # 本地日期变化时滚动日志文件
+//! rotate_daily = true
+//! # 单个活动日志文件最大字节数；0 表示不按大小滚动
+//! max_file_size = 104857600
 //! # 最多保留多少条待写日志；超过后丢弃较旧日志，0 表示不限制
 //! max_queue = 10000
 //! ```
 
+use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Local, NaiveDate, NaiveDateTime};
 use rskynet_core::service::LOGGER;
 use rskynet_core::{Ctx, Message, MsgType, Registry, Result, SvcCell};
 use serde::Deserialize;
 
 const DEFAULT_MAX_QUEUE: usize = 10_000;
+const DEFAULT_MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
 
 /// `[logger]` 段。`name` 归内核解析，这里只关心写到哪。
 #[derive(Debug, Deserialize)]
@@ -36,6 +43,10 @@ const DEFAULT_MAX_QUEUE: usize = 10_000;
 struct LoggerConfig {
     /// 日志文件路径，留空表示只写标准输出。
     path: String,
+    /// 本地日期变化时是否滚动日志文件。
+    rotate_daily: bool,
+    /// 单个活动日志文件的最大字节数，0 表示不按大小滚动。
+    max_file_size: u64,
     /// 最多保留多少条待写日志，0 表示不限制。
     max_queue: usize,
 }
@@ -44,9 +55,82 @@ impl Default for LoggerConfig {
     fn default() -> Self {
         Self {
             path: String::new(),
+            rotate_daily: true,
+            max_file_size: DEFAULT_MAX_FILE_SIZE,
             max_queue: DEFAULT_MAX_QUEUE,
         }
     }
+}
+
+#[derive(Debug)]
+struct LogFile {
+    file: File,
+    date: NaiveDate,
+    len: u64,
+}
+
+impl LogFile {
+    fn open(path: &Path, date: NaiveDate) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let len = file.metadata()?.len();
+        Ok(Self { file, date, len })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RotationConfig {
+    rotate_daily: bool,
+    max_file_size: u64,
+}
+
+impl Default for RotationConfig {
+    fn default() -> Self {
+        Self {
+            rotate_daily: true,
+            max_file_size: DEFAULT_MAX_FILE_SIZE,
+        }
+    }
+}
+
+fn should_rotate(
+    file: &LogFile,
+    now: NaiveDate,
+    next_line_len: u64,
+    config: RotationConfig,
+) -> bool {
+    (config.rotate_daily && file.date != now)
+        || (config.max_file_size != 0
+            && file.len != 0
+            && file.len.saturating_add(next_line_len) > config.max_file_size)
+}
+
+fn archive_path(path: &Path, timestamp: NaiveDateTime, sequence: u64) -> PathBuf {
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    let stem = path
+        .file_stem()
+        .filter(|stem| !stem.is_empty())
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| file_name.into_owned());
+    let mut archive_name = format!("{stem}.{}.{sequence:03}", timestamp.format("%Y%m%d.%H%M%S"));
+    if let Some(extension) = path.extension().filter(|extension| !extension.is_empty()) {
+        let _ = write!(archive_name, ".{}", extension.to_string_lossy());
+    }
+    path.with_file_name(archive_name)
+}
+
+fn next_archive_path(path: &Path, timestamp: NaiveDateTime) -> Result<PathBuf> {
+    for sequence in 1.. {
+        let candidate = archive_path(path, timestamp, sequence);
+        if !candidate.try_exists()? {
+            return Ok(candidate);
+        }
+    }
+    unreachable!("u64 序号不可能耗尽")
 }
 
 #[derive(Debug)]
@@ -89,20 +173,62 @@ impl Backpressure {
 pub struct Logger {
     /// 日志文件路径，空表示只写标准输出。
     path: SvcCell<String>,
-    file: SvcCell<Option<File>>,
+    file: SvcCell<Option<LogFile>>,
+    rotation: SvcCell<RotationConfig>,
     backpressure: SvcCell<Backpressure>,
 }
 
 impl Logger {
-    fn open(&self, path: &str) -> Result<()> {
-        if let Some(parent) = Path::new(path).parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+    fn open(&self, path: &Path, now: DateTime<Local>) -> Result<()> {
+        let file = LogFile::open(path, now.date_naive())?;
         *self.file.borrow_mut() = Some(file);
         Ok(())
+    }
+
+    fn rotate(&self, path: &Path, now: DateTime<Local>) -> Result<()> {
+        // Windows 上重命名前必须先释放文件句柄；其它平台也能确保归档内容完整。
+        *self.file.borrow_mut() = None;
+        let archive = match next_archive_path(path, now.naive_local()) {
+            Ok(archive) => archive,
+            Err(error) => {
+                let _ = self.open(path, now);
+                return Err(error);
+            }
+        };
+        if let Err(error) = std::fs::rename(path, &archive) {
+            // 归档失败时尽力恢复活动文件，保证后续日志仍有机会落盘。
+            let _ = self.open(path, now);
+            return Err(error.into());
+        }
+        if let Err(error) = self.open(path, now) {
+            // 新文件打不开时把归档还原成活动文件，再尝试恢复原来的追加写入。
+            let _ = std::fs::rename(&archive, path);
+            let _ = self.open(path, now);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn rotate_if_needed(&self, now: DateTime<Local>, next_line_len: u64) -> Result<()> {
+        let needs_rotation = {
+            let file = self.file.borrow();
+            let config = *self.rotation.borrow();
+            file.as_ref()
+                .is_some_and(|file| should_rotate(file, now.date_naive(), next_line_len, config))
+        };
+        if needs_rotation {
+            let path = self.path.borrow().clone();
+            self.rotate(Path::new(&path), now)?;
+        }
+        Ok(())
+    }
+
+    fn write_unrotated(&self, line: &str) {
+        if let Some(file) = self.file.borrow_mut().as_mut() {
+            if writeln!(file.file, "{line}").is_ok() {
+                file.len = file.len.saturating_add(line.len() as u64 + 1);
+            }
+        }
     }
 
     fn write(&self, ctx: &Ctx, source: rskynet_core::Handle, text: &str) {
@@ -116,9 +242,18 @@ impl Logger {
             text
         );
         println!("{line}");
-        if let Some(file) = self.file.borrow_mut().as_mut() {
-            let _ = writeln!(file, "{line}");
+        let now = Local::now();
+        if let Err(error) = self.rotate_if_needed(now, line.len() as u64 + 1) {
+            let error_line = format!(
+                "[{:>6}.{:03}] [:{:08x}] 日志文件滚动失败：{error}",
+                elapsed_ms / 1_000,
+                elapsed_ms % 1_000,
+                ctx.handle(),
+            );
+            println!("{error_line}");
+            self.write_unrotated(&error_line);
         }
+        self.write_unrotated(&line);
     }
 }
 
@@ -127,9 +262,13 @@ impl Logger {
     async fn init(&self, ctx: Ctx) -> Result<()> {
         let config: LoggerConfig = ctx.node().section(LOGGER)?.unwrap_or_default();
         self.backpressure.borrow_mut().max_queue = config.max_queue;
+        *self.rotation.borrow_mut() = RotationConfig {
+            rotate_daily: config.rotate_daily,
+            max_file_size: config.max_file_size,
+        };
         let path = config.path.trim().to_string();
         if !path.is_empty() {
-            self.open(&path)?;
+            self.open(Path::new(&path), Local::now())?;
             *self.path.borrow_mut() = path;
         }
         Ok(())
@@ -161,7 +300,7 @@ impl Logger {
                 let path = self.path.borrow().clone();
                 if !path.is_empty() {
                     *self.file.borrow_mut() = None;
-                    if let Err(err) = self.open(&path) {
+                    if let Err(err) = self.open(Path::new(&path), Local::now()) {
                         self.write(&ctx, ctx.handle(), &format!("重开日志文件失败：{err}"));
                     }
                 }
@@ -187,14 +326,69 @@ impl RegistryExt for Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use chrono::TimeZone;
+
+    static NEXT_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let id = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("rskynet-logger-test-{}-{id}", std::process::id()));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn date(year: i32, month: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(year, month, day).unwrap()
+    }
+
+    fn local_datetime(
+        year: i32,
+        month: u32,
+        day: u32,
+        hour: u32,
+        minute: u32,
+        second: u32,
+    ) -> DateTime<Local> {
+        Local
+            .from_local_datetime(
+                &date(year, month, day)
+                    .and_hms_opt(hour, minute, second)
+                    .unwrap(),
+            )
+            .single()
+            .unwrap()
+    }
 
     #[test]
     fn config_uses_the_default_limit() {
         let config: LoggerConfig = toml::from_str("").unwrap();
         assert_eq!(config.max_queue, DEFAULT_MAX_QUEUE);
+        assert!(config.rotate_daily);
+        assert_eq!(config.max_file_size, DEFAULT_MAX_FILE_SIZE);
 
-        let config: LoggerConfig = toml::from_str("max_queue = 0").unwrap();
+        let config: LoggerConfig =
+            toml::from_str("max_queue = 0\nrotate_daily = false\nmax_file_size = 0").unwrap();
         assert_eq!(config.max_queue, 0);
+        assert!(!config.rotate_daily);
+        assert_eq!(config.max_file_size, 0);
 
         let config: LoggerConfig = toml::from_str("max_queue = 42").unwrap();
         assert_eq!(config.max_queue, 42);
@@ -236,5 +430,86 @@ mod tests {
 
         assert_eq!(state.decide(1), LogDecision::Drop);
         assert_eq!(state.dropped, usize::MAX);
+    }
+
+    #[test]
+    fn rotation_decision_handles_date_size_and_disabled_triggers() {
+        let dir = TestDir::new();
+        let path = dir.path().join("rskynet.log");
+        let mut file = LogFile::open(&path, date(2026, 8, 22)).unwrap();
+
+        let size_only = RotationConfig {
+            rotate_daily: false,
+            max_file_size: 10,
+        };
+        file.len = 9;
+        assert!(
+            !should_rotate(&file, date(2026, 8, 22), 1, size_only),
+            "刚好达到阈值不滚动"
+        );
+        assert!(
+            should_rotate(&file, date(2026, 8, 22), 2, size_only),
+            "下一条会超过阈值时滚动"
+        );
+        file.len = 0;
+        assert!(
+            !should_rotate(&file, date(2026, 8, 22), 11, size_only),
+            "空文件允许写入一条超阈值日志"
+        );
+
+        let daily_only = RotationConfig {
+            rotate_daily: true,
+            max_file_size: 0,
+        };
+        assert!(!should_rotate(&file, date(2026, 8, 22), 1, daily_only));
+        assert!(should_rotate(&file, date(2026, 8, 23), 1, daily_only));
+
+        let disabled = RotationConfig {
+            rotate_daily: false,
+            max_file_size: 0,
+        };
+        assert!(!should_rotate(&file, date(2026, 8, 23), u64::MAX, disabled));
+    }
+
+    #[test]
+    fn archive_names_include_timestamp_and_never_overwrite() {
+        let dir = TestDir::new();
+        let path = dir.path().join("rskynet.log");
+        let timestamp = date(2026, 8, 22).and_hms_opt(15, 30, 45).unwrap();
+
+        let first = next_archive_path(&path, timestamp).unwrap();
+        assert_eq!(
+            first.file_name().unwrap().to_string_lossy(),
+            "rskynet.20260822.153045.001.log"
+        );
+        fs::write(&first, []).unwrap();
+        let second = next_archive_path(&path, timestamp).unwrap();
+        assert_eq!(
+            second.file_name().unwrap().to_string_lossy(),
+            "rskynet.20260822.153045.002.log"
+        );
+    }
+
+    #[test]
+    fn opening_existing_file_tracks_size_and_rotation_continues_writing() {
+        let dir = TestDir::new();
+        let path = dir.path().join("rskynet.log");
+        fs::write(&path, "before\n").unwrap();
+        let now = local_datetime(2026, 8, 22, 15, 30, 45);
+
+        let opened = LogFile::open(&path, now.date_naive()).unwrap();
+        assert_eq!(opened.len, 7);
+
+        let logger = Logger::default();
+        logger.open(&path, now).unwrap();
+        *logger.path.borrow_mut() = path.to_string_lossy().into_owned();
+        logger.rotate(&path, now).unwrap();
+        logger.write_unrotated("after");
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "after\n");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("rskynet.20260822.153045.001.log")).unwrap(),
+            "before\n"
+        );
     }
 }

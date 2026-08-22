@@ -28,6 +28,7 @@ async-trait = "0.1"
 backtrace = "0.3"
 crossbeam-queue = "0.3"
 crash-handler = "0.7"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 ctrlc = "3.5"
 futures-executor = "0.3"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }

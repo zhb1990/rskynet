@@ -11,6 +11,7 @@ repository.workspace = true
 rskynet-core = { workspace = true }
 rskynet-macros = { workspace = true }
 
+chrono = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]
