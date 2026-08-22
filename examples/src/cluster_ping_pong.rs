@@ -11,18 +11,35 @@ use std::time::Instant;
 use prost::Message as ProstMessage;
 use rskynet::cluster::{self, ClusterAddr, NodeId, RemoteContext};
 use rskynet::{Ctx, Error, MsgType, Payload, Result, SvcCell};
+use serde::{Deserialize, Serialize};
 
 const PONG_SERVICE: &str = "cluster-pong";
 const PONG_CONTROL: &str = "cluster-pong-control";
 
-#[derive(Clone, PartialEq, ProstMessage, rskynet::cluster::ClusterMessage)]
+#[derive(
+    Clone,
+    PartialEq,
+    Deserialize,
+    ProstMessage,
+    Serialize,
+    rskynet::MessageSchema,
+    rskynet::cluster::ClusterMessage,
+)]
 #[cluster(type_id = 1_001)]
 pub struct PingRequest {
     #[prost(uint64, tag = "1")]
     pub round: u64,
 }
 
-#[derive(Clone, PartialEq, ProstMessage, rskynet::cluster::ClusterMessage)]
+#[derive(
+    Clone,
+    PartialEq,
+    Deserialize,
+    ProstMessage,
+    Serialize,
+    rskynet::MessageSchema,
+    rskynet::cluster::ClusterMessage,
+)]
 #[cluster(type_id = 1_002)]
 pub struct PongResponse {
     #[prost(uint64, tag = "1")]
@@ -39,16 +56,19 @@ pub struct ShutdownRequest {}
 #[cluster(type_id = 1_004)]
 pub struct ShutdownResponse {}
 
+#[derive(Deserialize, Serialize, rskynet::MessageSchema)]
+#[serde(rename_all = "snake_case")]
 enum PongCommand {
     Ping {
-        source_node: NodeId,
+        source_node: u32,
         request: PingRequest,
     },
     Shutdown {
-        source_node: NodeId,
+        source_node: u32,
     },
 }
 
+#[derive(Serialize, rskynet::MessageSchema)]
 enum PongReply {
     Pong(PongResponse),
     Shutdown,
@@ -66,7 +86,7 @@ async fn pong(
         .request(
             PONG_SERVICE,
             Payload::of(PongCommand::Ping {
-                source_node: remote.source_node,
+                source_node: remote.source_node.get(),
                 request: ping,
             }),
         )
@@ -90,7 +110,7 @@ async fn shutdown(
         .request(
             PONG_SERVICE,
             Payload::of(PongCommand::Shutdown {
-                source_node: remote.source_node,
+                source_node: remote.source_node.get(),
             }),
         )
         .await
@@ -118,6 +138,7 @@ impl ClusterPong {
         Ok(())
     }
 
+    #[debug(name = "command")]
     #[msg(MsgType::USER)]
     async fn command(&self, ctx: Ctx, command: PongCommand) -> PongReply {
         match command {
@@ -129,7 +150,7 @@ impl ClusterPong {
                 rskynet::log!(
                     ctx,
                     "处理 node {} 的第 {} 轮 ping，累计 {} 次",
-                    source_node.get(),
+                    source_node,
                     request.round,
                     self.served.borrow()
                 );
@@ -139,7 +160,7 @@ impl ClusterPong {
                 })
             }
             PongCommand::Shutdown { source_node } => {
-                rskynet::log!(ctx, "收到 node {} 的关闭请求", source_node.get());
+                rskynet::log!(ctx, "收到 node {} 的关闭请求", source_node);
                 let shutdown_ctx = ctx.clone();
                 ctx.spawn(async move {
                     // 等本地应答经 cluster 编码并进入 socket 写缓冲后再关闭节点。

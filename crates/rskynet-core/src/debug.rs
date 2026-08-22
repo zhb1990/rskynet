@@ -7,7 +7,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::{FromPayload, IntoPayload, MsgType, Payload, Result};
+use crate::{FromPayload, IntoPayload, MessageSchema, MessageSchemaType, MsgType, Payload, Result};
 
 type DecodePayload = fn(Value) -> Result<Payload>;
 type EncodePayload = fn(Payload) -> Result<Value>;
@@ -21,7 +21,8 @@ pub struct DebugMessageDescriptor {
     mtype: MsgType,
     request_type: &'static str,
     response_type: Option<&'static str>,
-    request_example: Option<&'static str>,
+    request_schema: fn() -> MessageSchema,
+    response_schema: Option<fn() -> MessageSchema>,
     decode: DecodePayload,
     encode: Option<EncodePayload>,
 }
@@ -30,14 +31,15 @@ impl DebugMessageDescriptor {
     /// 构造一条只支持 `send` 的消息描述。
     pub fn send<Request>(name: &'static str, mtype: MsgType) -> Self
     where
-        Request: DeserializeOwned + IntoPayload,
+        Request: DeserializeOwned + IntoPayload + MessageSchemaType,
     {
         Self {
             name,
             mtype,
             request_type: std::any::type_name::<Request>(),
             response_type: None,
-            request_example: None,
+            request_schema: Request::message_schema,
+            response_schema: None,
             decode: decode_payload::<Request>,
             encode: None,
         }
@@ -46,15 +48,16 @@ impl DebugMessageDescriptor {
     /// 构造一条同时支持 `send` 与 `call` 的消息描述。
     pub fn call<Request, Response>(name: &'static str, mtype: MsgType) -> Self
     where
-        Request: DeserializeOwned + IntoPayload,
-        Response: FromPayload + Serialize,
+        Request: DeserializeOwned + IntoPayload + MessageSchemaType,
+        Response: FromPayload + Serialize + MessageSchemaType,
     {
         Self {
             name,
             mtype,
             request_type: std::any::type_name::<Request>(),
             response_type: Some(std::any::type_name::<Response>()),
-            request_example: None,
+            request_schema: Request::message_schema,
+            response_schema: Some(Response::message_schema),
             decode: decode_payload::<Request>,
             encode: Some(encode_payload::<Response>),
         }
@@ -80,16 +83,12 @@ impl DebugMessageDescriptor {
         self.encode.is_some()
     }
 
-    /// 服务为网页调试控制台提供的 JSON 请求示例。
-    pub fn request_example(self) -> Option<&'static str> {
-        self.request_example
+    pub fn request_schema(self) -> MessageSchema {
+        (self.request_schema)()
     }
 
-    /// 为消息描述附加已由服务宏在编译期校验过的 JSON 请求示例。
-    #[doc(hidden)]
-    pub fn with_request_example(mut self, example: &'static str) -> Self {
-        self.request_example = Some(example);
-        self
+    pub fn response_schema(self) -> Option<MessageSchema> {
+        self.response_schema.map(|schema| schema())
     }
 
     pub fn decode(self, value: Value) -> Result<Payload> {
@@ -114,7 +113,6 @@ impl std::fmt::Debug for DebugMessageDescriptor {
             .field("mtype", &self.mtype)
             .field("request_type", &self.request_type)
             .field("response_type", &self.response_type)
-            .field("request_example", &self.request_example)
             .finish_non_exhaustive()
     }
 }
@@ -139,7 +137,8 @@ mod tests {
 
     use super::*;
 
-    #[derive(Debug, Deserialize, PartialEq, Serialize)]
+    #[derive(Debug, Deserialize, PartialEq, Serialize, rskynet_macros::MessageSchema)]
+    #[schema(crate = crate)]
     struct Number {
         value: u32,
     }
@@ -162,8 +161,7 @@ mod tests {
 
     #[test]
     fn send_descriptor_rejects_response_encoding() {
-        let descriptor = DebugMessageDescriptor::send::<String>("notice", MsgType(42))
-            .with_request_example(r#""hello""#);
+        let descriptor = DebugMessageDescriptor::send::<String>("notice", MsgType(42));
         assert_eq!(
             descriptor
                 .decode(Value::String("hello".into()))
@@ -173,6 +171,6 @@ mod tests {
         );
         assert!(descriptor.encode(Payload::None).is_err());
         assert!(!descriptor.supports_call());
-        assert_eq!(descriptor.request_example(), Some(r#""hello""#));
+        assert_eq!(descriptor.request_schema()["type"], "string");
     }
 }

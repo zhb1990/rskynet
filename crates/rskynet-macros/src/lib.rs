@@ -54,6 +54,15 @@ mod signal;
 
 use proc_macro::TokenStream;
 
+/// 从 struct / enum 定义生成 Dashboard 使用的消息结构描述。
+///
+/// 该派生不需要 `Default` 或示例值；字段的 `serde(rename)`、`serde(default)` 与
+/// `Option<T>` 会反映到生成的 schema 中。
+#[proc_macro_derive(MessageSchema, attributes(serde, schema))]
+pub fn message_schema(item: TokenStream) -> TokenStream {
+    expand::derive_message_schema(item.into()).into()
+}
+
 /// 为 Prost 消息实现 `cluster::ClusterMessage`。
 #[proc_macro_derive(ClusterMessage, attributes(cluster))]
 pub fn cluster_message(item: TokenStream) -> TokenStream {
@@ -95,7 +104,7 @@ pub fn cluster_handler(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///     async fn on_ask(&self, ctx: Ctx, ask: Ask) -> Answer { .. }
 ///
 ///     // 请求从网页 JSON 反序列化，call 返回值再序列化为 JSON。
-///     #[debug(name = "ask", example = r#"{"question":"status"}"#)]
+///     #[debug(name = "ask")]
 ///     #[msg(MsgType::USER)]
 ///     async fn debug_ask(&self, ctx: Ctx, ask: Ask) -> Answer { .. }
 ///
@@ -114,8 +123,9 @@ pub fn cluster_handler(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// `boxed_payload!(Ask);` 就对应对象负载。返回值走 [`IntoPayload`]，返回 `()`
 /// 就不回包。
 ///
-/// `#[debug]` 是显式 opt-in：请求类型还需实现 `serde::de::DeserializeOwned`，有返回值
-/// 时返回类型还需实现 `serde::Serialize + FromPayload`。返回 `()` 的处理器只支持
+/// `#[debug]` 是显式 opt-in：请求与返回类型需实现 `MessageSchemaType`（业务结构通常
+/// `#[derive(rskynet::MessageSchema)]`），请求还需能反序列化，返回值还需能序列化。
+/// 返回 `()` 的处理器只支持
 /// Dashboard 的 send；收整条 `Message` 与 `#[msg(default)]` 不能开放给调试控制台。
 ///
 /// 没有 `#[msg(default)]` 时，认不出协议号的消息会记一行日志，对方在等回话的话

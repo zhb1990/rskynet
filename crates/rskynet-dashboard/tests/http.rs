@@ -15,12 +15,15 @@ struct Probe(mpsc::Sender<NodeRef>);
 const NOTICE: MsgType = MsgType(42);
 const SLOW: MsgType = MsgType(43);
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, rskynet_macros::MessageSchema)]
+#[schema(crate = ::rskynet_core)]
 struct DoubleRequest {
+    /// 要翻倍的原始数值。
     value: u32,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, rskynet_macros::MessageSchema)]
+#[schema(crate = ::rskynet_core)]
 struct DoubleResponse {
     value: u32,
 }
@@ -36,7 +39,7 @@ impl DebugTarget {
         Ok(())
     }
 
-    #[debug(name = "double", example = r#"{"value":21}"#)]
+    #[debug(name = "double")]
     #[msg(MsgType::USER)]
     async fn double(&self, _ctx: Ctx, request: DoubleRequest) -> DoubleResponse {
         DoubleResponse {
@@ -151,7 +154,7 @@ fn dashboard_serves_embedded_ui_and_live_stats() {
 
     let services = request(
         address,
-        "GET /api/v1/debug/services HTTP/1.1\r\nHost: dashboard\r\nConnection: close\r\n\r\n",
+        "GET /api/v1/messages HTTP/1.1\r\nHost: dashboard\r\nConnection: close\r\n\r\n",
     );
     assert!(services.starts_with("HTTP/1.1 200"));
     let body = services.split_once("\r\n\r\n").unwrap().1;
@@ -170,7 +173,15 @@ fn dashboard_serves_embedded_ui_and_live_stats() {
     assert_eq!(target["messages"].as_array().unwrap().len(), 3);
     assert_eq!(target["messages"][0]["name"], "double");
     assert_eq!(target["messages"][0]["call_supported"], true);
-    assert_eq!(target["messages"][0]["request_example"], r#"{"value":21}"#);
+    assert_eq!(target["messages"][0]["request_schema"]["type"], "object");
+    assert_eq!(
+        target["messages"][0]["request_schema"]["properties"]["value"]["type"],
+        "integer"
+    );
+    assert_eq!(
+        target["messages"][0]["response_schema"]["properties"]["value"]["type"],
+        "integer"
+    );
     assert_eq!(target["messages"][1]["mtype"], NOTICE.raw());
 
     let call_body = serde_json::json!({
@@ -310,12 +321,15 @@ fn dashboard_debug_api_is_disabled_by_default() {
     let json: serde_json::Value = serde_json::from_str(body).unwrap();
     assert_eq!(json["debug_console_enabled"], false);
 
-    let debug = request(
+    let messages = request(
         address,
-        "GET /api/v1/debug/services HTTP/1.1\r\nHost: dashboard\r\nConnection: close\r\n\r\n",
+        "GET /api/v1/messages HTTP/1.1\r\nHost: dashboard\r\nConnection: close\r\n\r\n",
     );
-    assert!(debug.starts_with("HTTP/1.1 404"));
-    assert!(debug.contains("debug_disabled"));
+    assert!(messages.starts_with("HTTP/1.1 200"));
+
+    let invoke = post_json(address, "/api/v1/debug/invoke", "{}");
+    assert!(invoke.starts_with("HTTP/1.1 404"));
+    assert!(invoke.contains("debug_disabled"));
 
     node.abort();
     runtime

@@ -9,9 +9,267 @@ use quote::quote;
 use syn::punctuated::Punctuated;
 use syn::token::Comma;
 use syn::{
-    Error, Expr, ExprCall, ExprLit, ExprPath, FnArg, Ident, ImplItem, ImplItemFn, ItemImpl, Lit,
-    LitStr, Meta, PatType, Path, Result, ReturnType, Signature, Token, Type, parse_quote,
+    Data, DeriveInput, Error, Expr, ExprCall, ExprLit, ExprPath, Fields, FnArg, GenericParam,
+    Ident, ImplItem, ImplItemFn, ItemImpl, Lit, LitStr, Meta, PatType, Path, Result, ReturnType,
+    Signature, Token, Type, parse_quote,
 };
+
+pub(crate) fn derive_message_schema(item: TokenStream) -> TokenStream {
+    match try_derive_message_schema(item) {
+        Ok(tokens) => tokens,
+        Err(error) => error.to_compile_error(),
+    }
+}
+
+fn try_derive_message_schema(item: TokenStream) -> Result<TokenStream> {
+    let input: DeriveInput = syn::parse2(item)?;
+    let krate = schema_crate(&input.attrs)?;
+    let name = &input.ident;
+    let title = name.to_string();
+    let description = doc_description(&input.attrs);
+    let description = description
+        .as_ref()
+        .map(|value| quote!(Some(#value)))
+        .unwrap_or_else(|| quote!(None));
+    let mut generics = input.generics.clone();
+    for param in &mut generics.params {
+        if let GenericParam::Type(param) = param {
+            param.bounds.push(parse_quote!(#krate::MessageSchemaType));
+        }
+    }
+    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+    let rename_all = serde_rename_all(&input.attrs)?;
+    let body = match &input.data {
+        Data::Struct(data) => schema_for_fields(
+            &krate,
+            &title,
+            description,
+            &data.fields,
+            rename_all.as_deref(),
+        )?,
+        Data::Enum(data) => {
+            let variants = data.variants.iter().map(|variant| {
+                let variant_name = serde_rename(&variant.attrs)?.unwrap_or_else(|| apply_rename_all(&variant.ident.to_string(), rename_all.as_deref()));
+                match &variant.fields {
+                    Fields::Unit => Ok(quote!(#krate::__private::schema_enum_unit(#variant_name))),
+                    Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
+                        let ty = &fields.unnamed[0].ty;
+                        Ok(quote!(#krate::__private::schema_enum_newtype(#variant_name, <#ty as #krate::MessageSchemaType>::message_schema())))
+                    }
+                    fields => {
+                        let inner_title = format!("{title}::{variant_name}");
+                        let inner = schema_for_fields(&krate, &inner_title, quote!(None), fields, None)?;
+                        Ok(quote!(#krate::__private::schema_enum_struct(#variant_name, #inner)))
+                    }
+                }
+            }).collect::<Result<Vec<_>>>()?;
+            quote!(#krate::__private::schema_enum(#title, #description, ::std::vec![#(#variants),*]))
+        }
+        Data::Union(union) => {
+            return Err(Error::new_spanned(
+                union.union_token,
+                "MessageSchema 不支持 union",
+            ));
+        }
+    };
+    Ok(quote! {
+        impl #impl_generics #krate::MessageSchemaType for #name #ty_generics #where_clause {
+            fn message_schema() -> #krate::MessageSchema { #body }
+        }
+    })
+}
+
+fn schema_crate(attrs: &[syn::Attribute]) -> Result<Path> {
+    let mut krate = None;
+    for attr in attrs.iter().filter(|attr| attr.path().is_ident("schema")) {
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("crate") {
+                krate = Some(meta.value()?.parse()?);
+                Ok(())
+            } else {
+                Err(meta.error("`schema` 只支持 `crate = path`"))
+            }
+        })?;
+    }
+    Ok(krate.unwrap_or_else(|| parse_quote!(::rskynet)))
+}
+
+fn schema_for_fields(
+    krate: &Path,
+    title: &str,
+    description: TokenStream,
+    fields: &Fields,
+    rename_all: Option<&str>,
+) -> Result<TokenStream> {
+    match fields {
+        Fields::Unit => {
+            Ok(quote!(#krate::__private::schema_tuple(#title, #description, ::std::vec![])))
+        }
+        Fields::Unnamed(fields) if fields.unnamed.len() == 1 => {
+            let ty = &fields.unnamed[0].ty;
+            Ok(quote!(<#ty as #krate::MessageSchemaType>::message_schema()))
+        }
+        Fields::Unnamed(fields) => {
+            let items = fields.unnamed.iter().map(|field| {
+                let ty = &field.ty;
+                quote!(<#ty as #krate::MessageSchemaType>::message_schema())
+            });
+            Ok(
+                quote!(#krate::__private::schema_tuple(#title, #description, ::std::vec![#(#items),*])),
+            )
+        }
+        Fields::Named(fields) => {
+            let values = fields.named.iter().map(|field| {
+                let ident = field.ident.as_ref().expect("named field");
+                let field_name = serde_rename(&field.attrs)?.unwrap_or_else(|| apply_rename_all(&ident.to_string(), rename_all));
+                let ty = &field.ty;
+                let required = !is_option(ty) && !serde_default(&field.attrs)?;
+                let field_description = doc_description(&field.attrs);
+                let schema = if let Some(field_description) = field_description {
+                    quote!({ let mut schema = <#ty as #krate::MessageSchemaType>::message_schema(); if let Some(object) = schema.as_object_mut() { object.insert("description".into(), #field_description.into()); } schema })
+                } else {
+                    quote!(<#ty as #krate::MessageSchemaType>::message_schema())
+                };
+                Ok(quote!((#field_name, #schema, #required)))
+            }).collect::<Result<Vec<_>>>()?;
+            Ok(
+                quote!(#krate::__private::schema_object(#title, #description, ::std::vec![#(#values),*])),
+            )
+        }
+    }
+}
+
+fn doc_description(attrs: &[syn::Attribute]) -> Option<String> {
+    let lines = attrs
+        .iter()
+        .filter_map(|attr| {
+            if !attr.path().is_ident("doc") {
+                return None;
+            }
+            let Meta::NameValue(value) = &attr.meta else {
+                return None;
+            };
+            let Expr::Lit(ExprLit {
+                lit: Lit::Str(value),
+                ..
+            }) = &value.value
+            else {
+                return None;
+            };
+            Some(value.value().trim().to_owned())
+        })
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+fn serde_rename(attrs: &[syn::Attribute]) -> Result<Option<String>> {
+    let mut rename = None;
+    for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename") {
+                rename = Some(meta.value()?.parse::<LitStr>()?.value());
+            } else if meta.input.peek(Token![=]) {
+                let _: Expr = meta.value()?.parse()?;
+            }
+            Ok(())
+        })?;
+    }
+    Ok(rename)
+}
+
+fn serde_rename_all(attrs: &[syn::Attribute]) -> Result<Option<String>> {
+    let mut rename_all = None;
+    for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename_all") {
+                rename_all = Some(meta.value()?.parse::<LitStr>()?.value());
+            } else if meta.input.peek(Token![=]) {
+                let _: Expr = meta.value()?.parse()?;
+            }
+            Ok(())
+        })?;
+    }
+    Ok(rename_all)
+}
+
+fn apply_rename_all(name: &str, rule: Option<&str>) -> String {
+    let Some(rule) = rule else {
+        return name.to_owned();
+    };
+    let words = split_words(name);
+    match rule {
+        "lowercase" => name.to_ascii_lowercase(),
+        "UPPERCASE" => name.to_ascii_uppercase(),
+        "snake_case" => words.join("_"),
+        "SCREAMING_SNAKE_CASE" => words.join("_").to_ascii_uppercase(),
+        "kebab-case" => words.join("-"),
+        "SCREAMING-KEBAB-CASE" => words.join("-").to_ascii_uppercase(),
+        "camelCase" => {
+            words.first().cloned().unwrap_or_default()
+                + &words
+                    .iter()
+                    .skip(1)
+                    .map(|word| capitalize(word))
+                    .collect::<String>()
+        }
+        "PascalCase" => words.iter().map(|word| capitalize(word)).collect(),
+        _ => name.to_owned(),
+    }
+}
+
+fn split_words(name: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    for ch in name.chars() {
+        if ch == '_' || ch == '-' {
+            if !current.is_empty() {
+                words.push(current.to_ascii_lowercase());
+                current.clear();
+            }
+        } else if ch.is_uppercase() && !current.is_empty() {
+            words.push(current.to_ascii_lowercase());
+            current.clear();
+            current.push(ch.to_ascii_lowercase());
+        } else {
+            current.push(ch.to_ascii_lowercase());
+        }
+    }
+    if !current.is_empty() {
+        words.push(current.to_ascii_lowercase());
+    }
+    words
+}
+
+fn capitalize(word: &str) -> String {
+    let mut chars = word.chars();
+    chars
+        .next()
+        .map(|first| first.to_ascii_uppercase().to_string() + chars.as_str())
+        .unwrap_or_default()
+}
+
+fn serde_default(attrs: &[syn::Attribute]) -> Result<bool> {
+    let mut default = false;
+    for attr in attrs.iter().filter(|attr| attr.path().is_ident("serde")) {
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("default") {
+                default = true;
+                if meta.input.peek(Token![=]) {
+                    let _: Expr = meta.value()?.parse()?;
+                }
+            } else if meta.input.peek(Token![=]) {
+                let _: Expr = meta.value()?.parse()?;
+            }
+            Ok(())
+        })?;
+    }
+    Ok(default)
+}
+
+fn is_option(ty: &Type) -> bool {
+    matches!(ty, Type::Path(path) if path.path.segments.last().is_some_and(|segment| segment.ident == "Option"))
+}
 
 /// 注册方式：共享 worker 池还是独占一条线程。决定要不要认 `idle` / `interrupt`。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -288,10 +546,9 @@ fn try_expand(attr: TokenStream, item: TokenStream, flavor: Flavor) -> Result<To
 
 struct DebugAttr {
     name: Option<LitStr>,
-    example: Option<LitStr>,
 }
 
-/// 摘掉处理器上的 `#[debug]` / `#[debug(name = "...", example = r#"..."#)]`。
+/// 摘掉处理器上的 `#[debug]` / `#[debug(name = "...")]`。
 fn take_debug(func: &mut ImplItemFn) -> Result<Option<DebugAttr>> {
     let indexes: Vec<_> = func
         .attrs
@@ -310,7 +567,6 @@ fn take_debug(func: &mut ImplItemFn) -> Result<Option<DebugAttr>> {
     };
     let attr = func.attrs.remove(index);
     let mut name = None;
-    let mut example = None;
     match &attr.meta {
         Meta::Path(_) => {}
         Meta::List(_) => attr.parse_nested_meta(|meta| {
@@ -323,33 +579,19 @@ fn take_debug(func: &mut ImplItemFn) -> Result<Option<DebugAttr>> {
                     return Err(Error::new_spanned(value, "调试消息名称不能为空"));
                 }
                 name = Some(value);
-            } else if meta.path.is_ident("example") {
-                if example.is_some() {
-                    return Err(meta.error("`example` 写了两遍"));
-                }
-                let value: LitStr = meta.value()?.parse()?;
-                if let Err(error) = serde_json::from_str::<serde_json::Value>(&value.value()) {
-                    return Err(Error::new_spanned(
-                        value,
-                        format!("`example` 必须是合法 JSON：{error}"),
-                    ));
-                }
-                example = Some(value);
             } else {
-                return Err(
-                    meta.error("`#[debug]` 只支持 `name = \"...\"` 与 `example = r#\"...\"#`")
-                );
+                return Err(meta.error("`#[debug]` 只支持 `name = \"...\"`"));
             }
             Ok(())
         })?,
         Meta::NameValue(_) => {
             return Err(Error::new_spanned(
                 attr,
-                "写成 `#[debug]` 或 `#[debug(name = \"...\", example = r#\"...\"#)]`",
+                "写成 `#[debug]` 或 `#[debug(name = \"...\")]`",
             ));
         }
     }
-    Ok(Some(DebugAttr { name, example }))
+    Ok(Some(DebugAttr { name }))
 }
 
 fn hook_of(name: &Ident, flavor: Flavor) -> Result<Option<Hook>> {
@@ -407,8 +649,6 @@ struct Handler {
     response: Option<Box<Type>>,
     /// 显式开放给 Dashboard 时使用的展示名称。
     debug_name: Option<LitStr>,
-    /// 可在 Dashboard 中直接载入的 JSON 请求示例。
-    debug_example: Option<LitStr>,
     span: Span,
 }
 
@@ -479,17 +719,11 @@ impl Handler {
         }
 
         let name = func.sig.ident.clone();
-        let (debug_name, debug_example) = match debug {
-            Some(debug) => (
-                Some(
-                    debug
-                        .name
-                        .unwrap_or_else(|| LitStr::new(&name.to_string(), name.span())),
-                ),
-                debug.example,
-            ),
-            None => (None, None),
-        };
+        let debug_name = debug.map(|debug| {
+            debug
+                .name
+                .unwrap_or_else(|| LitStr::new(&name.to_string(), name.span()))
+        });
         // 处理函数本身留在原地，好让它照旧能被直接调用（写单元测试用得上）
         leftovers.push(ImplItem::Fn(func));
         Ok(Handler {
@@ -499,7 +733,6 @@ impl Handler {
             arg,
             response,
             debug_name,
-            debug_example,
             span,
         })
     }
@@ -564,21 +797,14 @@ fn debug_messages(krate: &Path, handlers: &[Handler]) -> TokenStream {
         let Route::Types(types) = &handler.route else {
             unreachable!("带 #[debug] 的 default 已被拒绝")
         };
-        let example = handler
-            .debug_example
-            .as_ref()
-            .map(|example| quote!(.with_request_example(#example)))
-            .unwrap_or_default();
         types
             .iter()
             .map(|mtype| match &handler.response {
                 Some(response) => quote!(
                     #krate::DebugMessageDescriptor::call::<#request, #response>(#name, #mtype)
-                        #example
                 ),
                 None => quote!(
                     #krate::DebugMessageDescriptor::send::<#request>(#name, #mtype)
-                        #example
                 ),
             })
             .collect::<Vec<_>>()
@@ -806,12 +1032,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn debug_example_must_be_valid_json() {
+    fn debug_rejects_removed_example_parameter() {
         let error = try_expand(
             TokenStream::new(),
             quote! {
                 impl Demo {
-                    #[debug(example = "{not json}")]
+                    #[debug(example = "{}")]
                     #[msg(MsgType::USER)]
                     async fn run(&self, value: String) {}
                 }
@@ -819,6 +1045,6 @@ mod tests {
             Flavor::Shared,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("必须是合法 JSON"));
+        assert!(error.to_string().contains("只支持 `name"));
     }
 }

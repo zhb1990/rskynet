@@ -249,16 +249,8 @@ async fn serve(
             )
             .await
         }
-        "/api/v1/debug/services" if method == Method::GET => {
+        "/api/v1/messages" if method == Method::GET => {
             request.into_body().discard(ctx).await?;
-            if !debug.enabled {
-                return send_api_error(
-                    ctx,
-                    responder,
-                    ApiError::not_found("debug_disabled", "调试控制台未启用"),
-                )
-                .await;
-            }
             send_json(ctx, responder, StatusCode::OK, &debug_services(ctx), None).await
         }
         "/api/v1/debug/invoke" if method == Method::POST => {
@@ -375,7 +367,7 @@ async fn serve(
         "/"
         | "/index.html"
         | "/api/v1/stats"
-        | "/api/v1/debug/services"
+        | "/api/v1/messages"
         | "/assets/clock.svg"
         | "/assets/refresh.svg"
         | "/assets/server.svg" => {
@@ -417,7 +409,8 @@ struct DebugMessageInfo {
     mtype: u8,
     request_type: &'static str,
     response_type: Option<&'static str>,
-    request_example: Option<&'static str>,
+    request_schema: serde_json::Value,
+    response_schema: Option<serde_json::Value>,
     call_supported: bool,
 }
 
@@ -438,7 +431,8 @@ fn debug_services(ctx: &Ctx) -> DebugServices {
                     mtype: message.mtype().raw(),
                     request_type: message.request_type(),
                     response_type: message.response_type(),
-                    request_example: message.request_example(),
+                    request_schema: message.request_schema(),
+                    response_schema: message.response_schema(),
                     call_supported: message.supports_call(),
                 })
                 .collect();
@@ -839,9 +833,10 @@ mod tests {
     #[test]
     fn embedded_page_contains_the_api_and_cluster_condition() {
         assert!(INDEX_HTML.contains("/api/v1/stats"));
-        assert!(INDEX_HTML.contains("/api/v1/debug/services"));
+        assert!(INDEX_HTML.contains("/api/v1/messages"));
         assert!(INDEX_HTML.contains("/api/v1/debug/invoke"));
-        assert!(INDEX_HTML.contains("loadPayloadExample"));
+        assert!(INDEX_HTML.contains("requestMessageSchema"));
+        assert!(INDEX_HTML.contains("responseMessageSchema"));
         assert!(INDEX_HTML.contains("debugHistoryKey"));
         assert!(INDEX_HTML.contains("clusterBadge"));
         assert!(INDEX_HTML.contains("setInterval(refresh, 5000)"));

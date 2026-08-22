@@ -1,5 +1,12 @@
 # 节点 2：接收并应答跨节点 PingRequest。
 thread = 2
+profile = true
+
+[dashboard]
+address = "127.0.0.1:8080"
+# 强类型消息调试默认关闭；启用时 address 必须是 loopback。
+debug_console = true
+debug_call_timeout_ms = 10000
 
 [cluster]
 node_id = 2
@@ -12,4 +19,5 @@ seeds = []
 [bootstrap]
 services = [
     { name = "cluster-pong" },
+    { name = "debug-demo" }
 ]

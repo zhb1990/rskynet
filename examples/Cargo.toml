@@ -11,3 +11,4 @@ publish = false
 [dependencies]
 rskynet = { path = "../crates/rskynet", features = ["cluster", "dashboard", "websocket"] }
 prost = { workspace = true }
+serde = { workspace = true }

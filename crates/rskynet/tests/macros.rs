@@ -26,9 +26,9 @@ use serde::{Deserialize, Serialize};
 /// 业务自己的协议号，看宏认不认「不是内置常量」的表达式。
 const PING: MsgType = MsgType(42);
 
-#[derive(Deserialize)]
+#[derive(Deserialize, rskynet::MessageSchema)]
 struct Add(i64, i64);
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, rskynet::MessageSchema)]
 struct Sum(i64);
 boxed_payload!(Add, Sum);
 
@@ -49,7 +49,7 @@ impl Calc {
     }
 
     /// 对象负载 + 自动回包。
-    #[debug(name = "add", example = r#"[2,40]"#)]
+    #[debug(name = "add")]
     #[msg(MsgType::USER)]
     async fn on_add(&self, _ctx: Ctx, add: Add) -> Sum {
         self.calls.fetch_add(1, SeqCst);
@@ -162,7 +162,7 @@ impl Probe {
         assert_eq!(debug[0].name(), "add");
         assert_eq!(debug[0].mtype(), MsgType::USER);
         assert!(debug[0].supports_call());
-        assert_eq!(debug[0].request_example(), Some(r#"[2,40]"#));
+        assert_eq!(debug[0].request_schema()["type"], "array");
         assert_eq!(debug[1].name(), "on_text");
         assert!(!debug[1].supports_call());
         assert_eq!(debug[2].mtype(), PING);

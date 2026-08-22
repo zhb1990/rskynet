@@ -229,11 +229,13 @@ rskynet = {
 | `rskynet-http` | HTTP/1.1 客户端、服务端驱动和可选 WebSocket |
 | `rskynet-dashboard` | 节点及 socket 统计 API、内嵌 Dashboard |
 
-Dashboard 的强类型消息调试控制台默认关闭。需要时在 loopback 监听地址下配置
-`debug_console = true`，并在业务服务的 `#[msg(...)]` 处理器上添加 `#[debug]` 或
-`#[debug(name = "...")]`；请求类型需支持 serde 反序列化，有返回值的 call 还要求
-返回类型支持 serde 序列化。推荐用 `example` 为网页提供准确的 JSON 格式提示，宏会在
-编译期校验示例：`#[debug(name = "add", example = r#"{"a":1,"b":2}"#)]`。
+Dashboard 的消息页会展示显式开放的强类型消息。业务消息类型使用
+`#[derive(rskynet::MessageSchema)]`，并在 `#[msg(...)]` 处理器上添加 `#[debug]` 或
+`#[debug(name = "...")]`；宏会直接从类型字段生成请求与响应 schema，不需要
+`Default` 或手写 example，`#[msg(default)]` 不会进入消息文档。
+
+在线 send/call 默认关闭；需要时在 loopback 监听地址下配置 `debug_console = true`。
+请求类型仍需支持 serde 反序列化，有返回值的 call 还要求返回类型支持 serde 序列化。
 `debug_call_timeout_ms` 默认是 10000。
 | `rskynet-cluster` | Prost 消息编码、节点连接和跨节点请求/应答 |
 

@@ -215,30 +215,36 @@
     .flight-arrow { position: relative; width: 26px; height: 1px; background: var(--teal); }
     .flight-arrow::after { content: ""; position: absolute; right: 0; top: -3px; border-left: 5px solid var(--teal); border-top: 3px solid transparent; border-bottom: 3px solid transparent; }
     .debug-form-label { display: flex; justify-content: space-between; gap: 12px; margin: 14px 0 7px; color: var(--muted); }
-    .payload-guide {
-      display: flex; align-items: center; justify-content: space-between; gap: 14px; margin: 10px 0 4px; padding: 10px 12px;
-      border-left: 3px solid var(--cyan); border-radius: 3px 6px 6px 3px; background: #0d2638; color: var(--muted); font-size: 12px;
-    }
-    .payload-guide strong { display: block; margin-bottom: 3px; color: var(--text); font-size: 12px; }
-    .payload-guide-copy { min-width: 0; overflow-wrap: anywhere; }
-    .payload-example-button { flex: none; padding: 6px 9px; border: 1px solid #32617c; border-radius: 4px; color: var(--cyan); background: #0a1c2b; cursor: pointer; }
-    .payload-example-button:hover, .payload-example-button:focus-visible { border-color: var(--cyan); outline: none; }
-    .mode-switch { display: inline-flex; padding: 3px; border: 1px solid var(--line); border-radius: 6px; background: #081725; }
-    .mode-button { min-width: 74px; padding: 7px 12px; border: 0; border-radius: 4px; color: var(--muted); background: transparent; cursor: pointer; }
-    .mode-button[aria-pressed="true"] { color: #061c1a; background: var(--teal); font-weight: 700; }
-    .mode-button:focus-visible { outline: 1px solid var(--cyan); outline-offset: 2px; }
+    .content-tabs { display: flex; gap: 18px; margin-top: 14px; border-bottom: 1px solid var(--line-soft); }
+    .content-tab { position: relative; padding: 8px 2px 9px; border: 0; color: var(--muted); background: transparent; cursor: pointer; font-weight: 650; }
+    .content-tab::after { content: ""; position: absolute; right: 0; bottom: -1px; left: 0; height: 2px; background: transparent; }
+    .content-tab[aria-selected="true"] { color: var(--text); }
+    .content-tab[aria-selected="true"]::after { background: var(--teal); }
+    .content-tab:focus-visible { outline: 1px solid var(--cyan); outline-offset: 2px; }
+    .content-panel { padding-top: 7px; }
+    .schema-card { margin: 0; border: 1px solid #28506b; border-radius: 6px; overflow: hidden; background: #071723; }
+    .schema-tree { min-height: 160px; max-height: 330px; overflow: auto; padding: 8px 0 12px; font-family: var(--mono); font-size: 12px; }
+    .schema-row { --depth: 0; display: grid; grid-template-columns: minmax(130px, .7fr) minmax(100px, .42fr) minmax(180px, 1fr); gap: 12px; padding: 7px 13px 7px calc(13px + var(--depth) * 18px); border-bottom: 1px solid rgba(41,65,87,.32); }
+    .schema-row:last-child { border-bottom: 0; }
+    .schema-field { color: #eaf5fa; overflow-wrap: anywhere; }
+    .schema-field::before { content: "└ "; color: #3b6079; }
+    .schema-type { color: var(--cyan); }
+    .schema-required { margin-left: 5px; color: var(--orange); font-size: 10px; }
+    .schema-description { color: var(--muted); font-family: var(--sans); overflow-wrap: anywhere; }
+    .schema-empty { padding: 34px 14px; color: var(--muted); text-align: center; font-family: var(--sans); }
     .json-editor, .result-output {
       width: 100%; min-height: 300px; resize: vertical; padding: 14px; border: 1px solid var(--line); border-radius: 6px;
       color: #d8ecf8; background: #06131f; font: 13px/1.6 var(--mono); tab-size: 2;
     }
     .json-editor:focus { outline: 1px solid var(--cyan); border-color: var(--cyan); }
-    .debug-actions { display: flex; align-items: center; gap: 9px; margin-top: 11px; }
+    .debug-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 9px; margin-top: 11px; }
     .action-button { min-height: 38px; padding: 8px 13px; border: 1px solid var(--line); border-radius: 6px; color: var(--text); background: #10283a; cursor: pointer; }
     .action-button:hover, .action-button:focus-visible { border-color: var(--cyan); outline: none; }
-    .action-button.primary { margin-left: auto; min-width: 132px; border-color: #318e84; color: #061c1a; background: var(--teal); font-weight: 750; }
+    .action-button.primary { min-width: 88px; border-color: #318e84; color: #061c1a; background: var(--teal); font-weight: 750; }
+    .action-button.call { margin-left: auto; }
     .action-button:disabled { cursor: not-allowed; opacity: .45; }
     .editor-error { min-height: 20px; margin-top: 7px; color: #ff9b9b; font-size: 12px; }
-    .result-card { margin-top: 18px; border-top: 1px solid var(--line-soft); padding-top: 16px; }
+    .result-card { margin-top: 18px; border-top: 1px solid var(--line-soft); }
     .result-meta { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 7px; color: var(--muted); }
     .result-output { min-height: 150px; max-height: 290px; margin: 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
     .result-output.success { border-color: #27776f; }
@@ -255,6 +261,12 @@
     .history-message { font-weight: 650; overflow-wrap: anywhere; }
     .history-time { flex: none; color: var(--faint); font-family: var(--mono); font-size: 11px; }
     .history-route { margin: 5px 0 9px; color: var(--muted); font-family: var(--mono); font-size: 11px; overflow-wrap: anywhere; }
+    .history-details { margin: 0 0 9px; border-top: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft); }
+    .history-details summary { padding: 8px 1px; color: var(--cyan); cursor: pointer; font-size: 12px; }
+    .history-details summary:hover, .history-details summary:focus-visible { color: var(--teal); outline: none; }
+    .history-content { padding: 2px 0 10px; }
+    .history-content-label { display: block; margin: 8px 0 5px; color: var(--muted); font-size: 10px; letter-spacing: .06em; text-transform: uppercase; }
+    .history-json { max-height: 220px; margin: 0; overflow: auto; padding: 9px; border: 1px solid var(--line-soft); color: #d8ecf8; background: #061116; font: 11px/1.55 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
     .history-replay { width: 100%; padding: 6px; border: 1px solid var(--line); border-radius: 4px; color: var(--cyan); background: transparent; cursor: pointer; }
     .history-replay:hover, .history-replay:focus-visible { border-color: var(--cyan); outline: none; }
     .debug-empty { padding: 34px 12px; color: var(--muted); text-align: center; }
@@ -631,10 +643,7 @@
     .debug-message-name { font-size: 12px; }
     .protocol-chip { color: var(--cyan); font-size: 10px; }
     .flight-strip { border-color: var(--line); border-radius: 2px; background: #0a1b22; }
-    .payload-guide { border-left-width: 2px; border-radius: 0 2px 2px 0; background: rgba(114, 185, 240, .06); }
-    .payload-example-button, .action-button, .history-replay { border-radius: 2px; }
-    .mode-switch { border-radius: 3px; background: #071419; }
-    .mode-button { border-radius: 1px; }
+    .action-button, .history-replay { border-radius: 2px; }
     .json-editor, .result-output { border-color: var(--line); border-radius: 2px; background: #061116; }
     .action-button { background: #10242c; }
     .action-button.primary { border-color: var(--teal); color: #06140f; background: var(--teal); }
@@ -767,7 +776,7 @@
         <div class="tabbar" role="tablist" aria-label="节点统计类型">
           <button id="serviceTab" class="tab active" type="button" role="tab" aria-selected="true" aria-controls="servicePanel" tabindex="0">服务</button>
           <button id="networkTab" class="tab" type="button" role="tab" aria-selected="false" aria-controls="networkPanel" tabindex="-1">网络</button>
-          <button id="debugTab" class="tab" type="button" role="tab" aria-selected="false" aria-controls="debugPanel" tabindex="-1" hidden>调试</button>
+          <button id="debugTab" class="tab" type="button" role="tab" aria-selected="false" aria-controls="debugPanel" tabindex="-1">消息</button>
         </div>
 
         <div id="servicePanel" class="tab-panel" role="tabpanel" aria-labelledby="serviceTab">
@@ -871,29 +880,40 @@
                 <span class="flight-arrow" aria-hidden="true"></span>
                 <div class="flight-node"><span class="flight-label">方式</span><strong id="flightMode" class="flight-value">CALL</strong></div>
               </div>
-              <div class="debug-form-label">
-                <span id="requestType">请求类型：—</span>
-                <span id="responseType">返回类型：—</span>
+              <div class="content-tabs" role="tablist" aria-label="发送内容">
+                <button id="payloadTab" class="content-tab" type="button" role="tab" aria-selected="true" aria-controls="payloadPanel">发送内容</button>
+                <button id="requestStructureTab" class="content-tab" type="button" role="tab" aria-selected="false" aria-controls="requestStructurePanel">请求消息结构</button>
               </div>
-              <div class="mode-switch" role="group" aria-label="调用方式">
-                <button id="callMode" class="mode-button" type="button" aria-pressed="true">Call</button>
-                <button id="sendMode" class="mode-button" type="button" aria-pressed="false">Send</button>
+              <div id="payloadPanel" class="content-panel" role="tabpanel" aria-labelledby="payloadTab">
+                <label class="debug-form-label" for="jsonPayload"><span>JSON payload</span><span class="mono">≤ 256 KiB</span></label>
+                <textarea id="jsonPayload" class="json-editor" spellcheck="false" autocomplete="off" aria-describedby="editorError">null</textarea>
+                <div id="editorError" class="editor-error" role="alert"></div>
+                <div class="debug-actions">
+                  <button id="formatJson" class="action-button" type="button">格式化 JSON</button>
+                  <button id="clearPayload" class="action-button" type="button">清空</button>
+                  <button id="invokeCall" class="action-button primary call" type="button" disabled>Call</button>
+                  <button id="invokeSend" class="action-button primary" type="button" disabled>Send</button>
+                </div>
               </div>
-              <div class="payload-guide">
-                <div class="payload-guide-copy"><strong>格式提示</strong><span id="payloadHint">选择消息后显示 serde JSON 格式。</span></div>
-                <button id="loadPayloadExample" class="payload-example-button" type="button" hidden>载入示例</button>
-              </div>
-              <label class="debug-form-label" for="jsonPayload"><span>JSON payload</span><span class="mono">≤ 256 KiB</span></label>
-              <textarea id="jsonPayload" class="json-editor" spellcheck="false" autocomplete="off" aria-describedby="editorError">null</textarea>
-              <div id="editorError" class="editor-error" role="alert"></div>
-              <div class="debug-actions">
-                <button id="formatJson" class="action-button" type="button">格式化 JSON</button>
-                <button id="clearPayload" class="action-button" type="button">清空</button>
-                <button id="invokeDebug" class="action-button primary" type="button" disabled>发送 Call</button>
+              <div id="requestStructurePanel" class="content-panel" role="tabpanel" aria-labelledby="requestStructureTab" hidden>
+                <section class="schema-card" aria-label="请求消息结构">
+                  <div id="requestMessageSchema" class="schema-tree"><div class="schema-empty">选择消息后查看字段结构</div></div>
+                </section>
               </div>
               <section class="result-card" aria-live="polite">
-                <div class="result-meta"><strong>最近结果</strong><span id="resultDuration" class="mono">—</span></div>
-                <pre id="debugResult" class="result-output">选择一条消息后即可发送。</pre>
+                <div class="content-tabs" role="tablist" aria-label="响应内容">
+                  <button id="resultTab" class="content-tab" type="button" role="tab" aria-selected="true" aria-controls="resultPanel">收到的内容</button>
+                  <button id="responseStructureTab" class="content-tab" type="button" role="tab" aria-selected="false" aria-controls="responseStructurePanel">响应消息结构</button>
+                </div>
+                <div id="resultPanel" class="content-panel" role="tabpanel" aria-labelledby="resultTab">
+                  <div class="result-meta"><strong>最近结果</strong><span id="resultDuration" class="mono">—</span></div>
+                  <pre id="debugResult" class="result-output">选择一条消息后即可发送。</pre>
+                </div>
+                <div id="responseStructurePanel" class="content-panel" role="tabpanel" aria-labelledby="responseStructureTab" hidden>
+                  <section class="schema-card" aria-label="响应消息结构">
+                    <div id="responseMessageSchema" class="schema-tree"><div class="schema-empty">选择消息后查看字段结构</div></div>
+                  </section>
+                </div>
               </section>
             </section>
 
@@ -930,6 +950,7 @@
       debugServices: [],
       debugSelection: null,
       debugMode: 'call',
+      debugEnabled: false,
       debugBusy: false,
       debugHistory: loadDebugHistory(),
     };
@@ -946,13 +967,27 @@
       const button = event.target.closest('button[data-debug-target]');
       if (button) selectDebugMessage(button.dataset.debugTarget, button.dataset.debugMessage);
     });
-    $('callMode').addEventListener('click', () => setDebugMode('call'));
-    $('sendMode').addEventListener('click', () => setDebugMode('send'));
     $('formatJson').addEventListener('click', formatDebugJson);
-    $('loadPayloadExample').addEventListener('click', loadSelectedPayloadExample);
+    $('payloadTab').addEventListener('click', () => setDebugContentView('composer', 'payload'));
+    $('requestStructureTab').addEventListener('click', () => setDebugContentView('composer', 'schema'));
+    $('resultTab').addEventListener('click', () => setDebugContentView('result', 'content'));
+    $('responseStructureTab').addEventListener('click', () => setDebugContentView('result', 'schema'));
+    document.querySelectorAll('.content-tabs').forEach((tablist) => {
+      const tabs = Array.from(tablist.querySelectorAll('[role="tab"]'));
+      tabs.forEach((tab, index) => tab.addEventListener('keydown', (event) => {
+        if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+        event.preventDefault();
+        const nextIndex = event.key === 'Home' ? 0
+          : event.key === 'End' ? tabs.length - 1
+          : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+        tabs[nextIndex].click();
+        tabs[nextIndex].focus();
+      }));
+    });
     $('clearPayload').addEventListener('click', () => { $('jsonPayload').value = 'null'; validateDebugJson(); });
     $('jsonPayload').addEventListener('input', validateDebugJson);
-    $('invokeDebug').addEventListener('click', invokeDebugMessage);
+    $('invokeCall').addEventListener('click', () => invokeDebugMessage('call'));
+    $('invokeSend').addEventListener('click', () => invokeDebugMessage('send'));
     $('clearHistory').addEventListener('click', clearDebugHistory);
     $('debugHistory').addEventListener('click', (event) => {
       const button = event.target.closest('button[data-history-id]');
@@ -981,7 +1016,7 @@
         renderNetworkTable();
       });
     });
-    document.querySelectorAll('[role="tab"]').forEach((tab) => {
+    document.querySelectorAll('.tabbar > [role="tab"]').forEach((tab) => {
       tab.addEventListener('click', () => selectTab(tab.id.replace('Tab', '')));
       tab.addEventListener('keydown', (event) => {
         if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
@@ -998,7 +1033,6 @@
     renderDebugHistory();
 
     function selectTab(name, focus = false) {
-      if (name === 'debug' && $('debugTab').hidden) name = 'service';
       state.activeTab = name;
       ['service', 'network', 'debug'].forEach((candidate) => {
         const active = candidate === name;
@@ -1118,15 +1152,9 @@
     }
 
     async function refreshDebugServices(enabled) {
-      $('debugTab').hidden = !enabled;
-      if (!enabled) {
-        state.debugServices = [];
-        state.debugSelection = null;
-        if (state.activeTab === 'debug') selectTab('service');
-        return;
-      }
+      state.debugEnabled = enabled;
       try {
-        const response = await fetch('/api/v1/debug/services', { cache: 'no-store' });
+        const response = await fetch('/api/v1/messages', { cache: 'no-store' });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const payload = await response.json();
         state.debugServices = payload.services || [];
@@ -1194,66 +1222,78 @@
       updateDebugComposer();
     }
 
-    function setDebugMode(mode) {
-      const selected = selectedDebugMessage();
-      if (mode === 'call' && selected && !selected.message.call_supported) return;
-      state.debugMode = mode;
-      updateDebugComposer();
-    }
-
     function updateDebugComposer() {
       const selected = selectedDebugMessage();
       const message = selected && selected.message;
       $('flightTarget').textContent = selected ? selected.service.handle : '未选择';
       $('flightProtocol').textContent = message ? `${message.name} · #${message.mtype}` : '—';
       $('flightMode').textContent = state.debugMode.toUpperCase();
-      $('requestType').textContent = `请求类型：${message ? message.request_type : '—'}`;
-      $('responseType').textContent = `返回类型：${message ? (message.response_type || '无') : '—'}`;
-      const exactExample = Boolean(message && message.request_example);
-      $('payloadHint').textContent = message
-        ? (exactExample
-          ? '服务已提供与该请求类型匹配的 JSON 示例；可修改字段值后发送。'
-          : payloadShapeHint(message.request_type))
-        : '选择消息后显示 serde JSON 格式。';
-      $('loadPayloadExample').hidden = !exactExample;
-      $('callMode').disabled = Boolean(message && !message.call_supported);
-      $('callMode').setAttribute('aria-pressed', state.debugMode === 'call');
-      $('sendMode').setAttribute('aria-pressed', state.debugMode === 'send');
-      $('invokeDebug').textContent = state.debugBusy ? '正在发送…' : `发送 ${state.debugMode === 'call' ? 'Call' : 'Send'}`;
+      $('invokeCall').textContent = state.debugBusy && state.debugMode === 'call' ? '发送中…' : 'Call';
+      $('invokeSend').textContent = state.debugBusy && state.debugMode === 'send' ? '发送中…' : 'Send';
+      renderMessageSchema();
       validateDebugJson();
     }
 
     function initialPayload(message) {
-      if (!message) return 'null';
-      if (message.request_example) {
-        return JSON.stringify(JSON.parse(message.request_example), null, 2);
-      }
-      const type = message.request_type;
-      if (type === '()') return 'null';
-      if (type === 'bool') return 'false';
-      if (/^(u|i|f)(8|16|32|64|128|size)$/.test(type)) return '0';
-      if (type === 'alloc::string::String' || type === 'std::string::String' || type === 'String') return '""';
-      if (type.includes('::vec::Vec<') || type.startsWith('Vec<')) return '[]';
-      if (type.includes('::option::Option<') || type.startsWith('Option<')) return 'null';
       return 'null';
     }
 
-    function payloadShapeHint(type) {
-      if (type === '()') return '该消息无请求参数，请填写 null。';
-      if (type === 'bool') return '请填写 JSON 布尔值，例如 false。';
-      if (/^(u|i|f)(8|16|32|64|128|size)$/.test(type)) return '请填写 JSON 数字，例如 0。';
-      if (type === 'alloc::string::String' || type === 'std::string::String' || type === 'String') return '请填写 JSON 字符串，例如 "hello"（必须带双引号）。';
-      if (type.includes('::vec::Vec<') || type.startsWith('Vec<')) return '请填写 JSON 数组，例如 []。';
-      if (type.includes('::option::Option<') || type.startsWith('Option<')) return '可填写 null，或填写内部类型对应的 JSON。';
-      return `服务未提供示例；请按 ${type} 的 serde 表示填写。建议在处理器 #[debug] 中配置 example。`;
+    function renderMessageSchema() {
+      const selected = selectedDebugMessage();
+      renderSchema('requestMessageSchema', selected && selected.message.request_schema, 'request', '选择消息后查看字段结构');
+      renderSchema('responseMessageSchema', selected && selected.message.response_schema, 'response', selected ? '该消息没有响应结构' : '选择消息后查看字段结构');
     }
 
-    function loadSelectedPayloadExample() {
-      const selected = selectedDebugMessage();
-      if (!selected || !selected.message.request_example) return;
-      $('jsonPayload').value = initialPayload(selected.message);
-      $('jsonPayload').focus();
-      validateDebugJson();
+    function renderSchema(containerId, schema, rootName, emptyMessage) {
+      if (!schema) {
+        $(containerId).innerHTML = `<div class="schema-empty">${emptyMessage}</div>`;
+        return;
+      }
+      const rows = [];
+      flattenSchema(schema, schema.title || rootName, 0, false, rows);
+      $(containerId).innerHTML = rows.map((row) => `<div class="schema-row" style="--depth:${row.depth}">
+        <span class="schema-field">${escapeHtml(row.name)}${row.required ? '<span class="schema-required">必填</span>' : ''}</span>
+        <span class="schema-type">${escapeHtml(row.type)}</span>
+        <span class="schema-description">${escapeHtml(row.description || '—')}</span>
+      </div>`).join('') || '<div class="schema-empty">该消息没有字段</div>';
+    }
+
+    function setDebugContentView(group, view) {
+      const composer = group === 'composer';
+      const firstTab = $(composer ? 'payloadTab' : 'resultTab');
+      const secondTab = $(composer ? 'requestStructureTab' : 'responseStructureTab');
+      const firstPanel = $(composer ? 'payloadPanel' : 'resultPanel');
+      const secondPanel = $(composer ? 'requestStructurePanel' : 'responseStructurePanel');
+      const showFirst = view === (composer ? 'payload' : 'content');
+      firstTab.setAttribute('aria-selected', showFirst);
+      secondTab.setAttribute('aria-selected', !showFirst);
+      firstPanel.hidden = !showFirst;
+      secondPanel.hidden = showFirst;
+    }
+
+    function flattenSchema(schema, name, depth, required, rows) {
+      if (!schema || typeof schema !== 'object') {
+        rows.push({ name, depth, required, type: JSON.stringify(schema), description: '' });
+        return;
+      }
+      const alternatives = schema.oneOf || schema.anyOf;
+      const type = schema.type || (schema.oneOf ? 'oneOf' : schema.anyOf ? 'optional / union' : 'any');
+      rows.push({ name, depth, required, type: schemaTypeLabel(schema, type), description: schema.description || '' });
+      if (schema.properties) {
+        const requiredFields = new Set(schema.required || []);
+        Object.entries(schema.properties).forEach(([field, child]) => flattenSchema(child, field, depth + 1, requiredFields.has(field), rows));
+      }
+      if (schema.prefixItems) schema.prefixItems.forEach((child, index) => flattenSchema(child, `[${index}]`, depth + 1, true, rows));
+      if (schema.items) flattenSchema(schema.items, 'items', depth + 1, true, rows);
+      if (alternatives) alternatives.forEach((child, index) => flattenSchema(child, `variant ${index + 1}`, depth + 1, false, rows));
+    }
+
+    function schemaTypeLabel(schema, fallback) {
+      if (schema.enum) return `enum(${schema.enum.join(' | ')})`;
+      if (schema.const !== undefined) return `const ${JSON.stringify(schema.const)}`;
+      if (schema.type === 'array' && schema.prefixItems) return `tuple[${schema.prefixItems.length}]`;
+      if (schema.type === 'array') return 'array';
+      return fallback;
     }
 
     function validateDebugJson() {
@@ -1265,7 +1305,10 @@
         error = `JSON 无效：${parseError.message}`;
       }
       $('editorError').textContent = error;
-      $('invokeDebug').disabled = Boolean(error) || !selectedDebugMessage() || state.debugBusy;
+      const selected = selectedDebugMessage();
+      const unavailable = Boolean(error) || !selected || state.debugBusy || !state.debugEnabled;
+      $('invokeCall').disabled = unavailable || Boolean(selected && !selected.message.call_supported);
+      $('invokeSend').disabled = unavailable;
       return !error;
     }
 
@@ -1275,14 +1318,16 @@
       validateDebugJson();
     }
 
-    async function invokeDebugMessage() {
+    async function invokeDebugMessage(mode) {
       const selected = selectedDebugMessage();
       if (!selected || !validateDebugJson() || state.debugBusy) return;
+      if (mode === 'call' && !selected.message.call_supported) return;
+      state.debugMode = mode;
       const request = {
         target: selected.service.handle,
         message: selected.message.name,
         mtype: selected.message.mtype,
-        mode: state.debugMode,
+        mode,
         payload: JSON.parse($('jsonPayload').value),
       };
       state.debugBusy = true;
@@ -1354,6 +1399,15 @@
         <article class="history-item ${entry.ok ? 'passed' : 'failed'}">
           <div class="history-summary"><span class="history-message">${escapeHtml(entry.request.message)}</span><time class="history-time">${escapeHtml(formatClock(entry.at))}</time></div>
           <div class="history-route">${escapeHtml(entry.request.mode.toUpperCase())} · #${entry.request.mtype} · ${escapeHtml(entry.request.target)} · ${entry.duration} ms</div>
+          <details class="history-details">
+            <summary>查看发送与接收内容</summary>
+            <div class="history-content">
+              <span class="history-content-label">发送内容</span>
+              <pre class="history-json">${escapeHtml(JSON.stringify(entry.request.payload, null, 2) ?? 'null')}</pre>
+              <span class="history-content-label">接收内容</span>
+              <pre class="history-json">${escapeHtml(JSON.stringify(entry.response, null, 2) ?? 'null')}</pre>
+            </div>
+          </details>
           <button class="history-replay" type="button" data-history-id="${escapeHtml(entry.id)}">载入并重放</button>
         </article>`).join('');
     }
