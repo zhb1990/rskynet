@@ -32,6 +32,7 @@
 //!   与 `impl Exclusive`。后两个是同步方法（它们跑在自己那条线程上），原样搬过去。
 //! - `#[msg(..)]`：标在方法上取代手写 `dispatch`，宏按协议号生成分发，见
 //!   [`#[service]`][service] 的文档。
+//! - `#[debug]`：与 `#[msg(..)]` 一起使用，把强类型消息显式开放给 Dashboard。
 //!
 //! 没被认领的方法留在原来的 inherent `impl` 块里，一个字都不动。
 //!
@@ -93,6 +94,11 @@ pub fn cluster_handler(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///     #[msg(MsgType::USER)]
 ///     async fn on_ask(&self, ctx: Ctx, ask: Ask) -> Answer { .. }
 ///
+///     // 请求从网页 JSON 反序列化，call 返回值再序列化为 JSON。
+///     #[debug(name = "ask", example = r#"{"question":"status"}"#)]
+///     #[msg(MsgType::USER)]
+///     async fn debug_ask(&self, ctx: Ctx, ask: Ask) -> Answer { .. }
+///
 ///     // 一个处理函数可以认多个协议号
 ///     #[msg(MsgType::TEXT, MsgType::SYSTEM)]
 ///     async fn on_text(&self, ctx: Ctx, text: String) { .. }
@@ -107,6 +113,10 @@ pub fn cluster_handler(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// 类型走 [`FromPayload`]；`Vec<u8>` / `String` 对应字节负载，自己的类型写一句
 /// `boxed_payload!(Ask);` 就对应对象负载。返回值走 [`IntoPayload`]，返回 `()`
 /// 就不回包。
+///
+/// `#[debug]` 是显式 opt-in：请求类型还需实现 `serde::de::DeserializeOwned`，有返回值
+/// 时返回类型还需实现 `serde::Serialize + FromPayload`。返回 `()` 的处理器只支持
+/// Dashboard 的 send；收整条 `Message` 与 `#[msg(default)]` 不能开放给调试控制台。
 ///
 /// 没有 `#[msg(default)]` 时，认不出协议号的消息会记一行日志，对方在等回话的话
 /// 还会收到一个错误应答——总比让它永久挂着好。
@@ -164,6 +174,14 @@ pub fn exclusive(attr: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn msg(_attr: TokenStream, _item: TokenStream) -> TokenStream {
     expand::stray_msg().into()
+}
+
+/// 把一个 `#[msg(...)]` 处理器显式开放给 Dashboard 调试控制台。
+///
+/// 该属性由外层 [`service`] / [`exclusive`] 宏读取，单独使用会报错。
+#[proc_macro_attribute]
+pub fn debug(_attr: TokenStream, _item: TokenStream) -> TokenStream {
+    expand::stray_debug().into()
 }
 
 /// 注册一个进程信号回调。

@@ -21,12 +21,14 @@ use rskynet::{
     Config, ConfigExt, Ctx, Error, FromPayload, Idler, Message, MsgType, Payload, Registry, Result,
     boxed_payload,
 };
+use serde::{Deserialize, Serialize};
 
 /// 业务自己的协议号，看宏认不认「不是内置常量」的表达式。
 const PING: MsgType = MsgType(42);
 
+#[derive(Deserialize)]
 struct Add(i64, i64);
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
 struct Sum(i64);
 boxed_payload!(Add, Sum);
 
@@ -47,6 +49,7 @@ impl Calc {
     }
 
     /// 对象负载 + 自动回包。
+    #[debug(name = "add", example = r#"[2,40]"#)]
     #[msg(MsgType::USER)]
     async fn on_add(&self, _ctx: Ctx, add: Add) -> Sum {
         self.calls.fetch_add(1, SeqCst);
@@ -54,6 +57,7 @@ impl Calc {
     }
 
     /// 字节负载，认两个协议号，没有返回值所以不回包。
+    #[debug]
     #[msg(MsgType::TEXT, PING)]
     async fn on_text(&self, _ctx: Ctx, text: String) {
         self.note(format!("文本={text}"));
@@ -153,6 +157,16 @@ struct Probe {
 #[rskynet::service]
 impl Probe {
     async fn init(&self, ctx: Ctx) -> Result<()> {
+        let debug = ctx.node().debug_messages(".calc")?;
+        assert_eq!(debug.len(), 3);
+        assert_eq!(debug[0].name(), "add");
+        assert_eq!(debug[0].mtype(), MsgType::USER);
+        assert!(debug[0].supports_call());
+        assert_eq!(debug[0].request_example(), Some(r#"[2,40]"#));
+        assert_eq!(debug[1].name(), "on_text");
+        assert!(!debug[1].supports_call());
+        assert_eq!(debug[2].mtype(), PING);
+
         // 对象负载按声明的类型取，返回值自动装回去
         let reply = ctx
             .call(".calc", MsgType::USER, Payload::of(Add(2, 40)))

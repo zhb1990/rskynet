@@ -65,6 +65,7 @@ mod sync;
 
 mod clock;
 mod context;
+mod debug;
 mod error;
 mod exclusive;
 mod handle;
@@ -98,6 +99,7 @@ pub type Handle = u64;
 
 pub use clock::Timer;
 pub use context::{Ctx, Service};
+pub use debug::DebugMessageDescriptor;
 pub use error::{Error, Result};
 pub use exclusive::{Exclusive, Idler};
 pub use ext::{NodeRef, NodeStats, ReplyToken, ServiceLifecycle, ServiceStats};

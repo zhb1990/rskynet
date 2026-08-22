@@ -1732,6 +1732,7 @@ dependencies = [
 name = "rskynet-dashboard"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "rskynet-bootstrap",
  "rskynet-core",
  "rskynet-http",
@@ -1784,6 +1785,7 @@ version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
+ "serde_json",
  "syn 2.0.119",
 ]
 

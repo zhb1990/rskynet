@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+futures-util = { workspace = true }
 rskynet-core = { workspace = true }
 rskynet-http = { workspace = true }
 rskynet-macros = { workspace = true }

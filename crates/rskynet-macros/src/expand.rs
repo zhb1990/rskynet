@@ -9,8 +9,8 @@ use quote::quote;
 use syn::punctuated::Punctuated;
 use syn::token::Comma;
 use syn::{
-    Error, Expr, FnArg, Ident, ImplItem, ImplItemFn, ItemImpl, LitStr, PatType, Path, Result,
-    ReturnType, Signature, Token, Type, parse_quote,
+    Error, Expr, ExprCall, ExprLit, ExprPath, FnArg, Ident, ImplItem, ImplItemFn, ItemImpl, Lit,
+    LitStr, Meta, PatType, Path, Result, ReturnType, Signature, Token, Type, parse_quote,
 };
 
 /// 注册方式：共享 worker 池还是独占一条线程。决定要不要认 `idle` / `interrupt`。
@@ -137,18 +137,33 @@ fn try_expand(attr: TokenStream, item: TokenStream, flavor: Flavor) -> Result<To
             leftovers.push(item);
             continue;
         };
+        let debug = take_debug(&mut func)?;
         let route = take_route(&mut func)?;
         let hook = hook_of(&func.sig.ident, flavor)?;
-        match (hook, route) {
-            (Some(_), Some(_)) => {
+        match (hook, route, debug) {
+            (Some(_), Some(_), _) => {
                 return Err(Error::new_spanned(
                     &func.sig.ident,
                     "钩子方法上不能再标 `#[msg]`：它本来就是内核直接调的",
                 ));
             }
-            (Some(hook), None) => hooks.push((hook, func)),
-            (None, Some(route)) => handlers.push(Handler::parse(func, route, &mut leftovers)?),
-            (None, None) => leftovers.push(ImplItem::Fn(func)),
+            (Some(_), None, Some(_)) => {
+                return Err(Error::new_spanned(
+                    &func.sig.ident,
+                    "`#[debug]` 只能标在 `#[msg(...)]` 消息处理器上",
+                ));
+            }
+            (Some(hook), None, None) => hooks.push((hook, func)),
+            (None, Some(route), debug) => {
+                handlers.push(Handler::parse(func, route, debug, &mut leftovers)?)
+            }
+            (None, None, Some(_)) => {
+                return Err(Error::new_spanned(
+                    &func.sig.ident,
+                    "`#[debug]` 只能标在 `#[msg(...)]` 消息处理器上",
+                ));
+            }
+            (None, None, None) => leftovers.push(ImplItem::Fn(func)),
         }
     }
 
@@ -203,6 +218,7 @@ fn try_expand(attr: TokenStream, item: TokenStream, flavor: Flavor) -> Result<To
     if dispatch.is_none() {
         dispatch = Some(routed_dispatch(&krate, &handlers)?);
     }
+    let debug_messages = debug_messages(&krate, &handlers);
 
     // `self_ty` 自带类型参数，所以 `ty_generics` 用不上
     let (impl_generics, _, where_clause) = block.generics.split_for_impl();
@@ -261,12 +277,79 @@ fn try_expand(attr: TokenStream, item: TokenStream, flavor: Flavor) -> Result<To
         impl #impl_generics #krate::Service for #self_ty #where_clause {
             #init
             #dispatch
+            #debug_messages
         }
 
         #exclusive
 
         #auto_registration
     })
+}
+
+struct DebugAttr {
+    name: Option<LitStr>,
+    example: Option<LitStr>,
+}
+
+/// 摘掉处理器上的 `#[debug]` / `#[debug(name = "...", example = r#"..."#)]`。
+fn take_debug(func: &mut ImplItemFn) -> Result<Option<DebugAttr>> {
+    let indexes: Vec<_> = func
+        .attrs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, attr)| attr.path().is_ident("debug").then_some(index))
+        .collect();
+    if indexes.len() > 1 {
+        return Err(Error::new_spanned(
+            &func.attrs[indexes[1]],
+            "同一个处理器只能写一个 `#[debug]`",
+        ));
+    }
+    let Some(index) = indexes.first().copied() else {
+        return Ok(None);
+    };
+    let attr = func.attrs.remove(index);
+    let mut name = None;
+    let mut example = None;
+    match &attr.meta {
+        Meta::Path(_) => {}
+        Meta::List(_) => attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("name") {
+                if name.is_some() {
+                    return Err(meta.error("`name` 写了两遍"));
+                }
+                let value: LitStr = meta.value()?.parse()?;
+                if value.value().trim().is_empty() {
+                    return Err(Error::new_spanned(value, "调试消息名称不能为空"));
+                }
+                name = Some(value);
+            } else if meta.path.is_ident("example") {
+                if example.is_some() {
+                    return Err(meta.error("`example` 写了两遍"));
+                }
+                let value: LitStr = meta.value()?.parse()?;
+                if let Err(error) = serde_json::from_str::<serde_json::Value>(&value.value()) {
+                    return Err(Error::new_spanned(
+                        value,
+                        format!("`example` 必须是合法 JSON：{error}"),
+                    ));
+                }
+                example = Some(value);
+            } else {
+                return Err(
+                    meta.error("`#[debug]` 只支持 `name = \"...\"` 与 `example = r#\"...\"#`")
+                );
+            }
+            Ok(())
+        })?,
+        Meta::NameValue(_) => {
+            return Err(Error::new_spanned(
+                attr,
+                "写成 `#[debug]` 或 `#[debug(name = \"...\", example = r#\"...\"#)]`",
+            ));
+        }
+    }
+    Ok(Some(DebugAttr { name, example }))
 }
 
 fn hook_of(name: &Ident, flavor: Flavor) -> Result<Option<Hook>> {
@@ -320,8 +403,12 @@ struct Handler {
     takes_ctx: bool,
     /// 第二个参数是什么。
     arg: Option<Arg>,
-    /// 有返回值，且返回的不是 `()`。
-    replies: bool,
+    /// 非 `()` 返回类型；存在时宏会自动回包。
+    response: Option<Box<Type>>,
+    /// 显式开放给 Dashboard 时使用的展示名称。
+    debug_name: Option<LitStr>,
+    /// 可在 Dashboard 中直接载入的 JSON 请求示例。
+    debug_example: Option<LitStr>,
     span: Span,
 }
 
@@ -334,7 +421,12 @@ enum Arg {
 }
 
 impl Handler {
-    fn parse(func: ImplItemFn, route: Route, leftovers: &mut Vec<ImplItem>) -> Result<Self> {
+    fn parse(
+        func: ImplItemFn,
+        route: Route,
+        debug: Option<DebugAttr>,
+        leftovers: &mut Vec<ImplItem>,
+    ) -> Result<Self> {
         let span = func.sig.ident.span();
         if func.sig.asyncness.is_none() {
             return Err(Error::new(span, "`#[msg]` 的处理函数要写成 `async fn`"));
@@ -354,15 +446,50 @@ impl Handler {
             }
         });
         let takes_ctx = !args.is_empty();
-        let replies = !returns_unit(&func.sig.output);
-        if replies && matches!(arg, Some(Arg::Whole)) {
+        let response = return_type(&func.sig.output);
+        if response.is_some() && matches!(arg, Some(Arg::Whole)) {
             return Err(Error::new(
                 span,
                 "收整条 `Message` 的处理函数不能有返回值：消息已经交给它了，自动回包无从下手，请自己调 `ctx.reply`",
             ));
         }
+        if debug.is_some() && matches!(arg, Some(Arg::Whole)) {
+            return Err(Error::new(
+                span,
+                "收整条 `Message` 的处理函数无法 `#[debug]`：请声明可反序列化的负载类型",
+            ));
+        }
+        if debug.is_some() && matches!(route, Route::Fallback) {
+            return Err(Error::new(
+                span,
+                "`#[msg(default)]` 无法 `#[debug]`：调试消息必须有明确协议号",
+            ));
+        }
+        if debug.is_some() {
+            if let Route::Types(exprs) = &route {
+                for expr in exprs {
+                    if forbidden_debug_type(expr) {
+                        return Err(Error::new_spanned(
+                            expr,
+                            "调试控制台不能开放 MsgType::RESPONSE 或 MsgType::ERROR",
+                        ));
+                    }
+                }
+            }
+        }
 
         let name = func.sig.ident.clone();
+        let (debug_name, debug_example) = match debug {
+            Some(debug) => (
+                Some(
+                    debug
+                        .name
+                        .unwrap_or_else(|| LitStr::new(&name.to_string(), name.span())),
+                ),
+                debug.example,
+            ),
+            None => (None, None),
+        };
         // 处理函数本身留在原地，好让它照旧能被直接调用（写单元测试用得上）
         leftovers.push(ImplItem::Fn(func));
         Ok(Handler {
@@ -370,7 +497,9 @@ impl Handler {
             route,
             takes_ctx,
             arg,
-            replies,
+            response,
+            debug_name,
+            debug_example,
             span,
         })
     }
@@ -407,7 +536,7 @@ impl Handler {
     }
 
     fn finish(&self, krate: &Path, call: TokenStream) -> TokenStream {
-        if self.replies {
+        if self.response.is_some() {
             quote! {
                 let __out = #call.await;
                 if #krate::Message::needs_reply(&msg) {
@@ -420,6 +549,62 @@ impl Handler {
             quote!(#call.await;)
         }
     }
+}
+
+fn debug_messages(krate: &Path, handlers: &[Handler]) -> TokenStream {
+    let descriptors = handlers.iter().flat_map(|handler| {
+        let Some(name) = &handler.debug_name else {
+            return Vec::new();
+        };
+        let request: Type = match &handler.arg {
+            None => parse_quote!(()),
+            Some(Arg::Typed(ty)) => (**ty).clone(),
+            Some(Arg::Whole) => unreachable!("带 #[debug] 的整条 Message 已被拒绝"),
+        };
+        let Route::Types(types) = &handler.route else {
+            unreachable!("带 #[debug] 的 default 已被拒绝")
+        };
+        let example = handler
+            .debug_example
+            .as_ref()
+            .map(|example| quote!(.with_request_example(#example)))
+            .unwrap_or_default();
+        types
+            .iter()
+            .map(|mtype| match &handler.response {
+                Some(response) => quote!(
+                    #krate::DebugMessageDescriptor::call::<#request, #response>(#name, #mtype)
+                        #example
+                ),
+                None => quote!(
+                    #krate::DebugMessageDescriptor::send::<#request>(#name, #mtype)
+                        #example
+                ),
+            })
+            .collect::<Vec<_>>()
+    });
+    quote! {
+        fn debug_messages(&self) -> ::std::vec::Vec<#krate::DebugMessageDescriptor> {
+            ::std::vec![#(#descriptors),*]
+        }
+    }
+}
+
+fn forbidden_debug_type(expr: &Expr) -> bool {
+    if let Expr::Path(ExprPath { path, .. }) = expr {
+        return path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "RESPONSE" || segment.ident == "ERROR");
+    }
+    let Expr::Call(ExprCall { func, args, .. }) = expr else {
+        return false;
+    };
+    let is_msg_type = matches!(&**func, Expr::Path(path) if path.path.segments.last().is_some_and(|segment| segment.ident == "MsgType"));
+    if !is_msg_type || args.len() != 1 {
+        return false;
+    }
+    matches!(&args[0], Expr::Lit(ExprLit { lit: Lit::Int(value), .. }) if value.base10_parse::<u8>().ok().is_some_and(|value| value == 1 || value == 6))
 }
 
 /// 按协议号生成 `dispatch`。
@@ -592,6 +777,13 @@ fn returns_unit(output: &ReturnType) -> bool {
     }
 }
 
+fn return_type(output: &ReturnType) -> Option<Box<Type>> {
+    (!returns_unit(output)).then(|| match output {
+        ReturnType::Default => unreachable!(),
+        ReturnType::Type(_, ty) => ty.clone(),
+    })
+}
+
 /// 让 `#[msg]` 单独出现时报一句人话，而不是「找不到这个属性」。
 pub(crate) fn stray_msg() -> TokenStream {
     Error::new(
@@ -599,4 +791,34 @@ pub(crate) fn stray_msg() -> TokenStream {
         "`#[msg]` 只在 `#[service]` / `#[exclusive]` 标注的 impl 块里认",
     )
     .to_compile_error()
+}
+
+pub(crate) fn stray_debug() -> TokenStream {
+    Error::new(
+        Span::call_site(),
+        "`#[debug]` 只在 `#[service]` / `#[exclusive]` 中与 `#[msg(...)]` 一起使用",
+    )
+    .to_compile_error()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_example_must_be_valid_json() {
+        let error = try_expand(
+            TokenStream::new(),
+            quote! {
+                impl Demo {
+                    #[debug(example = "{not json}")]
+                    #[msg(MsgType::USER)]
+                    async fn run(&self, value: String) {}
+                }
+            },
+            Flavor::Shared,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("必须是合法 JSON"));
+    }
 }

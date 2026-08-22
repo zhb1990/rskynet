@@ -190,6 +190,20 @@ impl NodeRef {
         ))
     }
 
+    /// 查询一个存活 service 显式开放给调试控制台的消息。
+    pub fn debug_messages(
+        &self,
+        addr: impl Into<Addr>,
+    ) -> Result<Vec<crate::DebugMessageDescriptor>> {
+        let handle = self.node.resolve(&addr.into())?;
+        let ctx = self
+            .node
+            .handles
+            .grab(handle)
+            .ok_or(crate::Error::NoService(handle))?;
+        Ok(ctx.service.debug_messages())
+    }
+
     /// 只读取邮箱积压数的轻量路径，供 logger 的逐消息背压判断等热路径使用。
     pub fn mailbox_len(&self, addr: impl Into<Addr>) -> Result<usize> {
         let handle = self.node.resolve(&addr.into())?;

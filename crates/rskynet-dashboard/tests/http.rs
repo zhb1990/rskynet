@@ -5,12 +5,58 @@ use std::thread;
 use std::time::Duration;
 
 use rskynet_bootstrap::{ConfigExt as _, RegistryExt as _};
-use rskynet_core::{Builder, Config, Ctx, NodeRef, Registry, Result};
+use rskynet_core::{Builder, Config, Ctx, MsgType, NodeRef, Registry, Result};
 use rskynet_dashboard::RegistryExt as _;
 use rskynet_net::RegistryExt as _;
 use rskynet_timer::BuilderExt as _;
 
 struct Probe(mpsc::Sender<NodeRef>);
+
+const NOTICE: MsgType = MsgType(42);
+const SLOW: MsgType = MsgType(43);
+
+#[derive(serde::Deserialize)]
+struct DoubleRequest {
+    value: u32,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct DoubleResponse {
+    value: u32,
+}
+
+rskynet_core::boxed_payload!(DoubleRequest, DoubleResponse);
+
+struct DebugTarget(mpsc::Sender<String>);
+
+#[rskynet_macros::service(crate = ::rskynet_core)]
+impl DebugTarget {
+    async fn init(&self, ctx: Ctx) -> Result<()> {
+        assert!(ctx.register_name("debug-target"));
+        Ok(())
+    }
+
+    #[debug(name = "double", example = r#"{"value":21}"#)]
+    #[msg(MsgType::USER)]
+    async fn double(&self, _ctx: Ctx, request: DoubleRequest) -> DoubleResponse {
+        DoubleResponse {
+            value: request.value * 2,
+        }
+    }
+
+    #[debug]
+    #[msg(NOTICE)]
+    async fn notice(&self, _ctx: Ctx, message: String) {
+        self.0.send(message).unwrap();
+    }
+
+    #[debug]
+    #[msg(SLOW)]
+    async fn slow(&self, ctx: Ctx, message: String) -> String {
+        ctx.sleep(100).await;
+        message
+    }
+}
 
 #[rskynet_macros::service(crate = ::rskynet_core)]
 impl Probe {
@@ -25,10 +71,17 @@ impl Probe {
 fn dashboard_serves_embedded_ui_and_live_stats() {
     let address = available_address();
     let (ready_tx, ready_rx) = mpsc::channel();
-    let mut config = Config::default().with_bootstrap(["probe"]);
+    let (notice_tx, notice_rx) = mpsc::channel();
+    let mut config = Config::default().with_bootstrap(["debug-target", "probe"]);
     config
         .section_mut("dashboard")
         .insert("address".into(), address.to_string().into());
+    config
+        .section_mut("dashboard")
+        .insert("debug_console".into(), true.into());
+    config
+        .section_mut("dashboard")
+        .insert("debug_call_timeout_ms".into(), 10.into());
     config
         .section_mut("cluster")
         .insert("node_id".into(), i64::from(u32::MAX).into());
@@ -44,6 +97,7 @@ fn dashboard_serves_embedded_ui_and_live_stats() {
             .with_bootstrap()
             .with_net()
             .with_dashboard()
+            .with("debug-target", move || DebugTarget(notice_tx.clone()))
             .with("probe", move || Probe(ready_tx.clone()));
         Builder::new(config)
             .registry(registry)
@@ -74,6 +128,7 @@ fn dashboard_serves_embedded_ui_and_live_stats() {
     let body = stats.split_once("\r\n\r\n").unwrap().1;
     let json: serde_json::Value = serde_json::from_str(body).unwrap();
     assert_eq!(json["cluster_id"], u32::MAX);
+    assert_eq!(json["debug_console_enabled"], true);
     let start_time = json["start_time_unix_ms"].as_u64().unwrap();
     let server_time = json["server_time_unix_ms"].as_u64().unwrap();
     let node_uptime = json["node"]["uptime_ms"].as_u64().unwrap();
@@ -93,6 +148,108 @@ fn dashboard_serves_embedded_ui_and_live_stats() {
             && socket["local"] == address.to_string()
             && socket["id"].as_u64().is_some()
     }));
+
+    let services = request(
+        address,
+        "GET /api/v1/debug/services HTTP/1.1\r\nHost: dashboard\r\nConnection: close\r\n\r\n",
+    );
+    assert!(services.starts_with("HTTP/1.1 200"));
+    let body = services.split_once("\r\n\r\n").unwrap().1;
+    let debug: serde_json::Value = serde_json::from_str(body).unwrap();
+    let target = debug["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|service| service["kind"] == "debug-target")
+        .unwrap();
+    let target_handle = target["handle"].as_str().unwrap();
+    assert!(
+        target_handle.len() >= 9,
+        "handle 应至少为冒号加 8 位十六进制"
+    );
+    assert_eq!(target["messages"].as_array().unwrap().len(), 3);
+    assert_eq!(target["messages"][0]["name"], "double");
+    assert_eq!(target["messages"][0]["call_supported"], true);
+    assert_eq!(target["messages"][0]["request_example"], r#"{"value":21}"#);
+    assert_eq!(target["messages"][1]["mtype"], NOTICE.raw());
+
+    let call_body = serde_json::json!({
+        "target": target_handle,
+        "message": "double",
+        "mtype": MsgType::USER.raw(),
+        "mode": "call",
+        "payload": { "value": 21 }
+    })
+    .to_string();
+    let call = post_json(address, "/api/v1/debug/invoke", &call_body);
+    assert!(call.starts_with("HTTP/1.1 200"), "{call}");
+    let result: serde_json::Value =
+        serde_json::from_str(call.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(result["result"]["value"], 42);
+
+    let send_body = serde_json::json!({
+        "target": target_handle,
+        "message": "notice",
+        "mtype": NOTICE.raw(),
+        "mode": "send",
+        "payload": "hello dashboard"
+    })
+    .to_string();
+    let sent = post_json(address, "/api/v1/debug/invoke", &send_body);
+    assert!(sent.starts_with("HTTP/1.1 200"), "{sent}");
+    assert_eq!(
+        notice_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        "hello dashboard"
+    );
+
+    let unsupported_call = post_json(
+        address,
+        "/api/v1/debug/invoke",
+        &serde_json::json!({
+            "target": target_handle,
+            "message": "notice",
+            "mtype": NOTICE.raw(),
+            "mode": "call",
+            "payload": "hello"
+        })
+        .to_string(),
+    );
+    assert!(unsupported_call.starts_with("HTTP/1.1 409"));
+    assert!(unsupported_call.contains("call_not_supported"));
+
+    let invalid_payload = post_json(
+        address,
+        "/api/v1/debug/invoke",
+        &serde_json::json!({
+            "target": target_handle,
+            "message": "double",
+            "mtype": MsgType::USER.raw(),
+            "mode": "send",
+            "payload": { "wrong": true }
+        })
+        .to_string(),
+    );
+    assert!(invalid_payload.starts_with("HTTP/1.1 422"));
+    assert!(invalid_payload.contains("invalid_payload"));
+
+    let timed_out = post_json(
+        address,
+        "/api/v1/debug/invoke",
+        &serde_json::json!({
+            "target": target_handle,
+            "message": "slow",
+            "mtype": SLOW.raw(),
+            "mode": "call",
+            "payload": "wait"
+        })
+        .to_string(),
+    );
+    assert!(timed_out.starts_with("HTTP/1.1 504"), "{timed_out}");
+    assert!(timed_out.contains("call_timeout"));
+
+    let oversized = post_json(address, "/api/v1/debug/invoke", &" ".repeat(262_145));
+    assert!(oversized.starts_with("HTTP/1.1 413"), "{oversized}");
+    assert!(oversized.contains("body_too_large"));
     assert!(sockets.iter().any(|socket| {
         socket["kind"] == "stream"
             && socket["owner_kind"] == rskynet_dashboard::NAME
@@ -105,6 +262,60 @@ fn dashboard_serves_embedded_ui_and_live_stats() {
     );
     assert!(method.starts_with("HTTP/1.1 405"));
     assert!(method.contains("allow: GET"));
+
+    node.abort();
+    runtime
+        .join()
+        .expect("测试节点线程不应 panic")
+        .expect("测试节点应正常退出");
+}
+
+#[test]
+fn dashboard_debug_api_is_disabled_by_default() {
+    let address = available_address();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let mut config = Config::default().with_bootstrap(["probe"]);
+    config
+        .section_mut("dashboard")
+        .insert("address".into(), address.to_string().into());
+    config
+        .section_mut("logger")
+        .insert("name".into(), "".into());
+    config
+        .section_mut("signal")
+        .insert("name".into(), "".into());
+
+    let runtime = thread::spawn(move || {
+        let registry = Registry::new()
+            .with_bootstrap()
+            .with_net()
+            .with_dashboard()
+            .with("probe", move || Probe(ready_tx.clone()));
+        Builder::new(config)
+            .registry(registry)
+            .with_wheel_timer()
+            .startup_service(rskynet_net::NAME, "")
+            .startup_service(rskynet_dashboard::NAME, "")
+            .run()
+    });
+    let node = ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("测试节点应完成启动");
+
+    let stats = request(
+        address,
+        "GET /api/v1/stats HTTP/1.1\r\nHost: dashboard\r\nConnection: close\r\n\r\n",
+    );
+    let body = stats.split_once("\r\n\r\n").unwrap().1;
+    let json: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(json["debug_console_enabled"], false);
+
+    let debug = request(
+        address,
+        "GET /api/v1/debug/services HTTP/1.1\r\nHost: dashboard\r\nConnection: close\r\n\r\n",
+    );
+    assert!(debug.starts_with("HTTP/1.1 404"));
+    assert!(debug.contains("debug_disabled"));
 
     node.abort();
     runtime
@@ -127,4 +338,14 @@ fn request(address: SocketAddr, request: &str) -> String {
     let mut response = String::new();
     stream.read_to_string(&mut response).unwrap();
     response
+}
+
+fn post_json(address: SocketAddr, path: &str, body: &str) -> String {
+    request(
+        address,
+        &format!(
+            "POST {path} HTTP/1.1\r\nHost: dashboard\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    )
 }

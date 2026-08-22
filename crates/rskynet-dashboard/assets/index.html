@@ -186,6 +186,79 @@
     .service-chart canvas { height: 105px; }
     .empty { text-align: center; color: var(--muted); padding: 60px 20px; }
 
+    .debug-shell { min-height: 640px; display: grid; grid-template-columns: 280px minmax(420px, 1fr) 340px; background: #091a29; }
+    .debug-column { min-width: 0; padding: 18px; }
+    .debug-column + .debug-column { border-left: 1px solid var(--line-soft); }
+    .debug-eyebrow { color: var(--teal); font-family: var(--mono); font-size: 11px; letter-spacing: .11em; text-transform: uppercase; }
+    .debug-heading { margin: 5px 0 14px; font-size: 19px; font-weight: 680; }
+    .debug-search { margin-bottom: 13px; }
+    .debug-targets { display: grid; gap: 8px; max-height: 560px; overflow: auto; padding-right: 3px; }
+    .debug-service-label { margin: 10px 2px 3px; color: var(--muted); font-size: 12px; }
+    .debug-message {
+      width: 100%; padding: 10px 11px; display: grid; grid-template-columns: 1fr auto; gap: 4px 8px;
+      border: 1px solid var(--line-soft); border-radius: 6px; color: var(--text); background: #102334;
+      text-align: left; cursor: pointer;
+    }
+    .debug-message:hover, .debug-message:focus-visible { border-color: var(--cyan); outline: none; }
+    .debug-message.active { border-color: var(--teal); background: #153b42; box-shadow: inset 3px 0 var(--teal); }
+    .debug-message-name { font-weight: 650; overflow-wrap: anywhere; }
+    .debug-message-type { grid-column: 1 / -1; color: var(--faint); font-family: var(--mono); font-size: 11px; overflow-wrap: anywhere; }
+    .protocol-chip { align-self: start; color: var(--cyan); font-family: var(--mono); font-size: 11px; }
+    .flight-strip {
+      min-height: 62px; display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto minmax(88px, .6fr);
+      align-items: center; gap: 9px; margin-bottom: 16px; padding: 10px 13px;
+      border: 1px solid #28506b; border-radius: 6px; background: #0b2132;
+    }
+    .flight-node { min-width: 0; }
+    .flight-label { display: block; color: var(--faint); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
+    .flight-value { display: block; margin-top: 3px; overflow: hidden; color: #eaf5fa; font-family: var(--mono); text-overflow: ellipsis; white-space: nowrap; }
+    .flight-arrow { position: relative; width: 26px; height: 1px; background: var(--teal); }
+    .flight-arrow::after { content: ""; position: absolute; right: 0; top: -3px; border-left: 5px solid var(--teal); border-top: 3px solid transparent; border-bottom: 3px solid transparent; }
+    .debug-form-label { display: flex; justify-content: space-between; gap: 12px; margin: 14px 0 7px; color: var(--muted); }
+    .payload-guide {
+      display: flex; align-items: center; justify-content: space-between; gap: 14px; margin: 10px 0 4px; padding: 10px 12px;
+      border-left: 3px solid var(--cyan); border-radius: 3px 6px 6px 3px; background: #0d2638; color: var(--muted); font-size: 12px;
+    }
+    .payload-guide strong { display: block; margin-bottom: 3px; color: var(--text); font-size: 12px; }
+    .payload-guide-copy { min-width: 0; overflow-wrap: anywhere; }
+    .payload-example-button { flex: none; padding: 6px 9px; border: 1px solid #32617c; border-radius: 4px; color: var(--cyan); background: #0a1c2b; cursor: pointer; }
+    .payload-example-button:hover, .payload-example-button:focus-visible { border-color: var(--cyan); outline: none; }
+    .mode-switch { display: inline-flex; padding: 3px; border: 1px solid var(--line); border-radius: 6px; background: #081725; }
+    .mode-button { min-width: 74px; padding: 7px 12px; border: 0; border-radius: 4px; color: var(--muted); background: transparent; cursor: pointer; }
+    .mode-button[aria-pressed="true"] { color: #061c1a; background: var(--teal); font-weight: 700; }
+    .mode-button:focus-visible { outline: 1px solid var(--cyan); outline-offset: 2px; }
+    .json-editor, .result-output {
+      width: 100%; min-height: 300px; resize: vertical; padding: 14px; border: 1px solid var(--line); border-radius: 6px;
+      color: #d8ecf8; background: #06131f; font: 13px/1.6 var(--mono); tab-size: 2;
+    }
+    .json-editor:focus { outline: 1px solid var(--cyan); border-color: var(--cyan); }
+    .debug-actions { display: flex; align-items: center; gap: 9px; margin-top: 11px; }
+    .action-button { min-height: 38px; padding: 8px 13px; border: 1px solid var(--line); border-radius: 6px; color: var(--text); background: #10283a; cursor: pointer; }
+    .action-button:hover, .action-button:focus-visible { border-color: var(--cyan); outline: none; }
+    .action-button.primary { margin-left: auto; min-width: 132px; border-color: #318e84; color: #061c1a; background: var(--teal); font-weight: 750; }
+    .action-button:disabled { cursor: not-allowed; opacity: .45; }
+    .editor-error { min-height: 20px; margin-top: 7px; color: #ff9b9b; font-size: 12px; }
+    .result-card { margin-top: 18px; border-top: 1px solid var(--line-soft); padding-top: 16px; }
+    .result-meta { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 7px; color: var(--muted); }
+    .result-output { min-height: 150px; max-height: 290px; margin: 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .result-output.success { border-color: #27776f; }
+    .result-output.error { border-color: #9d424b; color: #ffb0b0; }
+    .history-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+    .history-clear { border: 0; color: var(--muted); background: transparent; cursor: pointer; font-size: 12px; }
+    .history-clear:hover, .history-clear:focus-visible { color: var(--red); outline: none; }
+    .history-note { margin: -4px 0 13px; color: var(--faint); font-size: 11px; }
+    .history-list { display: grid; gap: 8px; max-height: 545px; overflow: auto; }
+    .history-item { padding: 11px; border: 1px solid var(--line-soft); border-radius: 6px; background: #102334; }
+    .history-item.failed { border-left: 3px solid var(--red); }
+    .history-item.passed { border-left: 3px solid var(--teal); }
+    .history-summary { display: flex; justify-content: space-between; gap: 8px; }
+    .history-message { font-weight: 650; overflow-wrap: anywhere; }
+    .history-time { flex: none; color: var(--faint); font-family: var(--mono); font-size: 11px; }
+    .history-route { margin: 5px 0 9px; color: var(--muted); font-family: var(--mono); font-size: 11px; overflow-wrap: anywhere; }
+    .history-replay { width: 100%; padding: 6px; border: 1px solid var(--line); border-radius: 4px; color: var(--cyan); background: transparent; cursor: pointer; }
+    .history-replay:hover, .history-replay:focus-visible { border-color: var(--cyan); outline: none; }
+    .debug-empty { padding: 34px 12px; color: var(--muted); text-align: center; }
+
     @media (max-width: 1120px) {
       .topbar { flex-wrap: wrap; height: auto; padding-top: 12px; padding-bottom: 12px; gap: 12px; }
       .topbar-spacer { display: none; }
@@ -197,6 +270,9 @@
       .socket-total { grid-column: 1 / -1; text-align: left; }
       .pressure { grid-column: 1 / -1; border-left: 0; border-top: 1px solid var(--line-soft); padding: 12px 0 0; }
       .table-wrap { max-height: none; min-height: 420px; }
+      .debug-shell { grid-template-columns: 240px minmax(400px, 1fr); }
+      .debug-history-column { grid-column: 1 / -1; border-left: 0 !important; border-top: 1px solid var(--line-soft); }
+      .history-list { grid-template-columns: repeat(2, minmax(0, 1fr)); max-height: none; }
     }
     @media (max-width: 760px) {
       .page { padding-left: 8px; padding-right: 8px; }
@@ -212,6 +288,417 @@
       .socket-total { grid-column: auto; }
       .service-total { justify-self: start; }
       .detail { grid-template-columns: 1fr; }
+      .debug-shell { grid-template-columns: 1fr; }
+      .debug-column + .debug-column { border-left: 0; border-top: 1px solid var(--line-soft); }
+      .debug-targets, .history-list { max-height: 330px; }
+      .history-list { grid-template-columns: 1fr; }
+      .flight-strip { grid-template-columns: 1fr; }
+      .flight-arrow { width: 1px; height: 16px; margin-left: 8px; }
+      .flight-arrow::after { right: -3px; top: auto; bottom: 0; border-top: 5px solid var(--teal); border-left: 3px solid transparent; border-right: 3px solid transparent; border-bottom: 0; }
+    }
+
+    /* Signal board redesign */
+    :root {
+      --bg: #071015;
+      --header: rgba(7, 16, 21, .94);
+      --surface: #0d181e;
+      --surface-2: #112129;
+      --surface-3: #162b34;
+      --line: #29414a;
+      --line-soft: #1c3038;
+      --text: #e8f1ef;
+      --muted: #91a4a6;
+      --faint: #64777b;
+      --teal: #5ce6bd;
+      --cyan: #72b9f0;
+      --orange: #ffb567;
+      --red: #ff727d;
+      --yellow: #e9cb68;
+      --radius: 4px;
+      --mono: "SFMono-Regular", "Cascadia Mono", Consolas, "Liberation Mono", monospace;
+      --sans: "Aptos", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      --display: "Aptos Display", "Arial Narrow", "PingFang SC", sans-serif;
+    }
+
+    html { background: var(--bg); }
+    body {
+      height: 100dvh;
+      min-width: 320px;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      overflow: hidden;
+      background:
+        linear-gradient(rgba(114, 185, 240, .025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(114, 185, 240, .025) 1px, transparent 1px),
+        radial-gradient(circle at 12% -10%, rgba(92, 230, 189, .08), transparent 32%),
+        var(--bg);
+      background-size: 32px 32px, 32px 32px, auto, auto;
+      letter-spacing: .01em;
+    }
+    ::selection { color: #06130f; background: var(--teal); }
+    :focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+    * {
+      scrollbar-width: thin;
+      scrollbar-color: #375660 #091419;
+    }
+    *::-webkit-scrollbar { width: 8px; height: 8px; }
+    *::-webkit-scrollbar-track { background: #091419; }
+    *::-webkit-scrollbar-thumb {
+      min-width: 32px;
+      min-height: 32px;
+      border: 2px solid #091419;
+      border-radius: 999px;
+      background: #375660;
+    }
+    *::-webkit-scrollbar-thumb:hover { background: #4a7d7b; }
+    *::-webkit-scrollbar-thumb:active { background: var(--teal); }
+    *::-webkit-scrollbar-corner { background: #091419; }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      height: 78px;
+      padding: 0 24px 0 30px;
+      gap: 16px;
+      background: var(--header);
+      border-bottom: 1px solid var(--line-soft);
+      box-shadow: 0 10px 34px rgba(0, 0, 0, .22);
+      backdrop-filter: blur(18px);
+    }
+    .topbar::after {
+      content: "";
+      position: absolute;
+      right: 0;
+      bottom: -1px;
+      left: 0;
+      height: 1px;
+      background: linear-gradient(90deg, var(--teal) 0 9%, transparent 34% 83%, rgba(114, 185, 240, .55));
+      pointer-events: none;
+    }
+    .brand {
+      position: relative;
+      padding: 17px 26px 0 23px;
+      color: #f2f8f6;
+      font-family: var(--display);
+      font-size: 22px;
+      font-weight: 760;
+      letter-spacing: -.035em;
+      line-height: 1;
+      text-transform: lowercase;
+    }
+    .brand::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 18px;
+      width: 10px;
+      height: 10px;
+      border: 2px solid var(--teal);
+      box-shadow: 4px 4px 0 -2px var(--bg), 4px 4px 0 0 var(--cyan);
+      transform: rotate(45deg);
+    }
+    .brand::after {
+      content: "NODE OBSERVABILITY";
+      position: absolute;
+      left: 24px;
+      top: 0;
+      color: var(--faint);
+      font: 700 9px/1 var(--mono);
+      letter-spacing: .16em;
+    }
+    .connection {
+      gap: 9px;
+      padding: 7px 10px;
+      border: 1px solid var(--line-soft);
+      color: var(--muted);
+      background: rgba(13, 24, 30, .72);
+      font: 600 12px/1 var(--sans);
+    }
+    .connection-dot { width: 7px; height: 7px; box-shadow: 0 0 0 3px rgba(233, 203, 104, .1); }
+    .connection.online .connection-dot { box-shadow: 0 0 0 3px rgba(92, 230, 189, .1), 0 0 14px rgba(92, 230, 189, .65); }
+    .connection.offline .connection-dot { box-shadow: 0 0 0 3px rgba(255, 114, 125, .1); }
+    .badge, .endpoint {
+      min-height: 32px;
+      border-color: var(--line-soft);
+      border-radius: 3px;
+      color: #c8d5d3;
+      background: rgba(13, 24, 30, .78);
+      font-size: 12px;
+    }
+    .badge { color: var(--teal); border-color: rgba(92, 230, 189, .28); }
+    .endpoint img { width: 15px; height: 15px; opacity: .72; }
+    .last-refresh { color: var(--faint); font-size: 12px; }
+    .refresh-button {
+      min-height: 34px;
+      padding: 7px 12px;
+      border-color: var(--line);
+      border-radius: 3px;
+      background: var(--surface-2);
+      font-size: 12px;
+      transition: border-color .18s, color .18s, transform .18s;
+    }
+    .refresh-button:hover { color: var(--teal); transform: translateY(-1px); }
+    .refresh-button img { width: 15px; height: 15px; }
+
+    .page {
+      position: relative;
+      width: 100%;
+      height: auto;
+      min-height: 0;
+      max-width: 1880px;
+      margin: 0 auto;
+      padding: 24px 24px 32px 38px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .page::before {
+      content: "";
+      position: absolute;
+      top: 24px;
+      bottom: 32px;
+      left: 23px;
+      width: 1px;
+      background: linear-gradient(var(--teal), rgba(92, 230, 189, .08) 35%, rgba(114, 185, 240, .28));
+    }
+    .page::after {
+      content: "";
+      position: absolute;
+      top: 35px;
+      left: 19px;
+      width: 7px;
+      height: 7px;
+      border: 1px solid var(--teal);
+      background: var(--bg);
+      transform: rotate(45deg);
+    }
+    .time-strip {
+      position: relative;
+      flex: none;
+      min-height: 84px;
+      margin: 0 0 12px;
+      border: 1px solid var(--line-soft);
+      border-left: 0;
+      border-radius: var(--radius);
+      background: linear-gradient(105deg, rgba(92, 230, 189, .045), transparent 38%), var(--surface);
+      box-shadow: 0 16px 36px rgba(0, 0, 0, .12);
+    }
+    .time-strip::before {
+      content: "NODE CLOCK";
+      position: absolute;
+      top: 9px;
+      left: 22px;
+      color: var(--faint);
+      font: 700 9px/1 var(--mono);
+      letter-spacing: .16em;
+    }
+    .time-item { padding: 22px 25px 8px; grid-template-columns: 22px 1fr; column-gap: 12px; }
+    .time-item + .time-item { border-left-color: var(--line-soft); }
+    .time-icon { width: 19px; height: 19px; opacity: .7; filter: saturate(.7); }
+    .time-label { margin-bottom: 3px; color: var(--muted); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
+    .time-value { color: var(--text); font-size: clamp(17px, 1.35vw, 21px); font-weight: 560; letter-spacing: -.035em; }
+
+    .workspace { min-height: 0; flex: 1; grid-template-columns: 292px minmax(0, 1fr); gap: 14px; }
+    .sidebar {
+      min-height: 0;
+      display: grid;
+      grid-template-rows: auto repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      overflow: hidden;
+    }
+    .panel, .main-panel {
+      border: 1px solid var(--line-soft);
+      border-radius: var(--radius);
+      background: rgba(13, 24, 30, .94);
+      box-shadow: 0 16px 36px rgba(0, 0, 0, .1);
+    }
+    .panel-heading {
+      position: relative;
+      margin: 0;
+      padding: 15px 17px 10px 30px;
+      font-family: var(--display);
+      font-size: 15px;
+      font-weight: 680;
+      letter-spacing: -.01em;
+    }
+    .panel-heading::before {
+      content: "";
+      position: absolute;
+      top: 20px;
+      left: 17px;
+      width: 5px;
+      height: 5px;
+      background: var(--teal);
+      box-shadow: 0 0 9px rgba(92, 230, 189, .5);
+    }
+    .health-list { margin: 0 9px 9px; border-color: var(--line-soft); border-radius: 2px; }
+    .health-row { min-height: 32px; padding: 5px 10px; }
+    .health-row + .health-row { border-top-color: var(--line-soft); }
+    .health-key { font-size: 12px; }
+    .health-value { font-size: 15px; font-weight: 520; }
+    .status-mark { width: 5px; height: 5px; box-shadow: 0 0 8px currentColor; }
+    .chart-panel { min-height: 0; padding: 13px 15px 8px; }
+    .chart-title { color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .055em; text-transform: uppercase; }
+    .chart-value { color: var(--teal); font-size: 21px; font-weight: 520; letter-spacing: -.05em; }
+    canvas { height: calc(100% - 23px); min-height: 70px; max-height: 108px; }
+
+    .main-panel { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+    .tabbar {
+      min-height: 58px;
+      gap: 0;
+      padding: 0 12px;
+      border-bottom-color: var(--line-soft);
+      background: rgba(9, 20, 25, .7);
+    }
+    .tab {
+      min-width: 104px;
+      padding: 3px 18px 0;
+      color: var(--faint);
+      font-size: 13px;
+      letter-spacing: .06em;
+      transition: color .18s, background .18s;
+    }
+    .tab::after { left: 18px; right: 18px; height: 2px; border-radius: 0; }
+    .tab:hover { background: rgba(255,255,255,.018); }
+    .tab.active { color: var(--text); }
+    .tab.active::after { background: var(--teal); box-shadow: 0 -4px 14px rgba(92, 230, 189, .25); }
+    .tab-panel:not([hidden]) { min-height: 0; flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+    .toolbar {
+      min-height: 106px;
+      grid-template-columns: minmax(220px, 1fr) 180px auto minmax(320px, 1.2fr);
+      gap: 12px;
+      padding: 17px;
+      border-bottom-color: var(--line-soft);
+      background: rgba(17, 33, 41, .45);
+    }
+    .network-toolbar { min-height: 82px; grid-template-columns: minmax(260px, 1fr) 170px 200px auto; }
+    .search, .filter {
+      height: 39px;
+      border-color: var(--line);
+      border-radius: 2px;
+      color: var(--text);
+      background: #09161c;
+      font-size: 12px;
+      transition: border-color .18s, box-shadow .18s;
+    }
+    .search:focus, .filter:focus { outline: none; border-color: var(--cyan); box-shadow: 0 0 0 2px rgba(114, 185, 240, .1); }
+    .service-total, .socket-total { color: var(--muted); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; }
+    .service-total strong, .socket-total strong { color: var(--text); font-size: 13px; }
+    .pressure { border-left-color: var(--line-soft); }
+    .pressure-title { color: var(--muted); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; }
+    .pressure-bars { gap: 6px; }
+    .pressure-count { font-size: 12px; }
+    .pressure-line { height: 3px; border-radius: 0; }
+    .pressure-label { color: var(--faint); font-size: 9px; }
+
+    .table-wrap { min-height: 0; max-height: none; flex: 1; scrollbar-color: #375660 #091419; }
+    table { font-size: 12px; }
+    th, td { height: 43px; padding: 9px 12px; border-bottom-color: var(--line-soft); }
+    th {
+      background: #101f26;
+      color: #aebdbc;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: .055em;
+      text-transform: uppercase;
+    }
+    th button { letter-spacing: inherit; text-transform: inherit; }
+    tbody tr.data-row { transition: background .12s, box-shadow .12s; }
+    tbody tr.data-row:hover { background: rgba(114, 185, 240, .055); }
+    tbody tr.data-row.selected { background: rgba(92, 230, 189, .075); box-shadow: inset 2px 0 var(--teal); }
+    tbody tr.failed td { color: #ff9ba4; }
+    .life-dot { width: 6px; height: 6px; box-shadow: 0 0 8px currentColor; }
+    .flag { padding: 2px 5px; border-color: var(--line); border-radius: 2px; font-size: 9px; letter-spacing: .05em; }
+    .detail-row td { background: #0c2026; }
+    .detail { gap: 24px; padding: 20px 24px 23px; border-bottom-color: rgba(92, 230, 189, .25); }
+    .detail-title { color: var(--teal); font: 700 10px/1.3 var(--sans); letter-spacing: .07em; text-transform: uppercase; }
+    .detail-grid { gap: 8px 14px; }
+    .service-chart { border-color: var(--line); border-radius: 2px; background: rgba(7,16,21,.3); }
+
+    .debug-shell { min-height: 0; height: 100%; grid-template-columns: 270px minmax(420px, 1fr) 330px; overflow: auto; background: rgba(7, 18, 23, .72); }
+    .debug-column { min-height: 0; padding: 20px; overflow-y: auto; }
+    .debug-column + .debug-column { border-left-color: var(--line-soft); }
+    .debug-eyebrow { color: var(--teal); font-size: 9px; letter-spacing: .17em; }
+    .debug-heading { margin: 7px 0 16px; font-family: var(--display); font-size: 18px; letter-spacing: -.025em; }
+    .debug-message, .history-item {
+      border-color: var(--line-soft);
+      border-radius: 2px;
+      background: #0e2027;
+    }
+    .debug-message { padding: 11px; }
+    .debug-message.active { border-color: rgba(92, 230, 189, .55); background: rgba(92, 230, 189, .08); box-shadow: inset 2px 0 var(--teal); }
+    .debug-message-name { font-size: 12px; }
+    .protocol-chip { color: var(--cyan); font-size: 10px; }
+    .flight-strip { border-color: var(--line); border-radius: 2px; background: #0a1b22; }
+    .payload-guide { border-left-width: 2px; border-radius: 0 2px 2px 0; background: rgba(114, 185, 240, .06); }
+    .payload-example-button, .action-button, .history-replay { border-radius: 2px; }
+    .mode-switch { border-radius: 3px; background: #071419; }
+    .mode-button { border-radius: 1px; }
+    .json-editor, .result-output { border-color: var(--line); border-radius: 2px; background: #061116; }
+    .action-button { background: #10242c; }
+    .action-button.primary { border-color: var(--teal); color: #06140f; background: var(--teal); }
+    .history-item.failed, .history-item.passed { border-left-width: 2px; }
+
+    @media (prefers-reduced-motion: no-preference) {
+      .connection.online .connection-dot { animation: signalPulse 2.2s ease-out infinite; }
+      @keyframes signalPulse {
+        0%, 70%, 100% { box-shadow: 0 0 0 3px rgba(92, 230, 189, .1), 0 0 10px rgba(92, 230, 189, .45); }
+        82% { box-shadow: 0 0 0 7px rgba(92, 230, 189, 0), 0 0 17px rgba(92, 230, 189, .7); }
+      }
+    }
+
+    @media (max-width: 1120px) {
+      .topbar { height: auto; min-height: 72px; padding: 12px 18px 12px 25px; }
+      .brand { padding-right: 12px; }
+      .page { padding: 18px 18px 28px 31px; }
+      .page::before { top: 18px; bottom: 28px; left: 18px; }
+      .page::after { top: 29px; left: 14px; }
+      .page { overflow-y: auto; }
+      .workspace { min-height: auto; flex: none; grid-template-columns: 1fr; }
+      .sidebar { min-height: auto; grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-rows: auto; overflow: visible; }
+      .health-panel { grid-row: span 2; }
+      .toolbar { grid-template-columns: minmax(220px, 1fr) 180px auto; }
+      .network-toolbar { grid-template-columns: minmax(240px, 1fr) 170px 190px; }
+      .socket-total { grid-column: 1 / -1; text-align: left; }
+      .pressure { grid-column: 1 / -1; border-top: 1px solid var(--line-soft); border-left: 0; padding: 12px 0 0; }
+      .main-panel { min-height: 520px; }
+      .table-wrap { min-height: 420px; max-height: none; }
+      .debug-shell { grid-template-columns: 240px minmax(400px, 1fr); }
+      .debug-history-column { grid-column: 1 / -1; border-top: 1px solid var(--line-soft); border-left: 0 !important; }
+      .history-list { grid-template-columns: repeat(2, minmax(0, 1fr)); max-height: none; }
+    }
+
+    @media (max-width: 760px) {
+      .topbar { position: relative; padding: 14px; gap: 9px; }
+      .brand { width: 100%; margin-bottom: 3px; }
+      .connection { margin-left: auto; }
+      .endpoint { max-width: calc(100vw - 122px); overflow: hidden; }
+      .endpoint span { overflow: hidden; text-overflow: ellipsis; }
+      .page { padding: 12px 8px 22px 18px; }
+      .page::before { top: 12px; bottom: 22px; left: 8px; }
+      .page::after { top: 23px; left: 4px; }
+      .time-strip { min-height: 0; }
+      .time-strip::before { left: 16px; }
+      .time-item { padding: 26px 14px 9px; }
+      .time-item + .time-item { padding-top: 10px; }
+      .time-value { font-size: 17px; }
+      .sidebar { grid-template-columns: 1fr; }
+      .health-panel { grid-row: auto; }
+      .tabbar { overflow-x: auto; }
+      .tab { min-width: 88px; padding-left: 12px; padding-right: 12px; }
+      .toolbar, .network-toolbar { grid-template-columns: 1fr; }
+      .socket-total { grid-column: auto; }
+      .pressure { border-top: 1px solid var(--line-soft); }
+      .detail { grid-template-columns: 1fr; }
+      .debug-shell { grid-template-columns: 1fr; }
+      .debug-column { padding: 16px; }
+      .debug-column + .debug-column { border-top: 1px solid var(--line-soft); border-left: 0; }
+      .debug-targets, .history-list { max-height: 330px; }
+      .history-list { grid-template-columns: 1fr; }
+      .flight-strip { grid-template-columns: 1fr; }
+      .flight-arrow { width: 1px; height: 16px; margin-left: 8px; }
+      .flight-arrow::after { right: -3px; top: auto; bottom: 0; border-top: 5px solid var(--teal); border-right: 3px solid transparent; border-bottom: 0; border-left: 3px solid transparent; }
     }
   </style>
 </head>
@@ -280,6 +767,7 @@
         <div class="tabbar" role="tablist" aria-label="节点统计类型">
           <button id="serviceTab" class="tab active" type="button" role="tab" aria-selected="true" aria-controls="servicePanel" tabindex="0">服务</button>
           <button id="networkTab" class="tab" type="button" role="tab" aria-selected="false" aria-controls="networkPanel" tabindex="-1">网络</button>
+          <button id="debugTab" class="tab" type="button" role="tab" aria-selected="false" aria-controls="debugPanel" tabindex="-1" hidden>调试</button>
         </div>
 
         <div id="servicePanel" class="tab-panel" role="tabpanel" aria-labelledby="serviceTab">
@@ -363,6 +851,63 @@
             </table>
           </div>
         </div>
+
+        <div id="debugPanel" class="tab-panel" role="tabpanel" aria-labelledby="debugTab" hidden>
+          <div class="debug-shell">
+            <section class="debug-column" aria-labelledby="debugTargetHeading">
+              <div class="debug-eyebrow">01 / Target</div>
+              <h2 id="debugTargetHeading" class="debug-heading">选择消息入口</h2>
+              <input id="debugSearch" class="search debug-search" type="search" autocomplete="off" placeholder="搜索 service 或消息">
+              <div id="debugTargets" class="debug-targets"><div class="debug-empty">正在读取可调试消息…</div></div>
+            </section>
+
+            <section class="debug-column" aria-labelledby="debugPayloadHeading">
+              <div class="debug-eyebrow">02 / Dispatch</div>
+              <h2 id="debugPayloadHeading" class="debug-heading">编写 JSON 负载</h2>
+              <div class="flight-strip" aria-label="消息投递路径">
+                <div class="flight-node"><span class="flight-label">目标</span><strong id="flightTarget" class="flight-value">未选择</strong></div>
+                <span class="flight-arrow" aria-hidden="true"></span>
+                <div class="flight-node"><span class="flight-label">协议</span><strong id="flightProtocol" class="flight-value">—</strong></div>
+                <span class="flight-arrow" aria-hidden="true"></span>
+                <div class="flight-node"><span class="flight-label">方式</span><strong id="flightMode" class="flight-value">CALL</strong></div>
+              </div>
+              <div class="debug-form-label">
+                <span id="requestType">请求类型：—</span>
+                <span id="responseType">返回类型：—</span>
+              </div>
+              <div class="mode-switch" role="group" aria-label="调用方式">
+                <button id="callMode" class="mode-button" type="button" aria-pressed="true">Call</button>
+                <button id="sendMode" class="mode-button" type="button" aria-pressed="false">Send</button>
+              </div>
+              <div class="payload-guide">
+                <div class="payload-guide-copy"><strong>格式提示</strong><span id="payloadHint">选择消息后显示 serde JSON 格式。</span></div>
+                <button id="loadPayloadExample" class="payload-example-button" type="button" hidden>载入示例</button>
+              </div>
+              <label class="debug-form-label" for="jsonPayload"><span>JSON payload</span><span class="mono">≤ 256 KiB</span></label>
+              <textarea id="jsonPayload" class="json-editor" spellcheck="false" autocomplete="off" aria-describedby="editorError">null</textarea>
+              <div id="editorError" class="editor-error" role="alert"></div>
+              <div class="debug-actions">
+                <button id="formatJson" class="action-button" type="button">格式化 JSON</button>
+                <button id="clearPayload" class="action-button" type="button">清空</button>
+                <button id="invokeDebug" class="action-button primary" type="button" disabled>发送 Call</button>
+              </div>
+              <section class="result-card" aria-live="polite">
+                <div class="result-meta"><strong>最近结果</strong><span id="resultDuration" class="mono">—</span></div>
+                <pre id="debugResult" class="result-output">选择一条消息后即可发送。</pre>
+              </section>
+            </section>
+
+            <aside class="debug-column debug-history-column" aria-labelledby="debugHistoryHeading">
+              <div class="debug-eyebrow">03 / Replay</div>
+              <div class="history-head">
+                <h2 id="debugHistoryHeading" class="debug-heading">本地历史</h2>
+                <button id="clearHistory" class="history-clear" type="button">全部清除</button>
+              </div>
+              <p class="history-note">最近 50 条请求与结果保存在此浏览器，可能包含敏感数据。</p>
+              <div id="debugHistory" class="history-list"><div class="debug-empty">还没有调试记录</div></div>
+            </aside>
+          </div>
+        </div>
       </section>
     </section>
   </main>
@@ -381,6 +926,12 @@
       socketSortKey: 'id',
       socketSortDirection: 1,
       refreshing: false,
+      activeTab: 'service',
+      debugServices: [],
+      debugSelection: null,
+      debugMode: 'call',
+      debugBusy: false,
+      debugHistory: loadDebugHistory(),
     };
 
     $('endpoint').textContent = location.host || 'local';
@@ -390,6 +941,23 @@
     $('networkSearch').addEventListener('input', renderNetworkTable);
     $('networkKindFilter').addEventListener('change', renderNetworkTable);
     $('networkStateFilter').addEventListener('change', renderNetworkTable);
+    $('debugSearch').addEventListener('input', renderDebugTargets);
+    $('debugTargets').addEventListener('click', (event) => {
+      const button = event.target.closest('button[data-debug-target]');
+      if (button) selectDebugMessage(button.dataset.debugTarget, button.dataset.debugMessage);
+    });
+    $('callMode').addEventListener('click', () => setDebugMode('call'));
+    $('sendMode').addEventListener('click', () => setDebugMode('send'));
+    $('formatJson').addEventListener('click', formatDebugJson);
+    $('loadPayloadExample').addEventListener('click', loadSelectedPayloadExample);
+    $('clearPayload').addEventListener('click', () => { $('jsonPayload').value = 'null'; validateDebugJson(); });
+    $('jsonPayload').addEventListener('input', validateDebugJson);
+    $('invokeDebug').addEventListener('click', invokeDebugMessage);
+    $('clearHistory').addEventListener('click', clearDebugHistory);
+    $('debugHistory').addEventListener('click', (event) => {
+      const button = event.target.closest('button[data-history-id]');
+      if (button) replayDebugHistory(button.dataset.historyId);
+    });
     $('serviceRows').addEventListener('click', (event) => {
       const row = event.target.closest('tr.data-row');
       if (!row) return;
@@ -414,12 +982,12 @@
       });
     });
     document.querySelectorAll('[role="tab"]').forEach((tab) => {
-      tab.addEventListener('click', () => selectTab(tab.id === 'networkTab' ? 'network' : 'service'));
+      tab.addEventListener('click', () => selectTab(tab.id.replace('Tab', '')));
       tab.addEventListener('keydown', (event) => {
         if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
         event.preventDefault();
-        const tabs = ['service', 'network'];
-        const current = tab.id === 'networkTab' ? 1 : 0;
+        const tabs = ['service', 'network', 'debug'].filter((name) => !$(name + 'Tab').hidden);
+        const current = tabs.indexOf(tab.id.replace('Tab', ''));
         const index = event.key === 'Home' ? 0
           : event.key === 'End' ? tabs.length - 1
           : (current + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
@@ -427,19 +995,22 @@
       });
     });
     window.addEventListener('resize', drawCharts);
+    renderDebugHistory();
 
     function selectTab(name, focus = false) {
-      const network = name === 'network';
-      $('servicePanel').hidden = network;
-      $('networkPanel').hidden = !network;
-      [['serviceTab', !network], ['networkTab', network]].forEach(([id, active]) => {
+      if (name === 'debug' && $('debugTab').hidden) name = 'service';
+      state.activeTab = name;
+      ['service', 'network', 'debug'].forEach((candidate) => {
+        const active = candidate === name;
+        $(candidate + 'Panel').hidden = !active;
+        const id = candidate + 'Tab';
         const tab = $(id);
         tab.classList.toggle('active', active);
         tab.setAttribute('aria-selected', active);
         tab.tabIndex = active ? 0 : -1;
       });
-      if (focus) $(network ? 'networkTab' : 'serviceTab').focus();
-      if (!network) requestAnimationFrame(() => { drawCharts(); drawSelectedServiceChart(); });
+      if (focus) $(name + 'Tab').focus();
+      if (name === 'service') requestAnimationFrame(() => { drawCharts(); drawSelectedServiceChart(); });
     }
 
     async function refresh() {
@@ -450,6 +1021,7 @@
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const snapshot = await response.json();
         acceptSnapshot(snapshot);
+        await refreshDebugServices(Boolean(snapshot.debug_console_enabled));
         setConnectionStatus('connection online', '运行中');
       } catch (error) {
         setConnectionStatus('connection offline', '连接断开');
@@ -543,6 +1115,278 @@
       renderTable();
       renderNetworkTable();
       drawCharts();
+    }
+
+    async function refreshDebugServices(enabled) {
+      $('debugTab').hidden = !enabled;
+      if (!enabled) {
+        state.debugServices = [];
+        state.debugSelection = null;
+        if (state.activeTab === 'debug') selectTab('service');
+        return;
+      }
+      try {
+        const response = await fetch('/api/v1/debug/services', { cache: 'no-store' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const payload = await response.json();
+        state.debugServices = payload.services || [];
+        const current = selectedDebugMessage();
+        if (!current) {
+          const firstService = state.debugServices.find((service) => service.messages.length);
+          if (firstService) {
+            const firstMessage = firstService.messages[0];
+            state.debugSelection = { handle: firstService.handle, id: firstMessage.id };
+            $('jsonPayload').value = initialPayload(firstMessage);
+            if (!firstMessage.call_supported) state.debugMode = 'send';
+          } else {
+            state.debugSelection = null;
+          }
+        }
+        renderDebugTargets();
+        updateDebugComposer();
+      } catch (error) {
+        state.debugServices = [];
+        state.debugSelection = null;
+        $('debugTargets').innerHTML = `<div class="debug-empty">无法读取调试消息：${escapeHtml(error.message)}</div>`;
+        updateDebugComposer();
+      }
+    }
+
+    function selectedDebugMessage() {
+      if (!state.debugSelection) return null;
+      const service = state.debugServices.find((item) => item.handle === state.debugSelection.handle);
+      const message = service && service.messages.find((item) => item.id === state.debugSelection.id);
+      return service && message ? { service, message } : null;
+    }
+
+    function renderDebugTargets() {
+      const query = $('debugSearch').value.trim().toLowerCase();
+      const groups = state.debugServices.map((service) => {
+        const identity = `${service.kind} ${service.names.join(' ')} ${service.handle}`.toLowerCase();
+        const messages = service.messages.filter((message) => {
+          const haystack = `${identity} ${message.name} ${message.mtype} ${message.request_type} ${message.response_type || ''}`.toLowerCase();
+          return !query || haystack.includes(query);
+        });
+        if (!messages.length) return '';
+        const label = service.names.length ? `${service.kind} / ${service.names.join(', ')}` : service.kind;
+        return `<div class="debug-service-label"><strong>${escapeHtml(label)}</strong><br><span class="mono">${escapeHtml(service.handle)}</span></div>${messages.map((message) => {
+          const active = state.debugSelection && state.debugSelection.handle === service.handle && state.debugSelection.id === message.id;
+          return `<button class="debug-message ${active ? 'active' : ''}" type="button" data-debug-target="${escapeHtml(service.handle)}" data-debug-message="${escapeHtml(message.id)}" aria-pressed="${active}">
+            <span class="debug-message-name">${escapeHtml(message.name)}</span><span class="protocol-chip">#${message.mtype}</span>
+            <span class="debug-message-type">${escapeHtml(shortType(message.request_type))}${message.call_supported ? ` → ${escapeHtml(shortType(message.response_type))}` : ' · send only'}</span>
+          </button>`;
+        }).join('')}`;
+      }).join('');
+      $('debugTargets').innerHTML = groups || '<div class="debug-empty">没有符合条件的可调试消息</div>';
+    }
+
+    function selectDebugMessage(handle, id) {
+      const changed = !state.debugSelection || state.debugSelection.handle !== handle || state.debugSelection.id !== id;
+      state.debugSelection = { handle, id };
+      const selected = selectedDebugMessage();
+      if (selected && !selected.message.call_supported) state.debugMode = 'send';
+      else if (changed) state.debugMode = 'call';
+      if (changed) {
+        $('jsonPayload').value = initialPayload(selected && selected.message);
+        $('editorError').textContent = '';
+      }
+      renderDebugTargets();
+      updateDebugComposer();
+    }
+
+    function setDebugMode(mode) {
+      const selected = selectedDebugMessage();
+      if (mode === 'call' && selected && !selected.message.call_supported) return;
+      state.debugMode = mode;
+      updateDebugComposer();
+    }
+
+    function updateDebugComposer() {
+      const selected = selectedDebugMessage();
+      const message = selected && selected.message;
+      $('flightTarget').textContent = selected ? selected.service.handle : '未选择';
+      $('flightProtocol').textContent = message ? `${message.name} · #${message.mtype}` : '—';
+      $('flightMode').textContent = state.debugMode.toUpperCase();
+      $('requestType').textContent = `请求类型：${message ? message.request_type : '—'}`;
+      $('responseType').textContent = `返回类型：${message ? (message.response_type || '无') : '—'}`;
+      const exactExample = Boolean(message && message.request_example);
+      $('payloadHint').textContent = message
+        ? (exactExample
+          ? '服务已提供与该请求类型匹配的 JSON 示例；可修改字段值后发送。'
+          : payloadShapeHint(message.request_type))
+        : '选择消息后显示 serde JSON 格式。';
+      $('loadPayloadExample').hidden = !exactExample;
+      $('callMode').disabled = Boolean(message && !message.call_supported);
+      $('callMode').setAttribute('aria-pressed', state.debugMode === 'call');
+      $('sendMode').setAttribute('aria-pressed', state.debugMode === 'send');
+      $('invokeDebug').textContent = state.debugBusy ? '正在发送…' : `发送 ${state.debugMode === 'call' ? 'Call' : 'Send'}`;
+      validateDebugJson();
+    }
+
+    function initialPayload(message) {
+      if (!message) return 'null';
+      if (message.request_example) {
+        return JSON.stringify(JSON.parse(message.request_example), null, 2);
+      }
+      const type = message.request_type;
+      if (type === '()') return 'null';
+      if (type === 'bool') return 'false';
+      if (/^(u|i|f)(8|16|32|64|128|size)$/.test(type)) return '0';
+      if (type === 'alloc::string::String' || type === 'std::string::String' || type === 'String') return '""';
+      if (type.includes('::vec::Vec<') || type.startsWith('Vec<')) return '[]';
+      if (type.includes('::option::Option<') || type.startsWith('Option<')) return 'null';
+      return 'null';
+    }
+
+    function payloadShapeHint(type) {
+      if (type === '()') return '该消息无请求参数，请填写 null。';
+      if (type === 'bool') return '请填写 JSON 布尔值，例如 false。';
+      if (/^(u|i|f)(8|16|32|64|128|size)$/.test(type)) return '请填写 JSON 数字，例如 0。';
+      if (type === 'alloc::string::String' || type === 'std::string::String' || type === 'String') return '请填写 JSON 字符串，例如 "hello"（必须带双引号）。';
+      if (type.includes('::vec::Vec<') || type.startsWith('Vec<')) return '请填写 JSON 数组，例如 []。';
+      if (type.includes('::option::Option<') || type.startsWith('Option<')) return '可填写 null，或填写内部类型对应的 JSON。';
+      return `服务未提供示例；请按 ${type} 的 serde 表示填写。建议在处理器 #[debug] 中配置 example。`;
+    }
+
+    function loadSelectedPayloadExample() {
+      const selected = selectedDebugMessage();
+      if (!selected || !selected.message.request_example) return;
+      $('jsonPayload').value = initialPayload(selected.message);
+      $('jsonPayload').focus();
+      validateDebugJson();
+    }
+
+    function validateDebugJson() {
+      let error = '';
+      try {
+        const value = JSON.parse($('jsonPayload').value);
+        if (new Blob([JSON.stringify(value)]).size > 256 * 1024) error = 'JSON 超过 256 KiB 请求上限';
+      } catch (parseError) {
+        error = `JSON 无效：${parseError.message}`;
+      }
+      $('editorError').textContent = error;
+      $('invokeDebug').disabled = Boolean(error) || !selectedDebugMessage() || state.debugBusy;
+      return !error;
+    }
+
+    function formatDebugJson() {
+      if (!validateDebugJson()) return;
+      $('jsonPayload').value = JSON.stringify(JSON.parse($('jsonPayload').value), null, 2);
+      validateDebugJson();
+    }
+
+    async function invokeDebugMessage() {
+      const selected = selectedDebugMessage();
+      if (!selected || !validateDebugJson() || state.debugBusy) return;
+      const request = {
+        target: selected.service.handle,
+        message: selected.message.name,
+        mtype: selected.message.mtype,
+        mode: state.debugMode,
+        payload: JSON.parse($('jsonPayload').value),
+      };
+      state.debugBusy = true;
+      updateDebugComposer();
+      const started = Date.now();
+      let responsePayload;
+      let ok = false;
+      let status = 0;
+      try {
+        const response = await fetch('/api/v1/debug/invoke', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(request),
+        });
+        status = response.status;
+        responsePayload = await response.json();
+        ok = response.ok && responsePayload.ok;
+      } catch (error) {
+        responsePayload = { ok: false, error: { code: 'network_error', message: error.message } };
+      } finally {
+        state.debugBusy = false;
+      }
+      const duration = responsePayload.duration_ms ?? (Date.now() - started);
+      showDebugResult(responsePayload, ok, duration, status);
+      addDebugHistory({ request, response: responsePayload, ok, status, duration });
+      updateDebugComposer();
+    }
+
+    function showDebugResult(payload, ok, duration, status = 0) {
+      const output = $('debugResult');
+      output.className = `result-output ${ok ? 'success' : 'error'}`;
+      output.textContent = JSON.stringify(payload, null, 2);
+      $('resultDuration').textContent = `${status ? `HTTP ${status} · ` : ''}${duration} ms`;
+    }
+
+    function loadDebugHistory() {
+      try {
+        const value = JSON.parse(localStorage.getItem(debugHistoryKey()) || '[]');
+        return Array.isArray(value) ? value.slice(0, 50) : [];
+      } catch (_) {
+        return [];
+      }
+    }
+
+    function debugHistoryKey() { return `rskynet.dashboard.debug.history.v2:${location.origin}`; }
+
+    function saveDebugHistory() {
+      try { localStorage.setItem(debugHistoryKey(), JSON.stringify(state.debugHistory)); }
+      catch (error) { $('editorError').textContent = `历史记录无法保存：${error.message}`; }
+    }
+
+    function addDebugHistory(entry) {
+      state.debugHistory.unshift({
+        id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        at: Date.now(),
+        ...entry,
+      });
+      state.debugHistory = state.debugHistory.slice(0, 50);
+      saveDebugHistory();
+      renderDebugHistory();
+    }
+
+    function renderDebugHistory() {
+      if (!state.debugHistory.length) {
+        $('debugHistory').innerHTML = '<div class="debug-empty">还没有调试记录</div>';
+        return;
+      }
+      $('debugHistory').innerHTML = state.debugHistory.map((entry) => `
+        <article class="history-item ${entry.ok ? 'passed' : 'failed'}">
+          <div class="history-summary"><span class="history-message">${escapeHtml(entry.request.message)}</span><time class="history-time">${escapeHtml(formatClock(entry.at))}</time></div>
+          <div class="history-route">${escapeHtml(entry.request.mode.toUpperCase())} · #${entry.request.mtype} · ${escapeHtml(entry.request.target)} · ${entry.duration} ms</div>
+          <button class="history-replay" type="button" data-history-id="${escapeHtml(entry.id)}">载入并重放</button>
+        </article>`).join('');
+    }
+
+    function replayDebugHistory(id) {
+      const entry = state.debugHistory.find((item) => item.id === id);
+      if (!entry) return;
+      const idKey = `${entry.request.message}:${entry.request.mtype}`;
+      const service = state.debugServices.find((item) => item.handle === entry.request.target);
+      const message = service && service.messages.find((item) => item.id === idKey);
+      if (!service || !message) {
+        showDebugResult({ ok: false, error: { code: 'stale_history', message: '原目标或消息已不再可用' } }, false, 0);
+        return;
+      }
+      state.debugSelection = { handle: service.handle, id: message.id };
+      state.debugMode = entry.request.mode === 'call' && message.call_supported ? 'call' : 'send';
+      $('jsonPayload').value = JSON.stringify(entry.request.payload, null, 2);
+      renderDebugTargets();
+      updateDebugComposer();
+      showDebugResult(entry.response, entry.ok, entry.duration, entry.status);
+      selectTab('debug');
+      $('jsonPayload').focus();
+    }
+
+    function clearDebugHistory() {
+      state.debugHistory = [];
+      saveDebugHistory();
+      renderDebugHistory();
+    }
+
+    function shortType(value) {
+      if (!value) return '()';
+      return value.split('::').pop();
     }
 
     function calculateServiceDeltas(snapshot) {

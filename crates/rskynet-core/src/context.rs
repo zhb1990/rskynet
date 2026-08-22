@@ -49,6 +49,11 @@ pub trait Service: Send + Sync + 'static {
     /// 收到一条非应答消息时调用。每条消息都会开一个独立任务，
     /// 因此这里可以放心 `await`，不会挡住同服务的其它消息。
     fn dispatch(self: Arc<Self>, ctx: Ctx, msg: Message) -> BoxFuture<'static, ()>;
+
+    /// 显式开放给 Dashboard 调试控制台的消息。默认不开放任何消息。
+    fn debug_messages(&self) -> Vec<crate::DebugMessageDescriptor> {
+        Vec::new()
+    }
 }
 
 /// 当前 service 的执行上下文。

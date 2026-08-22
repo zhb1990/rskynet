@@ -75,7 +75,7 @@ pub use rskynet_core::*;
 /// `msg` 单独用没有意义（它由前两个宏在展开时摘走），导出它只是为了让写错地方时
 /// 报一句人话。
 #[cfg(feature = "macros")]
-pub use rskynet_macros::{exclusive, msg, service, signal};
+pub use rskynet_macros::{debug, exclusive, msg, service, signal};
 
 /// 网络层：socket / gate / agent。
 #[cfg(feature = "net")]

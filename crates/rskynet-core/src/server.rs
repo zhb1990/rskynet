@@ -153,7 +153,7 @@ pub(crate) struct ServiceContext {
     pub(crate) node: Arc<Node>,
     pub(crate) mailbox: Mailbox,
     pub(crate) sessions: SessionTable,
-    service: Arc<dyn Service>,
+    pub(crate) service: Arc<dyn Service>,
     /// 独占线程服务的另一副面孔，与 `service` 是同一个对象；普通服务是 `None`。
     /// 它同时兼作「本服务由自己那条线程执行，不进运行队列」的标记。
     exclusive: Option<Arc<dyn Exclusive>>,

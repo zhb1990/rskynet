@@ -4,6 +4,11 @@ profile = true
 
 [dashboard]
 address = "127.0.0.1:8080"
+# 强类型消息调试默认关闭；启用时 address 必须是 loopback。
+debug_console = true
+debug_call_timeout_ms = 10000
 
 [bootstrap]
-services = []
+services = [
+    { name = "debug-demo" },
+]

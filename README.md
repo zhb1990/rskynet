@@ -228,6 +228,13 @@ rskynet = {
 | `rskynet-tls` | 基于 `rustls`、运行于 `rskynet-net` 之上的 TLS 服务 |
 | `rskynet-http` | HTTP/1.1 客户端、服务端驱动和可选 WebSocket |
 | `rskynet-dashboard` | 节点及 socket 统计 API、内嵌 Dashboard |
+
+Dashboard 的强类型消息调试控制台默认关闭。需要时在 loopback 监听地址下配置
+`debug_console = true`，并在业务服务的 `#[msg(...)]` 处理器上添加 `#[debug]` 或
+`#[debug(name = "...")]`；请求类型需支持 serde 反序列化，有返回值的 call 还要求
+返回类型支持 serde 序列化。推荐用 `example` 为网页提供准确的 JSON 格式提示，宏会在
+编译期校验示例：`#[debug(name = "add", example = r#"{"a":1,"b":2}"#)]`。
+`debug_call_timeout_ms` 默认是 10000。
 | `rskynet-cluster` | Prost 消息编码、节点连接和跨节点请求/应答 |
 
 ## 运行时模型
