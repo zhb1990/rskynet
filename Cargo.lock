@@ -1682,6 +1682,7 @@ dependencies = [
  "rskynet-timer",
  "rskynet-tls",
  "serde",
+ "serde_json",
  "toml",
 ]
 

@@ -42,6 +42,7 @@ cluster = ["net", "bootstrap", "dep:rskynet-cluster", "dep:toml"]
 rskynet-net = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 toml = { workspace = true }
 
 [[test]]

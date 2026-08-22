@@ -112,6 +112,13 @@ pub fn cluster_handler(attr: TokenStream, item: TokenStream) -> TokenStream {
 ///     #[msg(MsgType::TEXT, MsgType::SYSTEM)]
 ///     async fn on_text(&self, ctx: Ctx, text: String) { .. }
 ///
+///     // 同一协议号也可以先解包外层 enum，再按 variant 分派。
+///     #[msg(MsgType::USER, variant = UserMessage::Notify)]
+///     async fn on_notify(&self, ctx: Ctx, notify: Notify) { .. }
+///
+///     #[msg(MsgType::USER, variant = UserMessage::Query)]
+///     async fn on_query(&self, ctx: Ctx, query: Query) -> Answer { .. }
+///
 ///     // 其余协议号的兜底。参数写 Message 就是整条消息都交给它
 ///     #[msg(default)]
 ///     async fn on_other(&self, ctx: Ctx, msg: Message) { .. }
@@ -122,6 +129,12 @@ pub fn cluster_handler(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// 类型走 [`FromPayload`]；`Vec<u8>` / `String` 对应字节负载，自己的类型写一句
 /// `boxed_payload!(Ask);` 就对应对象负载。返回值走 [`IntoPayload`]，返回 `()`
 /// 就不回包。
+///
+/// `variant = Enum::Variant` 支持单位 variant 与单字段 variant。宏对同一个协议号只
+/// 解包一次外层 enum，再把单字段 variant 的内部值交给处理器；多字段内容应先包装
+/// 成 struct。无返回值的 variant 只接受 send，call 会立即收到错误；有返回值的
+/// variant 同时接受 send 与 call，send 会执行处理器但丢弃返回值。外层 enum 需要
+/// 实现 `FromPayload` / `IntoPayload`，本地对象通常写 `boxed_payload!(UserMessage);`。
 ///
 /// `#[debug]` 是显式 opt-in：请求与返回类型需实现 `MessageSchemaType`（业务结构通常
 /// `#[derive(rskynet::MessageSchema)]`），请求还需能反序列化，返回值还需能序列化。

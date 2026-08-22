@@ -117,11 +117,13 @@ pub use futures_util::future::BoxFuture;
 /// 过程宏展开所需的实现细节，不属于稳定的业务 API。
 #[doc(hidden)]
 pub mod __private {
+    pub use crate::debug::decode_json;
     pub use crate::schema::{
         schema_enum, schema_enum_newtype, schema_enum_struct, schema_enum_unit, schema_object,
         schema_tuple,
     };
     pub use inventory;
+    pub use serde_json::Value as JsonValue;
 }
 
 /// 写日志的便捷宏，等价于 `ctx.log(format!(...))`。

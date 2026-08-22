@@ -2,8 +2,6 @@
 
 use rskynet::{Ctx, MsgType, Result};
 
-const NOTICE: MsgType = MsgType(42);
-
 #[derive(serde::Deserialize, rskynet::MessageSchema)]
 struct EchoRequest {
     /// 要回显的正文。
@@ -18,7 +16,12 @@ struct EchoResponse {
     echoed: String,
 }
 
-rskynet::boxed_payload!(EchoRequest, EchoResponse);
+enum DebugRequest {
+    Echo(EchoRequest),
+    Notice(String),
+}
+
+rskynet::boxed_payload!(DebugRequest, EchoResponse);
 
 #[derive(Default)]
 struct DebugDemo;
@@ -31,7 +34,7 @@ impl DebugDemo {
     }
 
     #[debug(name = "echo")]
-    #[msg(MsgType::USER)]
+    #[msg(MsgType::USER, variant = DebugRequest::Echo)]
     async fn echo(&self, _ctx: Ctx, request: EchoRequest) -> EchoResponse {
         EchoResponse {
             echoed: std::iter::repeat_n(request.text, usize::from(request.repeat.unwrap_or(1)))
@@ -41,7 +44,7 @@ impl DebugDemo {
     }
 
     #[debug(name = "notice")]
-    #[msg(NOTICE)]
+    #[msg(MsgType::USER, variant = DebugRequest::Notice)]
     async fn notice(&self, ctx: Ctx, text: String) {
         rskynet::log!(ctx, "debug notice: {text}");
     }

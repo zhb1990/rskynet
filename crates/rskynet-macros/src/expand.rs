@@ -5,7 +5,7 @@
 //! 见 [`Hook`] 与 [`Route`]。
 
 use proc_macro2::{Span, TokenStream};
-use quote::quote;
+use quote::{ToTokens, format_ident, quote};
 use syn::punctuated::Punctuated;
 use syn::token::Comma;
 use syn::{
@@ -290,9 +290,53 @@ enum Hook {
 /// `#[msg(..)]` 里写的东西。
 enum Route {
     /// 一个或多个协议号，展开成 `if mtype == .. || mtype == ..`。
-    Types(Vec<Expr>),
+    Types {
+        types: Vec<Expr>,
+        variant: Option<VariantRoute>,
+    },
     /// `#[msg(default)]`，其余协议号的兜底。
     Fallback,
+}
+
+#[derive(Clone)]
+struct VariantRoute {
+    /// 完整构造器路径，例如 `UserMessage::Notify`。
+    path: Path,
+    /// 外层枚举路径，例如 `UserMessage`。
+    envelope: Path,
+}
+
+struct MsgArgs {
+    types: Vec<Expr>,
+    variant: Option<Path>,
+}
+
+impl syn::parse::Parse for MsgArgs {
+    fn parse(input: syn::parse::ParseStream) -> Result<Self> {
+        let mut types = Vec::new();
+        let mut variant = None;
+        while !input.is_empty() {
+            let is_variant = input.peek(Ident) && {
+                let fork = input.fork();
+                fork.parse::<Ident>()? == "variant" && fork.peek(Token![=])
+            };
+            if is_variant {
+                let key: Ident = input.parse()?;
+                input.parse::<Token![=]>()?;
+                if variant.is_some() {
+                    return Err(Error::new_spanned(key, "`variant` 写了两遍"));
+                }
+                variant = Some(input.parse()?);
+            } else {
+                types.push(input.parse()?);
+            }
+            if input.is_empty() {
+                break;
+            }
+            input.parse::<Token![,]>()?;
+        }
+        Ok(Self { types, variant })
+    }
 }
 
 pub(crate) fn expand(attr: TokenStream, item: TokenStream, flavor: Flavor) -> TokenStream {
@@ -621,19 +665,39 @@ fn take_route(func: &mut ImplItemFn) -> Result<Option<Route>> {
         return Ok(None);
     };
     let attr = func.attrs.remove(index);
-    let exprs = attr.parse_args_with(Punctuated::<Expr, Comma>::parse_terminated)?;
-    if exprs.is_empty() {
+    let MsgArgs { types, variant } = attr.parse_args()?;
+    if types.is_empty() {
         return Err(Error::new_spanned(
             &attr,
             "要写协议号，例如 `#[msg(MsgType::SOCKET)]`，或者写 `#[msg(default)]` 当兜底",
         ));
     }
     let is_default =
-        exprs.len() == 1 && matches!(&exprs[0], Expr::Path(path) if path.path.is_ident("default"));
+        types.len() == 1 && matches!(&types[0], Expr::Path(path) if path.path.is_ident("default"));
+    if is_default && variant.is_some() {
+        return Err(Error::new_spanned(
+            &attr,
+            "`#[msg(default)]` 不能再指定 `variant`",
+        ));
+    }
+    let variant = variant
+        .map(|path| {
+            if path.segments.len() < 2 {
+                return Err(Error::new_spanned(
+                    path,
+                    "`variant` 要写完整路径，例如 `UserMessage::Notify`",
+                ));
+            }
+            let mut envelope = path.clone();
+            envelope.segments.pop();
+            envelope.segments.pop_punct();
+            Ok(VariantRoute { path, envelope })
+        })
+        .transpose()?;
     Ok(Some(if is_default {
         Route::Fallback
     } else {
-        Route::Types(exprs.into_iter().collect())
+        Route::Types { types, variant }
     }))
 }
 
@@ -706,8 +770,8 @@ impl Handler {
             ));
         }
         if debug.is_some() {
-            if let Route::Types(exprs) = &route {
-                for expr in exprs {
+            if let Route::Types { types, .. } = &route {
+                for expr in types {
                     if forbidden_debug_type(expr) {
                         return Err(Error::new_spanned(
                             expr,
@@ -716,6 +780,16 @@ impl Handler {
                     }
                 }
             }
+        }
+        if let Route::Types {
+            variant: Some(_), ..
+        } = &route
+            && matches!(arg, Some(Arg::Whole))
+        {
+            return Err(Error::new(
+                span,
+                "variant handler 不能接收整条 `Message`；请接收 variant 的内部字段",
+            ));
         }
 
         let name = func.sig.ident.clone();
@@ -782,35 +856,101 @@ impl Handler {
             quote!(#call.await;)
         }
     }
+
+    /// enum variant 命中之后的调用。无返回值 variant 是 send-only，call 必须立即失败。
+    fn variant_body(&self, krate: &Path, value: Option<&Ident>) -> TokenStream {
+        let name = &self.name;
+        let ctx_arg = self
+            .takes_ctx
+            .then(|| quote!(::core::clone::Clone::clone(&ctx),));
+        let value_arg = value.map(|value| quote!(#value));
+        let call = quote!(self.#name(#ctx_arg #value_arg));
+        if self.response.is_some() {
+            self.finish(krate, call)
+        } else {
+            let label = name.to_string();
+            quote! {
+                if #krate::Message::needs_reply(&msg) {
+                    #krate::Ctx::log(&ctx, ::std::format!(
+                        "{} 只接受 send，拒绝 call", #label,
+                    ));
+                    let _ = #krate::Ctx::reply_error(&ctx, &msg);
+                } else {
+                    #call.await;
+                }
+            }
+        }
+    }
 }
 
 fn debug_messages(krate: &Path, handlers: &[Handler]) -> TokenStream {
-    let descriptors = handlers.iter().flat_map(|handler| {
-        let Some(name) = &handler.debug_name else {
-            return Vec::new();
-        };
-        let request: Type = match &handler.arg {
-            None => parse_quote!(()),
-            Some(Arg::Typed(ty)) => (**ty).clone(),
-            Some(Arg::Whole) => unreachable!("带 #[debug] 的整条 Message 已被拒绝"),
-        };
-        let Route::Types(types) = &handler.route else {
-            unreachable!("带 #[debug] 的 default 已被拒绝")
-        };
-        types
-            .iter()
-            .map(|mtype| match &handler.response {
-                Some(response) => quote!(
-                    #krate::DebugMessageDescriptor::call::<#request, #response>(#name, #mtype)
-                ),
-                None => quote!(
-                    #krate::DebugMessageDescriptor::send::<#request>(#name, #mtype)
-                ),
-            })
-            .collect::<Vec<_>>()
-    });
+    let mut decoders = Vec::new();
+    let descriptors = handlers
+        .iter()
+        .flat_map(|handler| {
+            let Some(name) = &handler.debug_name else {
+                return Vec::new();
+            };
+            let request: Type = match &handler.arg {
+                None => parse_quote!(()),
+                Some(Arg::Typed(ty)) => (**ty).clone(),
+                Some(Arg::Whole) => unreachable!("带 #[debug] 的整条 Message 已被拒绝"),
+            };
+            let Route::Types { types, variant } = &handler.route else {
+                unreachable!("带 #[debug] 的 default 已被拒绝")
+            };
+            let constructor = variant.as_ref().map(|variant| &variant.path);
+            let decoder = constructor.map(|constructor| {
+                let decoder = format_ident!("__rskynet_decode_{}", handler.name);
+                let build = match &handler.arg {
+                    None => quote! {
+                        #krate::__private::decode_json::<()>(value)?;
+                        #constructor
+                    },
+                    Some(Arg::Typed(ty)) => quote! {
+                        #constructor(#krate::__private::decode_json::<#ty>(value)?)
+                    },
+                    Some(Arg::Whole) => unreachable!("variant handler 已拒绝整条 Message"),
+                };
+                decoders.push(quote! {
+                    fn #decoder(
+                        value: #krate::__private::JsonValue,
+                    ) -> #krate::Result<#krate::Payload> {
+                        ::core::result::Result::Ok(
+                            #krate::IntoPayload::into_payload({ #build })
+                        )
+                    }
+                });
+                decoder
+            });
+            types
+                .iter()
+                .map(|mtype| match &handler.response {
+                    Some(response) if decoder.is_some() => {
+                        let decoder = decoder.as_ref().unwrap();
+                        quote!(#krate::DebugMessageDescriptor::call_decoded::<#request, #response>(
+                            #name, #mtype, #decoder,
+                        ))
+                    }
+                    None if decoder.is_some() => {
+                        let decoder = decoder.as_ref().unwrap();
+                        quote!(#krate::DebugMessageDescriptor::send_decoded::<#request>(
+                            #name, #mtype, #decoder,
+                        ))
+                    }
+                    Some(response) => quote!(
+                        #krate::DebugMessageDescriptor::call::<#request, #response>(#name, #mtype)
+                    ),
+                    None => quote!(
+                        #krate::DebugMessageDescriptor::send::<#request>(#name, #mtype)
+                    ),
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     quote! {
         fn debug_messages(&self) -> ::std::vec::Vec<#krate::DebugMessageDescriptor> {
+            #(#decoders)*
             ::std::vec![#(#descriptors),*]
         }
     }
@@ -835,13 +975,86 @@ fn forbidden_debug_type(expr: &Expr) -> bool {
 
 /// 按协议号生成 `dispatch`。
 fn routed_dispatch(krate: &Path, handlers: &[Handler]) -> Result<TokenStream> {
+    struct VariantGroup<'a> {
+        expr: &'a Expr,
+        envelope: &'a Path,
+        handlers: Vec<&'a Handler>,
+    }
+
+    let expr_key = |expr: &Expr| expr.to_token_stream().to_string();
+    let path_key = |path: &Path| path.to_token_stream().to_string();
+    let mut variant_groups: Vec<(String, VariantGroup<'_>)> = Vec::new();
+    let mut plain_types: Vec<(String, Span)> = Vec::new();
+
+    for handler in handlers {
+        let Route::Types { types, variant } = &handler.route else {
+            continue;
+        };
+        for expr in types {
+            let key = expr_key(expr);
+            match variant {
+                None => plain_types.push((key, handler.span)),
+                Some(variant) => {
+                    let group = if let Some((_, group)) = variant_groups
+                        .iter_mut()
+                        .find(|(candidate, _)| *candidate == key)
+                    {
+                        group
+                    } else {
+                        variant_groups.push((
+                            key.clone(),
+                            VariantGroup {
+                                expr,
+                                envelope: &variant.envelope,
+                                handlers: Vec::new(),
+                            },
+                        ));
+                        &mut variant_groups.last_mut().unwrap().1
+                    };
+                    if path_key(group.envelope) != path_key(&variant.envelope) {
+                        return Err(Error::new(
+                            handler.span,
+                            "同一个 MsgType 的 variant handler 必须属于同一个外层枚举",
+                        ));
+                    }
+                    let duplicate = group.handlers.iter().any(|existing| {
+                        let Route::Types {
+                            variant: Some(existing),
+                            ..
+                        } = &existing.route
+                        else {
+                            unreachable!()
+                        };
+                        path_key(&existing.path) == path_key(&variant.path)
+                    });
+                    if duplicate {
+                        return Err(Error::new(handler.span, "同一个 enum variant 写了两遍"));
+                    }
+                    group.handlers.push(handler);
+                }
+            }
+        }
+    }
+    for (key, span) in &plain_types {
+        if variant_groups.iter().any(|(candidate, _)| candidate == key) {
+            return Err(Error::new(
+                *span,
+                "同一个 MsgType 不能混用普通 handler 与 variant handler",
+            ));
+        }
+    }
+
     let mut arms = Vec::new();
     let mut fallback = None;
+    let mut emitted_variant_groups = Vec::<String>::new();
     for handler in handlers {
-        let body = handler.body(krate);
         match &handler.route {
-            Route::Types(exprs) => {
-                let tests = exprs.iter().map(|expr| quote!(__mtype == (#expr)));
+            Route::Types {
+                types,
+                variant: None,
+            } => {
+                let body = handler.body(krate);
+                let tests = types.iter().map(|expr| quote!(__mtype == (#expr)));
                 arms.push(quote! {
                     if #(#tests)||* {
                         #body
@@ -849,10 +1062,83 @@ fn routed_dispatch(krate: &Path, handlers: &[Handler]) -> Result<TokenStream> {
                     }
                 });
             }
+            Route::Types {
+                types,
+                variant: Some(_),
+            } => {
+                for expr in types {
+                    let key = expr_key(expr);
+                    if emitted_variant_groups.iter().any(|emitted| emitted == &key) {
+                        continue;
+                    }
+                    emitted_variant_groups.push(key.clone());
+                    let group = &variant_groups
+                        .iter()
+                        .find(|(candidate, _)| candidate == &key)
+                        .expect("variant group 应已建立")
+                        .1;
+                    let mtype = group.expr;
+                    let envelope = group.envelope;
+                    let match_arms = group.handlers.iter().map(|handler| {
+                        let Route::Types {
+                            variant: Some(variant),
+                            ..
+                        } = &handler.route
+                        else {
+                            unreachable!()
+                        };
+                        let path = &variant.path;
+                        match &handler.arg {
+                            None => {
+                                let body = handler.variant_body(krate, None);
+                                quote!(#path => { #body })
+                            }
+                            Some(Arg::Typed(_)) => {
+                                let value = format_ident!("__variant_value");
+                                let body = handler.variant_body(krate, Some(&value));
+                                quote!(#path(#value) => { #body })
+                            }
+                            Some(Arg::Whole) => unreachable!("variant handler 已拒绝 Message"),
+                        }
+                    });
+                    arms.push(quote! {
+                        if __mtype == (#mtype) {
+                            match <#envelope as #krate::FromPayload>::from_payload(
+                                #krate::Message::take_payload(&mut msg),
+                            ) {
+                                ::core::result::Result::Ok(__variant_message) => {
+                                    match __variant_message {
+                                        #(#match_arms,)*
+                                        _ => {
+                                            #krate::Ctx::log(&ctx, ::std::format!(
+                                                "没人处理 {:?} 消息的这个 enum variant（来自 :{:08x}）",
+                                                msg.mtype, msg.source,
+                                            ));
+                                            if #krate::Message::needs_reply(&msg) {
+                                                let _ = #krate::Ctx::reply_error(&ctx, &msg);
+                                            }
+                                        }
+                                    }
+                                }
+                                ::core::result::Result::Err(__err) => {
+                                    #krate::Ctx::log(&ctx, ::std::format!(
+                                        "{:?} 消息无法解析成 {}：{}",
+                                        msg.mtype, ::core::stringify!(#envelope), __err,
+                                    ));
+                                    if #krate::Message::needs_reply(&msg) {
+                                        let _ = #krate::Ctx::reply_error(&ctx, &msg);
+                                    }
+                                }
+                            }
+                            return;
+                        }
+                    });
+                }
+            }
             Route::Fallback if fallback.is_some() => {
                 return Err(Error::new(handler.span, "`#[msg(default)]` 只能有一个"));
             }
-            Route::Fallback => fallback = Some(body),
+            Route::Fallback => fallback = Some(handler.body(krate)),
         }
     }
 
@@ -1046,5 +1332,56 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("只支持 `name"));
+    }
+
+    #[test]
+    fn variant_routes_reject_duplicate_variants() {
+        let error = try_expand(
+            TokenStream::new(),
+            quote! {
+                impl Demo {
+                    #[msg(MsgType::USER, variant = Request::Ping)]
+                    async fn first(&self, ctx: Ctx, value: Ping) {}
+                    #[msg(MsgType::USER, variant = Request::Ping)]
+                    async fn second(&self, ctx: Ctx, value: Ping) {}
+                }
+            },
+            Flavor::Shared,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("variant 写了两遍"));
+    }
+
+    #[test]
+    fn variant_routes_reject_mixed_envelopes_and_plain_handlers() {
+        let different_envelope = try_expand(
+            TokenStream::new(),
+            quote! {
+                impl Demo {
+                    #[msg(MsgType::USER, variant = First::Ping)]
+                    async fn first(&self, ctx: Ctx, value: Ping) {}
+                    #[msg(MsgType::USER, variant = Second::Pong)]
+                    async fn second(&self, ctx: Ctx, value: Pong) {}
+                }
+            },
+            Flavor::Shared,
+        )
+        .unwrap_err();
+        assert!(different_envelope.to_string().contains("同一个外层枚举"));
+
+        let mixed = try_expand(
+            TokenStream::new(),
+            quote! {
+                impl Demo {
+                    #[msg(MsgType::USER)]
+                    async fn plain(&self, ctx: Ctx, value: String) {}
+                    #[msg(MsgType::USER, variant = Request::Ping)]
+                    async fn variant(&self, ctx: Ctx, value: Ping) {}
+                }
+            },
+            Flavor::Shared,
+        )
+        .unwrap_err();
+        assert!(mixed.to_string().contains("不能混用"));
     }
 }

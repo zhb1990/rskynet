@@ -45,6 +45,29 @@ impl DebugMessageDescriptor {
         }
     }
 
+    /// 宏展开 variant 调试消息时使用：请求 schema 仍属于 `Request`，但 decoder
+    /// 会先把它包装成外层 enum 再放进 `Payload`。
+    #[doc(hidden)]
+    pub fn send_decoded<Request>(
+        name: &'static str,
+        mtype: MsgType,
+        decode: fn(Value) -> Result<Payload>,
+    ) -> Self
+    where
+        Request: DeserializeOwned + MessageSchemaType,
+    {
+        Self {
+            name,
+            mtype,
+            request_type: std::any::type_name::<Request>(),
+            response_type: None,
+            request_schema: Request::message_schema,
+            response_schema: None,
+            decode,
+            encode: None,
+        }
+    }
+
     /// 构造一条同时支持 `send` 与 `call` 的消息描述。
     pub fn call<Request, Response>(name: &'static str, mtype: MsgType) -> Self
     where
@@ -59,6 +82,29 @@ impl DebugMessageDescriptor {
             request_schema: Request::message_schema,
             response_schema: Some(Response::message_schema),
             decode: decode_payload::<Request>,
+            encode: Some(encode_payload::<Response>),
+        }
+    }
+
+    /// [`Self::send_decoded`] 的 call 版本。
+    #[doc(hidden)]
+    pub fn call_decoded<Request, Response>(
+        name: &'static str,
+        mtype: MsgType,
+        decode: fn(Value) -> Result<Payload>,
+    ) -> Self
+    where
+        Request: DeserializeOwned + MessageSchemaType,
+        Response: FromPayload + Serialize + MessageSchemaType,
+    {
+        Self {
+            name,
+            mtype,
+            request_type: std::any::type_name::<Request>(),
+            response_type: Some(std::any::type_name::<Response>()),
+            request_schema: Request::message_schema,
+            response_schema: Some(Response::message_schema),
+            decode,
             encode: Some(encode_payload::<Response>),
         }
     }
@@ -104,6 +150,13 @@ impl DebugMessageDescriptor {
             ))),
         }
     }
+}
+
+/// 过程宏生成的 variant decoder 通过这个入口反序列化内部字段，避免要求使用方
+/// 直接依赖 `serde_json`。
+#[doc(hidden)]
+pub fn decode_json<T: DeserializeOwned>(value: Value) -> Result<T> {
+    serde_json::from_value(value).map_err(Into::into)
 }
 
 impl std::fmt::Debug for DebugMessageDescriptor {

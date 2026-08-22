@@ -155,6 +155,20 @@ ctx.spawn(async move {
 - 实现 `async fn dispatch(&self, ctx: Ctx, msg: Message)`，自行解析整条消息；
 - 给方法添加 `#[msg(MsgType::...)]`，由宏按协议号解析负载并自动回复返回值。
 
+同一协议号承载枚举消息时，可继续按 variant 拆分回调：
+
+```rust,ignore
+#[msg(MsgType::USER, variant = UserMessage::Notify)]
+async fn notify(&self, ctx: Ctx, request: Notify) {}
+
+#[msg(MsgType::USER, variant = UserMessage::Query)]
+async fn query(&self, ctx: Ctx, request: Query) -> QueryResult { /* ... */ }
+```
+
+首版直接支持单位 variant 和 `Variant(T)`；复杂字段先包装成 struct。无返回值的
+variant 只接受 send，带返回值的 variant 同时接受 send 与 call。发送端传递完整的
+外层枚举，并为它声明 `boxed_payload!(UserMessage)`。
+
 自定义对象负载可用 `rskynet::boxed_payload!(Type)` 接入 `FromPayload` / `IntoPayload`。需要专用线程时使用 `#[rskynet::exclusive]`，并按需实现同步的 `idle` 和 `interrupt` 钩子。
 
 ## 配置与启动顺序

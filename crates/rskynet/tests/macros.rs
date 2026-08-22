@@ -25,12 +25,35 @@ use serde::{Deserialize, Serialize};
 
 /// 业务自己的协议号，看宏认不认「不是内置常量」的表达式。
 const PING: MsgType = MsgType(42);
+const VARIANT: MsgType = MsgType(43);
 
 #[derive(Deserialize, rskynet::MessageSchema)]
 struct Add(i64, i64);
 #[derive(Debug, Serialize, rskynet::MessageSchema)]
 struct Sum(i64);
 boxed_payload!(Add, Sum);
+
+#[derive(Debug, Deserialize, rskynet::MessageSchema)]
+struct Notice {
+    text: String,
+}
+#[derive(Debug, Deserialize, rskynet::MessageSchema)]
+struct Query {
+    value: u32,
+}
+#[derive(Debug, Serialize, rskynet::MessageSchema)]
+struct QueryResult {
+    value: u32,
+}
+
+enum UserMessage {
+    Notice(Notice),
+    Refresh,
+    Query(Query),
+    Unhandled,
+}
+
+boxed_payload!(UserMessage, QueryResult);
 
 type Journal = Arc<Mutex<Vec<String>>>;
 
@@ -61,6 +84,27 @@ impl Calc {
     #[msg(MsgType::TEXT, PING)]
     async fn on_text(&self, _ctx: Ctx, text: String) {
         self.note(format!("文本={text}"));
+    }
+
+    #[debug]
+    #[msg(VARIANT, variant = UserMessage::Notice)]
+    async fn on_notice(&self, _ctx: Ctx, notice: Notice) {
+        self.note(format!("通知={}", notice.text));
+    }
+
+    #[debug]
+    #[msg(VARIANT, variant = UserMessage::Refresh)]
+    async fn on_refresh(&self) {
+        self.note("刷新".to_string());
+    }
+
+    #[debug]
+    #[msg(VARIANT, variant = UserMessage::Query)]
+    async fn on_query(&self, _ctx: Ctx, query: Query) -> QueryResult {
+        self.note(format!("查询={}", query.value));
+        QueryResult {
+            value: query.value + 1,
+        }
     }
 
     /// 收整条消息的处理函数：回包得自己发。
@@ -158,7 +202,7 @@ struct Probe {
 impl Probe {
     async fn init(&self, ctx: Ctx) -> Result<()> {
         let debug = ctx.node().debug_messages(".calc")?;
-        assert_eq!(debug.len(), 3);
+        assert_eq!(debug.len(), 6);
         assert_eq!(debug[0].name(), "add");
         assert_eq!(debug[0].mtype(), MsgType::USER);
         assert!(debug[0].supports_call());
@@ -166,6 +210,30 @@ impl Probe {
         assert_eq!(debug[1].name(), "on_text");
         assert!(!debug[1].supports_call());
         assert_eq!(debug[2].mtype(), PING);
+
+        let notice = debug
+            .iter()
+            .find(|message| message.name() == "on_notice")
+            .unwrap();
+        assert!(!notice.supports_call());
+        assert_eq!(notice.request_schema()["type"], "object");
+        let notice_payload =
+            notice.decode(serde_json::json!({ "text": "来自 Dashboard decoder" }))?;
+        ctx.send(".calc", VARIANT, notice_payload)?;
+
+        let refresh = debug
+            .iter()
+            .find(|message| message.name() == "on_refresh")
+            .unwrap();
+        assert_eq!(refresh.request_schema()["type"], "null");
+        ctx.send(".calc", VARIANT, refresh.decode(serde_json::Value::Null)?)?;
+
+        let query_descriptor = debug
+            .iter()
+            .find(|message| message.name() == "on_query")
+            .unwrap();
+        assert!(query_descriptor.supports_call());
+        assert!(query_descriptor.response_schema().is_some());
 
         // 对象负载按声明的类型取，返回值自动装回去
         let reply = ctx
@@ -195,6 +263,61 @@ impl Probe {
         self.note(format!(
             "无人认领={}",
             matches!(mute, Err(Error::CallFailed(_)))
+        ));
+
+        // 相同 MsgType 先解出外层 enum，再按 variant 进入不同 handler。
+        ctx.send(
+            ".calc",
+            VARIANT,
+            Payload::of(UserMessage::Notice(Notice {
+                text: "直接发送".into(),
+            })),
+        )?;
+        let reply = ctx
+            .call(
+                ".calc",
+                VARIANT,
+                Payload::of(UserMessage::Query(Query { value: 7 })),
+            )
+            .await?;
+        self.note(format!(
+            "variant 回包={}",
+            QueryResult::from_payload(reply)?.value
+        ));
+
+        // 有返回值的 variant 也接受 send；后续 call 充当队列屏障。
+        ctx.send(
+            ".calc",
+            VARIANT,
+            Payload::of(UserMessage::Query(Query { value: 8 })),
+        )?;
+        let _ = ctx
+            .call(
+                ".calc",
+                VARIANT,
+                Payload::of(UserMessage::Query(Query { value: 9 })),
+            )
+            .await?;
+
+        // send-only、未处理 variant、错误外层类型的 call 都应立即失败。
+        let send_only = ctx
+            .call(".calc", VARIANT, Payload::of(UserMessage::Refresh))
+            .await;
+        self.note(format!(
+            "send-only 拒绝={}",
+            matches!(send_only, Err(Error::CallFailed(_)))
+        ));
+        let unhandled = ctx
+            .call(".calc", VARIANT, Payload::of(UserMessage::Unhandled))
+            .await;
+        self.note(format!(
+            "variant 未处理={}",
+            matches!(unhandled, Err(Error::CallFailed(_)))
+        ));
+        let wrong_enum = ctx.call(".calc", VARIANT, Payload::text("wrong")).await;
+        self.note(format!(
+            "variant 类型不符={}",
+            matches!(wrong_enum, Err(Error::CallFailed(_)))
         ));
 
         // 独占服务之一：`idle` / `interrupt` 都没写，靠 Exclusive 的默认实现挂起等消息。
@@ -259,6 +382,8 @@ fn generated_services_behave() {
     assert_eq!(
         *seen,
         vec![
+            "通知=来自 Dashboard decoder",
+            "刷新",
             "和=42",
             "文本=甲",
             "文本=乙",
@@ -266,6 +391,14 @@ fn generated_services_behave() {
             "兜底",
             "类型不符=true",
             "无人认领=true",
+            "通知=直接发送",
+            "查询=7",
+            "variant 回包=8",
+            "查询=8",
+            "查询=9",
+            "send-only 拒绝=true",
+            "variant 未处理=true",
+            "variant 类型不符=true",
             "落库=丙",
             "pong",
         ]

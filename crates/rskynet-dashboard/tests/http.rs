@@ -14,6 +14,7 @@ struct Probe(mpsc::Sender<NodeRef>);
 
 const NOTICE: MsgType = MsgType(42);
 const SLOW: MsgType = MsgType(43);
+const VARIANT: MsgType = MsgType(44);
 
 #[derive(serde::Deserialize, rskynet_macros::MessageSchema)]
 #[schema(crate = ::rskynet_core)]
@@ -29,6 +30,31 @@ struct DoubleResponse {
 }
 
 rskynet_core::boxed_payload!(DoubleRequest, DoubleResponse);
+
+#[derive(serde::Deserialize, rskynet_macros::MessageSchema)]
+#[schema(crate = ::rskynet_core)]
+struct VariantNotice {
+    message: String,
+}
+
+#[derive(serde::Deserialize, rskynet_macros::MessageSchema)]
+#[schema(crate = ::rskynet_core)]
+struct VariantDouble {
+    value: u32,
+}
+
+#[derive(Debug, serde::Serialize, rskynet_macros::MessageSchema)]
+#[schema(crate = ::rskynet_core)]
+struct VariantResult {
+    value: u32,
+}
+
+enum DebugMessage {
+    Notice(VariantNotice),
+    Double(VariantDouble),
+}
+
+rskynet_core::boxed_payload!(DebugMessage, VariantResult);
 
 struct DebugTarget(mpsc::Sender<String>);
 
@@ -58,6 +84,20 @@ impl DebugTarget {
     async fn slow(&self, ctx: Ctx, message: String) -> String {
         ctx.sleep(100).await;
         message
+    }
+
+    #[debug(name = "variant_notice")]
+    #[msg(VARIANT, variant = DebugMessage::Notice)]
+    async fn variant_notice(&self, _ctx: Ctx, request: VariantNotice) {
+        self.0.send(request.message).unwrap();
+    }
+
+    #[debug(name = "variant_double")]
+    #[msg(VARIANT, variant = DebugMessage::Double)]
+    async fn variant_double(&self, _ctx: Ctx, request: VariantDouble) -> VariantResult {
+        VariantResult {
+            value: request.value * 2,
+        }
     }
 }
 
@@ -170,7 +210,7 @@ fn dashboard_serves_embedded_ui_and_live_stats() {
         target_handle.len() >= 9,
         "handle 应至少为冒号加 8 位十六进制"
     );
-    assert_eq!(target["messages"].as_array().unwrap().len(), 3);
+    assert_eq!(target["messages"].as_array().unwrap().len(), 5);
     assert_eq!(target["messages"][0]["name"], "double");
     assert_eq!(target["messages"][0]["call_supported"], true);
     assert_eq!(target["messages"][0]["request_schema"]["type"], "object");
@@ -212,6 +252,41 @@ fn dashboard_serves_embedded_ui_and_live_stats() {
         notice_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
         "hello dashboard"
     );
+
+    let variant_send = post_json(
+        address,
+        "/api/v1/debug/invoke",
+        &serde_json::json!({
+            "target": target_handle,
+            "message": "variant_notice",
+            "mtype": VARIANT.raw(),
+            "mode": "send",
+            "payload": { "message": "wrapped variant" }
+        })
+        .to_string(),
+    );
+    assert!(variant_send.starts_with("HTTP/1.1 200"), "{variant_send}");
+    assert_eq!(
+        notice_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        "wrapped variant"
+    );
+
+    let variant_call = post_json(
+        address,
+        "/api/v1/debug/invoke",
+        &serde_json::json!({
+            "target": target_handle,
+            "message": "variant_double",
+            "mtype": VARIANT.raw(),
+            "mode": "call",
+            "payload": { "value": 12 }
+        })
+        .to_string(),
+    );
+    assert!(variant_call.starts_with("HTTP/1.1 200"), "{variant_call}");
+    let variant_result: serde_json::Value =
+        serde_json::from_str(variant_call.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(variant_result["result"]["value"], 24);
 
     let unsupported_call = post_json(
         address,

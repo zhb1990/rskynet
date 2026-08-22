@@ -52,29 +52,34 @@ pub struct PongResponse {
 #[cluster(type_id = 1_003)]
 pub struct ShutdownRequest {}
 
-#[derive(Clone, PartialEq, ProstMessage, rskynet::cluster::ClusterMessage)]
+#[derive(
+    Clone,
+    PartialEq,
+    ProstMessage,
+    Serialize,
+    rskynet::MessageSchema,
+    rskynet::cluster::ClusterMessage,
+)]
 #[cluster(type_id = 1_004)]
 pub struct ShutdownResponse {}
 
 #[derive(Deserialize, Serialize, rskynet::MessageSchema)]
-#[serde(rename_all = "snake_case")]
+struct LocalPingRequest {
+    source_node: u32,
+    request: PingRequest,
+}
+
+#[derive(Deserialize, Serialize, rskynet::MessageSchema)]
+struct LocalShutdownRequest {
+    source_node: u32,
+}
+
 enum PongCommand {
-    Ping {
-        source_node: u32,
-        request: PingRequest,
-    },
-    Shutdown {
-        source_node: u32,
-    },
+    Ping(LocalPingRequest),
+    Shutdown(LocalShutdownRequest),
 }
 
-#[derive(Serialize, rskynet::MessageSchema)]
-enum PongReply {
-    Pong(PongResponse),
-    Shutdown,
-}
-
-rskynet::boxed_payload!(PongCommand, PongReply);
+rskynet::boxed_payload!(PongCommand, PongResponse, ShutdownResponse);
 
 #[rskynet::cluster::handler("cluster-pong")]
 async fn pong(
@@ -85,19 +90,16 @@ async fn pong(
     let reply = remote
         .request(
             PONG_SERVICE,
-            Payload::of(PongCommand::Ping {
+            Payload::of(PongCommand::Ping(LocalPingRequest {
                 source_node: remote.source_node.get(),
                 request: ping,
-            }),
+            })),
         )
         .await
         .map_err(|error| error.to_string())?
-        .downcast::<PongReply>()
+        .downcast::<PongResponse>()
         .map_err(|_| "本地 cluster-pong 返回了错误的负载类型".to_owned())?;
-    match *reply {
-        PongReply::Pong(response) => Ok(response),
-        PongReply::Shutdown => Err("本地 cluster-pong 返回了错误的响应".into()),
-    }
+    Ok(*reply)
 }
 
 #[rskynet::cluster::handler("cluster-pong-control")]
@@ -109,18 +111,15 @@ async fn shutdown(
     let reply = remote
         .request(
             PONG_SERVICE,
-            Payload::of(PongCommand::Shutdown {
+            Payload::of(PongCommand::Shutdown(LocalShutdownRequest {
                 source_node: remote.source_node.get(),
-            }),
+            })),
         )
         .await
         .map_err(|error| error.to_string())?
-        .downcast::<PongReply>()
+        .downcast::<ShutdownResponse>()
         .map_err(|_| "本地 cluster-pong 返回了错误的负载类型".to_owned())?;
-    match *reply {
-        PongReply::Shutdown => Ok(ShutdownResponse {}),
-        PongReply::Pong(_) => Err("本地 cluster-pong 返回了错误的响应".into()),
-    }
+    Ok(*reply)
 }
 
 #[derive(Default)]
@@ -138,38 +137,34 @@ impl ClusterPong {
         Ok(())
     }
 
-    #[debug(name = "command")]
-    #[msg(MsgType::USER)]
-    async fn command(&self, ctx: Ctx, command: PongCommand) -> PongReply {
-        match command {
-            PongCommand::Ping {
-                source_node,
-                request,
-            } => {
-                *self.served.borrow_mut() += 1;
-                rskynet::log!(
-                    ctx,
-                    "处理 node {} 的第 {} 轮 ping，累计 {} 次",
-                    source_node,
-                    request.round,
-                    self.served.borrow()
-                );
-                PongReply::Pong(PongResponse {
-                    round: request.round,
-                    node_id: 2,
-                })
-            }
-            PongCommand::Shutdown { source_node } => {
-                rskynet::log!(ctx, "收到 node {} 的关闭请求", source_node);
-                let shutdown_ctx = ctx.clone();
-                ctx.spawn(async move {
-                    // 等本地应答经 cluster 编码并进入 socket 写缓冲后再关闭节点。
-                    shutdown_ctx.sleep_ms(100).await;
-                    shutdown_ctx.abort();
-                });
-                PongReply::Shutdown
-            }
+    #[debug(name = "ping")]
+    #[msg(MsgType::USER, variant = PongCommand::Ping)]
+    async fn ping(&self, ctx: Ctx, command: LocalPingRequest) -> PongResponse {
+        *self.served.borrow_mut() += 1;
+        rskynet::log!(
+            ctx,
+            "处理 node {} 的第 {} 轮 ping，累计 {} 次",
+            command.source_node,
+            command.request.round,
+            self.served.borrow()
+        );
+        PongResponse {
+            round: command.request.round,
+            node_id: 2,
         }
+    }
+
+    #[debug(name = "shutdown")]
+    #[msg(MsgType::USER, variant = PongCommand::Shutdown)]
+    async fn shutdown(&self, ctx: Ctx, command: LocalShutdownRequest) -> ShutdownResponse {
+        rskynet::log!(ctx, "收到 node {} 的关闭请求", command.source_node);
+        let shutdown_ctx = ctx.clone();
+        ctx.spawn(async move {
+            // 等本地应答经 cluster 编码并进入 socket 写缓冲后再关闭节点。
+            shutdown_ctx.sleep_ms(100).await;
+            shutdown_ctx.abort();
+        });
+        ShutdownResponse {}
     }
 }
 
