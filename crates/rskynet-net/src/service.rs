@@ -79,6 +79,7 @@ enum Deferred {
     Listen,
     Connect { deadline_ms: Option<u64> },
     Udp,
+    UdpForPeer,
     UdpConnect { id: SocketId },
 }
 
@@ -666,6 +667,10 @@ impl NetService {
                     None => return self.defer(ctx, bind, waiting, Deferred::Udp),
                 }
             }
+            Command::UdpForPeer { addr } => match parse(&addr) {
+                Some(addr) => Some(self.do_udp_for_peer(addr, waiting.source)),
+                None => return self.defer(ctx, addr, waiting, Deferred::UdpForPeer),
+            },
             Command::UdpConnect { id, addr } => match parse(&addr) {
                 Some(addr) => Some(self.do_udp_connect(id, addr)),
                 None => return self.defer(ctx, addr, waiting, Deferred::UdpConnect { id }),
@@ -677,6 +682,9 @@ impl NetService {
                 self.do_send_wait(ctx, id, Chunk::tcp(data), high, waiting)
             }
             Command::UdpSend { id, to, data } => Some(self.do_udp_send(ctx, id, to, data)),
+            Command::UdpSendWait { id, to, data } => {
+                self.do_udp_send_wait(ctx, id, to, data, waiting)
+            }
             Command::Close(id) => self.do_close(ctx, id, waiting),
             Command::Shutdown(id) => {
                 self.close(ctx, id, Farewell::Closed);
@@ -804,6 +812,35 @@ impl NetService {
     }
 
     fn do_udp(&self, addr: SocketAddr, owner: rskynet_core::Handle) -> Answer {
+        self.do_udp_with_peer(addr, None, owner)
+    }
+
+    fn do_udp_for_peer(&self, peer: SocketAddr, owner: rskynet_core::Handle) -> Answer {
+        let wildcard = udp_wildcard_for(peer);
+        let probe = match std::net::UdpSocket::bind(wildcard) {
+            Ok(probe) => probe,
+            Err(err) => return Answer::Failed(format!("绑定 UDP {wildcard} 失败：{err}")),
+        };
+        if let Err(err) = probe.connect(peer) {
+            return Answer::Failed(format!("UDP 对端 {peer} 不可达：{err}"));
+        }
+        self.do_udp_with_peer(wildcard, Some(peer), owner)
+    }
+
+    fn do_udp_for_peer_candidates(
+        &self,
+        addrs: Vec<SocketAddr>,
+        owner: rskynet_core::Handle,
+    ) -> Answer {
+        first_successful_udp_candidate(addrs, |addr| self.do_udp_for_peer(addr, owner))
+    }
+
+    fn do_udp_with_peer(
+        &self,
+        addr: SocketAddr,
+        peer: Option<SocketAddr>,
+        owner: rskynet_core::Handle,
+    ) -> Answer {
         let udp = match UdpSocket::bind(addr) {
             Ok(udp) => udp,
             Err(err) => return Answer::Failed(format!("绑定 UDP {addr} 失败：{err}")),
@@ -813,6 +850,7 @@ impl NetService {
         let Some(socket) = sockets.insert(owner, Kind::Udp(udp), State::Connected) else {
             return Answer::Failed("槽位已满，开不了新的 UDP 端口".to_string());
         };
+        socket.udp_peer = peer;
         match socket.apply(&self.registry) {
             Ok(()) => Answer::Id(socket.id),
             Err(err) => {
@@ -992,6 +1030,35 @@ impl NetService {
         self.do_send(ctx, id, Chunk::udp(data, to), true)
     }
 
+    fn do_udp_send_wait(
+        &self,
+        ctx: &Ctx,
+        id: SocketId,
+        to: Option<SocketAddr>,
+        data: Vec<u8>,
+        waiting: Pending,
+    ) -> Option<Answer> {
+        if data.len() > MAX_UDP_PACKAGE {
+            return Some(Answer::Failed(format!(
+                "UDP 包 {} 字节，超过上限 {MAX_UDP_PACKAGE}",
+                data.len()
+            )));
+        }
+        let to = {
+            let sockets = self.sockets.borrow();
+            let Some(socket) = sockets.get(id) else {
+                return Some(missing(id));
+            };
+            match to.or(socket.udp_peer) {
+                Some(to) => to,
+                None => {
+                    return Some(Answer::Failed(format!("{id} 没有默认对端，得指定地址")));
+                }
+            }
+        };
+        self.do_send_wait(ctx, id, Chunk::udp(data, to), true, waiting)
+    }
+
     /// 返回 `None` 表示「等写缓冲排空再回话」。
     fn do_close(&self, ctx: &Ctx, id: SocketId, waiting: Pending) -> Option<Answer> {
         // 先尽力把欠的写出去，写完了就地关掉
@@ -1142,6 +1209,7 @@ impl NetService {
                 self.do_connect_candidates(ctx, addrs.into(), waiting, deadline_ms)
             }
             Deferred::Udp => Some(self.do_udp(addr, waiting.source)),
+            Deferred::UdpForPeer => Some(self.do_udp_for_peer_candidates(addrs, waiting.source)),
             Deferred::UdpConnect { id } => Some(self.do_udp_connect(id, addr)),
         }
     }
@@ -1168,4 +1236,55 @@ fn missing(id: SocketId) -> Answer {
 /// 字面地址就地解析，域名交给解析线程。
 fn parse(addr: &str) -> Option<SocketAddr> {
     addr.parse().ok()
+}
+
+fn udp_wildcard_for(peer: SocketAddr) -> SocketAddr {
+    match peer {
+        SocketAddr::V4(_) => "0.0.0.0:0".parse().expect("valid IPv4 wildcard"),
+        SocketAddr::V6(_) => "[::]:0".parse().expect("valid IPv6 wildcard"),
+    }
+}
+
+fn first_successful_udp_candidate(
+    addrs: Vec<SocketAddr>,
+    mut open: impl FnMut(SocketAddr) -> Answer,
+) -> Answer {
+    let mut last_error = None;
+    for addr in addrs {
+        match open(addr) {
+            Answer::Failed(reason) => last_error = Some(reason),
+            answer => return answer,
+        }
+    }
+    Answer::Failed(last_error.unwrap_or_else(|| "解析结果是空的，无法建立 UDP 端点".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn udp_peer_uses_matching_address_family() {
+        let ipv4 = udp_wildcard_for("127.0.0.1:4433".parse().unwrap());
+        let ipv6 = udp_wildcard_for("[::1]:4433".parse().unwrap());
+        assert!(ipv4.is_ipv4() && ipv4.port() == 0);
+        assert!(ipv6.is_ipv6() && ipv6.port() == 0);
+    }
+
+    #[test]
+    fn udp_peer_tries_later_resolved_addresses() {
+        let first = "192.0.2.1:4433".parse().unwrap();
+        let second = "127.0.0.1:4433".parse().unwrap();
+        let mut attempted = Vec::new();
+        let answer = first_successful_udp_candidate(vec![first, second], |addr| {
+            attempted.push(addr);
+            if addr == first {
+                Answer::Failed("no route".into())
+            } else {
+                Answer::Done
+            }
+        });
+        assert!(matches!(answer, Answer::Done));
+        assert_eq!(attempted, vec![first, second]);
+    }
 }

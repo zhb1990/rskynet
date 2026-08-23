@@ -13,7 +13,7 @@ rskynet 是一个受 [skynet](https://github.com/cloudwu/skynet) 启发、使用
 - `request` / `reply` 通过 session 配对应答，调用方可直接 `.await`。
 - 一个服务内可用 `ctx.spawn` 并发执行多个任务，`ctx.sleep_ms`、RPC 回包和外部唤醒统一进入调度器。
 - 支持独占线程服务，适合定时器、日志和基于 `mio` 的网络轮询。
-- 可选 TCP/UDP、TLS、HTTP/1.1、WebSocket、Dashboard 和 Protobuf 跨节点通信。
+- 可选 TCP/UDP、TLS、QUIC、HTTP/1.1、WebSocket、Dashboard 和 Protobuf 跨节点通信。
 - TOML 驱动启动流程；具名服务和集群 handler 可在链接期自动注册。
 - 支持优雅关停、崩溃报告、服务运行统计和疑似死循环检测。
 
@@ -37,6 +37,7 @@ cargo run -p rskynet-examples -- config/examples/ping_pong.toml
 | 示例 | 命令 | 说明 |
 | --- | --- | --- |
 | TCP echo | `cargo run -p rskynet-examples -- config/examples/echo_server.toml` | 监听 `127.0.0.1:8888`，原样返回收到的数据 |
+| QUIC | `cargo run -p rskynet-examples -- config/examples/quic.toml` | 用自签名证书完成一次 QUIC stream 回显后退出 |
 | HTTP | `cargo run -p rskynet-examples -- config/examples/http.toml` | 在随机本地端口完成一次 HTTP POST 回显后退出 |
 | WebSocket | `cargo run -p rskynet-examples -- config/examples/websocket.toml` | 完成一次 WebSocket 文本回显后退出 |
 | Dashboard | `cargo run -p rskynet-examples -- config/examples/dashboard.toml` | 在 `http://127.0.0.1:8080/` 展示节点状态 |
@@ -188,10 +189,10 @@ profile = true
 默认 feature 下，节点依次启动 logger、signal、timer 和 bootstrap。可选基础设施由配置段触发，并在 bootstrap 业务服务之前按依赖顺序启动：
 
 ```text
-net -> tls -> http-client -> cluster -> dashboard -> bootstrap services
+net -> tls -> quic -> http-client -> cluster -> dashboard -> bootstrap services
 ```
 
-仅会启动实际需要的项。例如存在 `[http-client]` 时会自动启动 HTTP 客户端及其底层 `net`；存在 `[dashboard]` 时会自动启动 Dashboard、HTTP 所需的网络层。不要再把 `net`、`tls`、`http-client`、`cluster` 或 `dashboard` 手工写入 `[bootstrap].services`。
+仅会启动实际需要的项。例如存在 `[quic]` 时会自动先启动 `net`；存在 `[dashboard]` 时会自动启动 Dashboard、HTTP 所需的网络层。不要再把 `net`、`tls`、`quic`、`http-client`、`cluster` 或 `dashboard` 手工写入 `[bootstrap].services`。
 
 完整配置示例见 [config/dev.toml](config/dev.toml) 和 [config/examples](config/examples)。
 
@@ -209,11 +210,16 @@ net -> tls -> http-client -> cluster -> dashboard -> bootstrap services
 | `main` | 标准 TOML 命令行入口 | 默认启用 |
 | `net` | TCP/UDP socket 服务 | — |
 | `tls` | 基于 rustls 的 TLS 服务 | `net` |
+| `quic` | 基于 quinn-proto 的通用 QUIC stream/datagram 服务 | `net` |
 | `http` | HTTP/1.1 客户端与可嵌入服务端 | `net` |
 | `https` | HTTPS 客户端和 TLS 服务端传输 | `http`、`tls` |
 | `websocket` | WebSocket 客户端及服务端升级 | `http` |
 | `dashboard` | 节点统计 API 和内嵌 Web UI | `http` |
 | `cluster` | Protobuf 跨节点通信 | `net`、`bootstrap` |
+
+`quic` 提供标准 QUIC 连接、双向/单向 stream 和可选 datagram，业务双方需约定
+相同的 ALPN 与报文 framing。它不是 HTTP/3 或 WebTransport，浏览器 JavaScript 不能
+直接使用；首版 listener 还必须绑定明确 IP，不接受 `0.0.0.0` / `::` wildcard。
 
 例如：
 
@@ -221,7 +227,7 @@ net -> tls -> http-client -> cluster -> dashboard -> bootstrap services
 [dependencies]
 rskynet = {
     path = "path/to/rskynet/crates/rskynet",
-    features = ["https", "websocket", "dashboard", "cluster"]
+    features = ["https", "websocket", "dashboard", "cluster", "quic"]
 }
 ```
 
@@ -240,6 +246,7 @@ rskynet = {
 | `rskynet-signal` | 进程信号、优雅关停、崩溃日志和 minidump |
 | `rskynet-net` | 基于 `mio` 的 TCP/UDP 网络服务 |
 | `rskynet-tls` | 基于 `rustls`、运行于 `rskynet-net` 之上的 TLS 服务 |
+| `rskynet-quic` | 基于 `quinn-proto`、运行于 `rskynet-net` UDP 之上的通用 QUIC 服务 |
 | `rskynet-http` | HTTP/1.1 客户端、服务端驱动和可选 WebSocket |
 | `rskynet-dashboard` | 节点及 socket 统计 API、内嵌 Dashboard |
 

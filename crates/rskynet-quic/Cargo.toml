@@ -1,0 +1,27 @@
+[package]
+name = "rskynet-quic"
+description = "rskynet 的通用 QUIC 传输服务：quinn-proto 驱动、无 Tokio 运行时依赖"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+quinn-proto = { workspace = true }
+rskynet-core = { workspace = true }
+rskynet-macros = { workspace = true }
+rskynet-net = { workspace = true }
+rskynet-tls = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rcgen = "0.14"
+quinn = "=0.11.11"
+rskynet-bootstrap = { workspace = true }
+rskynet-macros = { workspace = true }
+rskynet-timer = { workspace = true }
+rustls = { workspace = true }
+tokio = { version = "1", features = ["rt", "net", "time", "io-util"] }

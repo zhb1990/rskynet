@@ -19,6 +19,7 @@ rskynet-logger = { version = "0.1.0", path = "crates/rskynet-logger" }
 rskynet-http = { version = "0.1.0", path = "crates/rskynet-http" }
 rskynet-macros = { version = "0.1.0", path = "crates/rskynet-macros" }
 rskynet-net = { version = "0.1.0", path = "crates/rskynet-net" }
+rskynet-quic = { version = "0.1.0", path = "crates/rskynet-quic" }
 rskynet-signal = { version = "0.1.0", path = "crates/rskynet-signal" }
 rskynet-timer = { version = "0.1.0", path = "crates/rskynet-timer" }
 rskynet-tls = { version = "0.1.0", path = "crates/rskynet-tls" }
@@ -41,6 +42,8 @@ minidumper = "0.9"
 mio = { version = "1", features = ["os-poll", "net"] }
 parking_lot = "0.12"
 prost = "0.14"
+bytes = "1"
+quinn-proto = "=0.11.17"
 pkcs8 = { version = "0.11", features = ["encryption", "getrandom", "pem"] }
 proc-macro2 = "1"
 quote = "1"

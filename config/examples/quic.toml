@@ -1,0 +1,9 @@
+thread = 4
+profile = true
+
+[quic]
+max_connections = 1024
+max_handshakes = 128
+
+[bootstrap]
+services = [{ name = "quic-example" }]

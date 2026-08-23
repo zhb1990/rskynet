@@ -165,6 +165,12 @@ impl ClientTlsConfig {
     pub(crate) fn inner(&self) -> Arc<ClientConfig> {
         self.0.clone()
     }
+
+    /// 取得底层 rustls 配置。QUIC 等同样使用 TLS 1.3 的协议层
+    /// 可以复用这份身份验证策略，但不会经过 `TlsService`。
+    pub fn rustls_config(&self) -> Arc<ClientConfig> {
+        self.0.clone()
+    }
 }
 
 impl fmt::Debug for ClientTlsConfig {
@@ -190,7 +196,10 @@ impl ServerTlsConfig {
             return Err(TlsConfigError::EmptyCertificateChain);
         }
         let key = decode_private_key(private_key)?;
-        let mut config = ServerConfig::builder()
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let mut config = ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|error| TlsConfigError::Rustls(error.to_string()))?
             .with_no_client_auth()
             .with_single_cert(certificates, key)
             .map_err(|error| TlsConfigError::Rustls(error.to_string()))?;
@@ -199,6 +208,11 @@ impl ServerTlsConfig {
     }
 
     pub(crate) fn inner(&self) -> Arc<ServerConfig> {
+        self.0.clone()
+    }
+
+    /// 取得底层 rustls 配置，供 QUIC 等 TLS 1.3 协议复用证书与 ALPN。
+    pub fn rustls_config(&self) -> Arc<ServerConfig> {
         self.0.clone()
     }
 }

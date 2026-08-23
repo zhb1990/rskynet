@@ -28,6 +28,8 @@ impl MsgType {
     pub const USER: MsgType = MsgType(7);
     /// TLS 服务投递的握手、明文与关闭事件。
     pub const TLS: MsgType = MsgType(8);
+    /// QUIC 服务投递的连接、stream 与 datagram 事件。
+    pub const QUIC: MsgType = MsgType(9);
 
     pub const fn raw(self) -> u8 {
         self.0
@@ -50,6 +52,7 @@ impl MsgType {
             Self::ERROR => "ERROR",
             Self::USER => "USER",
             Self::TLS => "TLS",
+            Self::QUIC => "QUIC",
             _ => return None,
         })
     }
@@ -274,13 +277,15 @@ mod tests {
                 MsgType::SOCKET,
                 MsgType::ERROR,
                 MsgType::USER,
-                MsgType::TLS
+                MsgType::TLS,
+                MsgType::QUIC,
             ]
             .map(MsgType::raw),
-            [0, 1, 2, 3, 4, 5, 6, 7, 8]
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
         );
         assert!(MsgType::RESPONSE.is_reply() && MsgType::ERROR.is_reply());
         assert!(!MsgType::USER.is_reply());
+        assert!(!MsgType::QUIC.is_reply());
         assert_eq!(format!("{:?}", MsgType::RESPONSE), "RESPONSE");
         assert_eq!(format!("{:?}", MsgType(99)), "MsgType(99)");
     }

@@ -57,10 +57,18 @@ pub enum Command {
     NoDelay { id: SocketId, on: bool },
     /// 开一个 UDP 端口，对照 `'U'`。`bind` 不写就让系统挑个端口。
     Udp { bind: Option<String> },
+    /// 为指定对端建立 UDP 端点，默认绑定与对端相同的地址族。
+    UdpForPeer { addr: String },
     /// 记下 UDP 的默认对端，对照 `'C'`。
     UdpConnect { id: SocketId, addr: String },
     /// 发一个 UDP 包，对照 `'A'`。`to` 不写就发给默认对端。
     UdpSend {
+        id: SocketId,
+        to: Option<SocketAddr>,
+        data: Vec<u8>,
+    },
+    /// 与 `UdpSend` 相同，但写队列越过高水位时等待回落。
+    UdpSendWait {
         id: SocketId,
         to: Option<SocketAddr>,
         data: Vec<u8>,
@@ -247,6 +255,15 @@ pub async fn udp(ctx: &Ctx, bind: Option<&str>) -> Result<SocketId> {
     .await
 }
 
+/// 建立一个已记住默认对端的 UDP 端点。
+///
+/// 域名会先在解析线程中解析，再根据选中的对端绑定 IPv4 或 IPv6
+/// wildcard 地址；没有可用路由或无法建立端点时会继续尝试后续候选，避免首个
+/// A / AAAA 结果不可达，或默认 IPv4 socket 无法向 IPv6 对端发包。
+pub async fn udp_for_peer(ctx: &Ctx, addr: impl Into<String>) -> Result<SocketId> {
+    ask_id(ctx, Command::UdpForPeer { addr: addr.into() }).await
+}
+
 /// 记下默认对端，之后 [`udp_send`] 不写地址就发给它，对照 `socket_server_udp_connect`。
 pub async fn udp_connect(ctx: &Ctx, id: SocketId, addr: impl Into<String>) -> Result<()> {
     ask_done(
@@ -264,6 +281,18 @@ pub async fn udp_connect(ctx: &Ctx, id: SocketId, addr: impl Into<String>) -> Re
 /// `to` 不写就发给 [`udp_connect`] 记下的那个对端；两个都没有就报错。
 pub fn udp_send(ctx: &Ctx, id: SocketId, to: Option<SocketAddr>, data: Vec<u8>) -> Result<()> {
     tell(ctx, Command::UdpSend { id, to, data })
+}
+
+/// 发送一个 UDP 包，并在底层写队列拥塞时等待它回落。
+///
+/// 等待只影响调用方，包边界始终保留。
+pub async fn udp_send_wait(
+    ctx: &Ctx,
+    id: SocketId,
+    to: Option<SocketAddr>,
+    data: Vec<u8>,
+) -> Result<()> {
+    ask_done(ctx, Command::UdpSendWait { id, to, data }).await
 }
 
 /// 问一个 socket 的现状，对照 C 版的 `'Q'`。

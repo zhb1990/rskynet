@@ -63,3 +63,12 @@ warn_size = 1048576
 # send_wait 从高水位开始等待，写队列回落到低水位后恢复调用者。
 write_high_water = 1048576
 write_low_water = 524288
+
+# 通用 QUIC 服务。段存在时自动先启动 net，不需要写入 bootstrap。
+[quic]
+max_connections = 65536
+max_handshakes = 4096
+write_high_water = 4194304
+write_low_water = 2097152
+max_chunk_size = 65536
+handshake_timeout_ms = 10000

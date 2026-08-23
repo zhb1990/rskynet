@@ -56,6 +56,7 @@
 //! | 标准命令行入口 | 读取 TOML 并启动自动注册服务 | `main`（默认开） |
 //! | `rskynet-net` | socket 层，一个[独占线程的服务][Exclusive] | `net` |
 //! | `rskynet-tls` | 基于 rustls、复用 net 的双向 TLS 协议服务 | `tls` |
+//! | `rskynet-quic` | 基于 quinn-proto、复用 net UDP reactor 的通用 QUIC | `quic` |
 //! | `rskynet-http` | HTTP/1.1 客户端服务与可嵌入服务端 | `http` / `https` |
 //! | `rskynet-dashboard` | 节点统计 API 与内嵌 Dashboard | `dashboard` |
 //! | `rskynet-cluster` | Protobuf 节点间通信 | `cluster` |
@@ -84,6 +85,10 @@ pub use rskynet_net as net;
 /// TLS 协议服务：底层复用 [`net`]，向业务投递明文事件。
 #[cfg(feature = "tls")]
 pub use rskynet_tls as tls;
+
+/// 通用 QUIC 连接、stream 与 datagram 传输。
+#[cfg(feature = "quic")]
+pub use rskynet_quic as quic;
 
 /// HTTP/1.1 客户端服务与可嵌入业务服务的服务端驱动。
 #[cfg(feature = "http")]
@@ -263,6 +268,10 @@ impl BuilderExt for Builder {
         {
             builder = builder.service(rskynet_tls::NAME, rskynet_tls::TlsService::new);
         }
+        #[cfg(feature = "quic")]
+        {
+            builder = builder.service(rskynet_quic::NAME, rskynet_quic::QuicService::new);
+        }
         #[cfg(feature = "http")]
         {
             builder = builder.service(rskynet_http::NAME, rskynet_http::HttpClientService::new);
@@ -295,12 +304,14 @@ pub fn start(config: Config, registry: Registry) -> Result<()> {
 fn prepare_startup(config: &Config, registry: &mut Registry) -> Result<Vec<&'static str>> {
     const NET: &str = "net";
     const TLS: &str = "tls";
+    const QUIC: &str = "quic";
     const HTTP: &str = "http-client";
     const CLUSTER: &str = "cluster";
     const DASHBOARD: &str = "dashboard";
 
     let has_net = config.has_section(NET);
     let has_tls = config.has_section(TLS);
+    let has_quic = config.has_section(QUIC);
     let has_http = config.has_section(HTTP);
     let has_cluster = config.has_section(CLUSTER);
     let has_dashboard = config.has_section(DASHBOARD);
@@ -316,6 +327,10 @@ fn prepare_startup(config: &Config, registry: &mut Registry) -> Result<Vec<&'sta
         return Err(Error::Config(
             "[tls] 需要启用 `tls` 或 `https` feature".into(),
         ));
+    }
+    #[cfg(not(feature = "quic"))]
+    if has_quic {
+        return Err(Error::Config("[quic] 需要启用 `quic` feature".into()));
     }
     #[cfg(not(feature = "http"))]
     if has_http {
@@ -341,7 +356,7 @@ fn prepare_startup(config: &Config, registry: &mut Registry) -> Result<Vec<&'sta
         if let Some(service) = bootstrap.services.iter().find(|service| {
             matches!(
                 service.name.as_str(),
-                NET | TLS | HTTP | CLUSTER | DASHBOARD
+                NET | TLS | QUIC | HTTP | CLUSTER | DASHBOARD
             )
         }) {
             return Err(Error::Config(format!(
@@ -365,13 +380,16 @@ fn prepare_startup(config: &Config, registry: &mut Registry) -> Result<Vec<&'sta
     let need_cluster = has_cluster;
     let need_dashboard = has_dashboard;
     let need_tls = has_tls || (need_http && cfg!(feature = "https"));
-    let need_net = has_net || need_tls || need_http || need_cluster || need_dashboard;
+    let need_net = has_net || need_tls || has_quic || need_http || need_cluster || need_dashboard;
     let mut startup = Vec::new();
     if need_net {
         startup.push(NET);
     }
     if need_tls {
         startup.push(TLS);
+    }
+    if has_quic {
+        startup.push(QUIC);
     }
     if need_http {
         startup.push(HTTP);
@@ -428,6 +446,24 @@ mod startup_tests {
             prepare_startup(&config, &mut Registry::new()).unwrap(),
             ["net", "tls"]
         );
+    }
+
+    #[cfg(feature = "quic")]
+    #[test]
+    fn quic_adds_default_net_dependency() {
+        let config = with_empty_section(Config::default(), "quic");
+        assert_eq!(
+            prepare_startup(&config, &mut Registry::new()).unwrap(),
+            ["net", "quic"]
+        );
+    }
+
+    #[cfg(not(feature = "quic"))]
+    #[test]
+    fn configured_quic_requires_feature() {
+        let config = with_empty_section(Config::default(), "quic");
+        let error = prepare_startup(&config, &mut Registry::new()).unwrap_err();
+        assert!(error.to_string().contains("`quic` feature"));
     }
 
     #[cfg(all(feature = "http", not(feature = "https")))]

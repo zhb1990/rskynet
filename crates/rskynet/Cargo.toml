@@ -25,6 +25,8 @@ main = []
 net = ["dep:rskynet-net"]
 # TLS 协议服务，密文收发依赖底层网络服务
 tls = ["net", "dep:rskynet-tls"]
+# 通用 QUIC 传输，复用 net 的 UDP reactor，TLS 1.3 由 QUIC 内部处理
+quic = ["net", "dep:rskynet-quic"]
 # HTTP/1.1 客户端服务与明文嵌入式服务端
 http = ["net", "dep:rskynet-http"]
 # 节点统计 HTTP API 与内嵌 Dashboard
@@ -64,6 +66,7 @@ rskynet-logger = { workspace = true, optional = true }
 rskynet-http = { workspace = true, optional = true }
 rskynet-macros = { workspace = true, optional = true }
 rskynet-net = { workspace = true, optional = true }
+rskynet-quic = { workspace = true, optional = true }
 rskynet-signal = { workspace = true, optional = true }
 rskynet-timer = { workspace = true, optional = true }
 rskynet-tls = { workspace = true, optional = true }

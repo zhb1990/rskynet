@@ -99,7 +99,8 @@ use rskynet_core::Registry;
 
 pub use command::{
     Answer, Command, close, connect, connect_timeout, info, listen, netstat, pause, send, send_low,
-    send_low_wait, send_wait, set_nodelay, shutdown, start, udp, udp_connect, udp_send,
+    send_low_wait, send_wait, set_nodelay, shutdown, start, udp, udp_connect, udp_for_peer,
+    udp_send, udp_send_wait,
 };
 pub use config::NetConfig;
 pub use event::{SocketEvent, SocketId, SocketInfo};
