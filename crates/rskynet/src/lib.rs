@@ -60,6 +60,7 @@
 //! | `rskynet-http` | HTTP/1.1 客户端服务与可嵌入服务端 | `http` / `https` |
 //! | `rskynet-dashboard` | 节点统计 API 与内嵌 Dashboard | `dashboard` |
 //! | `rskynet-cluster` | Protobuf 节点间通信 | `cluster` |
+//! | `rskynet-plugin` | service 内组合式插件、Capability 与 EventBus | `plugin` |
 //!
 //! 内核里一个服务都没有，连时间都不在里面：分层时间轮住在 `rskynet-timer`，内核
 //! 只认 [`Timer`] 这个抽象，启动前必须注入一个实现。这么切的好处与网络层独立是
@@ -76,7 +77,7 @@ pub use rskynet_core::*;
 /// `msg` 单独用没有意义（它由前两个宏在展开时摘走），导出它只是为了让写错地方时
 /// 报一句人话。
 #[cfg(feature = "macros")]
-pub use rskynet_macros::{MessageSchema, debug, exclusive, msg, service, signal};
+pub use rskynet_macros::{MessageSchema, debug, exclusive, msg, service, service_plugin, signal};
 
 /// 网络层：socket / gate / agent。
 #[cfg(feature = "net")]
@@ -105,6 +106,10 @@ pub use rskynet_http::websocket;
 /// 可选的 Protobuf 跨节点通信层。
 #[cfg(feature = "cluster")]
 pub use rskynet_cluster as cluster;
+
+/// Service 内组合式插件：链接期注册，启动时按配置装配。
+#[cfg(feature = "plugin")]
+pub use rskynet_plugin as plugin;
 
 #[cfg(feature = "bootstrap")]
 pub use rskynet_bootstrap as bootstrap;

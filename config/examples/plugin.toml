@@ -1,0 +1,26 @@
+thread = 4
+profile = true
+
+[logger]
+name = "logger"
+path = ""
+
+[timer]
+name = "timer"
+tick_micros = 2500
+
+# 插件已经静态链接进 examples 二进制；这里决定本次为 plugin-demo namespace
+# 创建哪些插件实例。依赖顺序不必手工排列，宿主会做拓扑排序。
+[plugin-demo]
+plugins = [
+    { name = "command" },
+    { name = "audit" },
+    { name = "counter" },
+]
+
+[bootstrap]
+name = "bootstrap"
+services = [
+    { name = "plugin-demo-host" },
+    { name = "plugin-demo-client" },
+]

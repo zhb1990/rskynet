@@ -1,0 +1,14 @@
+[package]
+name = "rskynet-plugin"
+description = "rskynet service 内的组合式插件、Capability 与 typed EventBus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+inventory = { workspace = true }
+rskynet-core = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }

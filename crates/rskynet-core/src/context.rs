@@ -87,6 +87,24 @@ impl Ctx {
         NodeRef::new(self.inner.node.clone())
     }
 
+    /// 为当前 service 动态公开 Dashboard 调试消息。
+    ///
+    /// 主要供初始化时才知道启用集合的组合组件使用。名称与消息类型组成的键不能和
+    /// service 静态消息或先前动态注册的消息重复。
+    pub fn register_debug_messages(
+        &self,
+        messages: impl IntoIterator<Item = crate::DebugMessageDescriptor>,
+    ) -> Result<()> {
+        self.inner.assert_ownership();
+        let static_messages = self.inner.service.debug_messages();
+        let mut dynamic = self
+            .inner
+            .debug_messages
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        register_debug_messages_into(&static_messages, &mut dynamic, messages)
+    }
+
     fn resolve(&self, addr: impl Into<Addr>) -> Result<crate::Handle> {
         self.inner.node.resolve(&addr.into())
     }
@@ -321,6 +339,75 @@ impl Ctx {
     pub fn log(&self, text: impl Into<String>) {
         self.inner.assert_ownership();
         self.inner.node.log(self.handle(), text.into());
+    }
+}
+
+fn register_debug_messages_into(
+    static_messages: &[crate::DebugMessageDescriptor],
+    dynamic: &mut Vec<crate::DebugMessageDescriptor>,
+    messages: impl IntoIterator<Item = crate::DebugMessageDescriptor>,
+) -> Result<()> {
+    let messages: Vec<_> = messages.into_iter().collect();
+    for (index, message) in messages.iter().enumerate() {
+        let duplicate = static_messages
+            .iter()
+            .chain(dynamic.iter())
+            .chain(messages[..index].iter())
+            .any(|existing| {
+                existing.name() == message.name() && existing.mtype() == message.mtype()
+            });
+        if duplicate {
+            return Err(Error::service(format!(
+                "Dashboard 调试消息 `{}:{}` 重复注册",
+                message.name(),
+                message.mtype().raw(),
+            )));
+        }
+    }
+    dynamic.extend(messages);
+    Ok(())
+}
+
+#[cfg(test)]
+mod debug_message_tests {
+    use super::*;
+
+    #[test]
+    fn debug_message_registration_is_atomic() {
+        let static_messages = [crate::DebugMessageDescriptor::send::<String>(
+            "existing",
+            MsgType::USER,
+        )];
+        let mut dynamic = Vec::new();
+        let error = register_debug_messages_into(
+            &static_messages,
+            &mut dynamic,
+            [
+                crate::DebugMessageDescriptor::send::<String>("new", MsgType::USER),
+                crate::DebugMessageDescriptor::send::<String>("existing", MsgType::USER),
+            ],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("重复注册"));
+        assert!(dynamic.is_empty(), "校验失败不能留下部分注册结果");
+    }
+
+    #[test]
+    fn debug_message_registration_rejects_duplicates_inside_the_batch() {
+        let mut dynamic = Vec::new();
+        let error = register_debug_messages_into(
+            &[],
+            &mut dynamic,
+            [
+                crate::DebugMessageDescriptor::send::<String>("same", MsgType::USER),
+                crate::DebugMessageDescriptor::send::<String>("same", MsgType::USER),
+            ],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("重复注册"));
+        assert!(dynamic.is_empty());
     }
 }
 

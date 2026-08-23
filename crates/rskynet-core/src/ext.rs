@@ -201,7 +201,15 @@ impl NodeRef {
             .handles
             .grab(handle)
             .ok_or(crate::Error::NoService(handle))?;
-        Ok(ctx.service.debug_messages())
+        let mut messages = ctx.service.debug_messages();
+        messages.extend(
+            ctx.debug_messages
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .copied(),
+        );
+        Ok(messages)
     }
 
     /// 只读取邮箱积压数的轻量路径，供 logger 的逐消息背压判断等热路径使用。

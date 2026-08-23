@@ -37,6 +37,8 @@ https = ["http", "tls", "rskynet-http/tls"]
 websocket = ["http", "rskynet-http/websocket"]
 # 跨节点通信：按需开启，同时带上底层网络服务
 cluster = ["net", "bootstrap", "dep:rskynet-cluster", "dep:toml"]
+# service 内组合式插件：静态注册、按配置装配、Capability 与 EventBus
+plugin = ["dep:rskynet-plugin"]
 
 # net 在 dev-dependencies 里也列一份，好让 `cargo test` 不加 feature 也跑网络层的
 # 用例——那些用例直接用 `rskynet_net`，不经过 `rskynet::net` 那个 re-export
@@ -57,6 +59,11 @@ name = "cluster_auto_duplicate"
 path = "tests/cluster_auto_duplicate.rs"
 required-features = ["cluster"]
 
+[[test]]
+name = "plugin"
+path = "tests/plugin.rs"
+required-features = ["plugin"]
+
 [dependencies]
 rskynet-core = { workspace = true }
 rskynet-dashboard = { workspace = true, optional = true }
@@ -66,6 +73,7 @@ rskynet-logger = { workspace = true, optional = true }
 rskynet-http = { workspace = true, optional = true }
 rskynet-macros = { workspace = true, optional = true }
 rskynet-net = { workspace = true, optional = true }
+rskynet-plugin = { workspace = true, optional = true }
 rskynet-quic = { workspace = true, optional = true }
 rskynet-signal = { workspace = true, optional = true }
 rskynet-timer = { workspace = true, optional = true }

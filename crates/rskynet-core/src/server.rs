@@ -154,6 +154,8 @@ pub(crate) struct ServiceContext {
     pub(crate) mailbox: Mailbox,
     pub(crate) sessions: SessionTable,
     pub(crate) service: Arc<dyn Service>,
+    /// 初始化期间动态挂入的 Dashboard 消息（例如按配置启用的 service 插件）。
+    pub(crate) debug_messages: std::sync::RwLock<Vec<crate::DebugMessageDescriptor>>,
     /// 独占线程服务的另一副面孔，与 `service` 是同一个对象；普通服务是 `None`。
     /// 它同时兼作「本服务由自己那条线程执行，不进运行队列」的标记。
     exclusive: Option<Arc<dyn Exclusive>>,
@@ -786,6 +788,7 @@ impl Node {
                 mailbox: Mailbox::new(),
                 sessions: SessionTable::new(),
                 service: instance.service,
+                debug_messages: std::sync::RwLock::new(Vec::new()),
                 exclusive: instance.exclusive,
                 thread: ArcSwapOption::empty(),
                 tasks: TaskSet::new(),
@@ -1324,6 +1327,7 @@ pub(crate) mod tests {
             mailbox: Mailbox::new(),
             sessions: SessionTable::new(),
             service: Arc::new(NullService),
+            debug_messages: std::sync::RwLock::new(Vec::new()),
             exclusive: None,
             thread: ArcSwapOption::empty(),
             tasks: TaskSet::new(),
@@ -1361,6 +1365,7 @@ pub(crate) mod tests {
                 mailbox: Mailbox::new(),
                 sessions: SessionTable::new(),
                 service: service_arc,
+                debug_messages: std::sync::RwLock::new(Vec::new()),
                 exclusive: Some(service),
                 thread: ArcSwapOption::empty(),
                 tasks: TaskSet::new(),

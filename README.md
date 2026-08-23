@@ -15,6 +15,7 @@ rskynet 是一个受 [skynet](https://github.com/cloudwu/skynet) 启发、使用
 - 支持独占线程服务，适合定时器、日志和基于 `mio` 的网络轮询。
 - 可选 TCP/UDP、TLS、QUIC、HTTP/1.1、WebSocket、Dashboard 和 Protobuf 跨节点通信。
 - TOML 驱动启动流程；具名服务和集群 handler 可在链接期自动注册。
+- 可选的 service 内组合式插件，支持按 namespace 注册、Capability 直调和 typed EventBus。
 - 支持优雅关停、崩溃报告、服务运行统计和疑似死循环检测。
 
 ## 快速运行
@@ -41,6 +42,7 @@ cargo run -p rskynet-examples -- config/examples/ping_pong.toml
 | HTTP | `cargo run -p rskynet-examples -- config/examples/http.toml` | 在随机本地端口完成一次 HTTP POST 回显后退出 |
 | WebSocket | `cargo run -p rskynet-examples -- config/examples/websocket.toml` | 完成一次 WebSocket 文本回显后退出 |
 | Dashboard | `cargo run -p rskynet-examples -- config/examples/dashboard.toml` | 在 `http://127.0.0.1:8080/` 展示节点状态 |
+| Service 插件 | `cargo run -p rskynet-examples -- config/examples/plugin.toml` | 演示插件注册、Capability 调用和 EventBus 广播 |
 
 TCP echo 和 Dashboard 会持续运行，可按 `Ctrl+C` 关停。
 
@@ -172,6 +174,103 @@ variant 只接受 send，带返回值的 variant 同时接受 send 与 call。�
 
 自定义对象负载可用 `rskynet::boxed_payload!(Type)` 接入 `FromPayload` / `IntoPayload`。需要专用线程时使用 `#[rskynet::exclusive]`，并按需实现同步的 `idle` 和 `interrupt` 钩子。
 
+## Service 内插件
+
+无法继续按 service 拆分的大型业务可以启用 `plugin` feature，在保留一个邮箱和地址
+的同时把功能拆成独立插件。插件静态链接进程序，启动时再按配置选择启用：
+
+```rust,ignore
+use rskynet::plugin::{
+    CommandId, PluginCtx, PluginMount, ServicePlugin,
+    register_service_plugin,
+};
+
+#[derive(Default)]
+struct ProfilePlugin;
+
+impl ServicePlugin for ProfilePlugin {
+    fn mount(self: Arc<Self>, mount: &mut PluginMount<'_>) -> rskynet::Result<()> {
+        mount.provide(ProfileCapability(self.clone()))?;
+        Ok(())
+    }
+
+    fn handle(
+        self: Arc<Self>,
+        ctx: PluginCtx,
+        command: CommandId,
+        msg: rskynet::Message,
+    ) -> rskynet::BoxFuture<'static, rskynet::Result<()>> {
+        Box::pin(async move { /* 处理命令并按需 reply */ Ok(()) })
+    }
+}
+
+register_service_plugin! {
+    namespace: "account",
+    name: "profile",
+    plugin: ProfilePlugin,
+    factory: ProfilePlugin::default,
+    dependencies: ["identity"],
+    commands: [CommandId(100)],
+}
+```
+
+需要把插件命令公开到 Dashboard 时，可以用 `#[service_plugin]` 同时生成命令分发、
+静态注册和调试描述。顶层写 `debug` 会公开当前插件的全部 `#[msg]` 处理器：
+
+```rust,ignore
+#[rskynet::service_plugin(
+    namespace = "account",
+    name = "profile",
+    factory = ProfilePlugin::default,
+    dependencies = ["identity"],
+    debug,
+)]
+impl ProfilePlugin {
+    #[msg(LOAD_PROFILE)]
+    async fn load(&self, ctx: PluginCtx, request: LoadProfile) -> Profile { /* ... */ }
+}
+```
+
+不写顶层 `debug` 时，只有单独标记的处理器会公开；同一个命令按 enum variant
+分派时也可以只公开其中一个 variant：
+
+```rust,ignore
+#[rskynet::service_plugin(
+    namespace = "account",
+    name = "profile",
+    factory = ProfilePlugin::default,
+    dependencies = [],
+)]
+impl ProfilePlugin {
+    #[debug(name = "query")]
+    #[msg(PROFILE, variant = ProfileCommand::Query)]
+    async fn query(&self, ctx: PluginCtx, request: Query) -> Profile { /* ... */ }
+
+    #[msg(PROFILE, variant = ProfileCommand::InternalRefresh)]
+    async fn refresh(&self, ctx: PluginCtx, request: Refresh) { /* 不公开 */ }
+}
+```
+
+Dashboard 中的名称会自动加插件名前缀，例如 `profile.query`。插件宿主初始化成功后
+会把实际启用插件的描述动态注册到当前 service；JSON 负载也会自动包装为
+`CommandEnvelope`，Dashboard 不需要知道插件命令路由。请求和返回类型分别需要
+serde 反序列化/序列化以及 `MessageSchema`，对象负载仍需声明 `boxed_payload!`。
+
+最终二进制必须依赖插件 crate，并写一条 `use plugin_crate as _;` 确保描述符进入
+链接产物。具体 service 持有 `PluginHost::from_auto("account")?`，在 `init` 中调用
+`init_from_section(ctx, "account")`，在 `dispatch` 中调用 `PluginHost::dispatch`。
+
+同一个插件类型可以为多个 namespace 注册；每个 service 实例都会由 factory 创建自己的
+插件实例，状态不会跨实例共享。插件间有返回值的交互使用 Capability；无需等待的
+通知使用 `PluginCtx::emit`，事件经当前 service 邮箱异步广播。
+`namespace` 只是插件集合的命名空间，不是 service 地址、注册名或配置段名称。
+
+可直接运行完整示例：
+
+```bash
+cargo run -p rskynet-examples -- config/examples/plugin.toml
+```
+
 ## 配置与启动顺序
 
 顶层只有两个内核配置项：
@@ -216,6 +315,7 @@ net -> tls -> quic -> http-client -> cluster -> dashboard -> bootstrap services
 | `websocket` | WebSocket 客户端及服务端升级 | `http` |
 | `dashboard` | 节点统计 API 和内嵌 Web UI | `http` |
 | `cluster` | Protobuf 跨节点通信 | `net`、`bootstrap` |
+| `plugin` | service 内组合式插件、Capability 与 typed EventBus | — |
 
 `quic` 提供标准 QUIC 连接、双向/单向 stream 和可选 datagram，业务双方需约定
 相同的 ALPN 与报文 framing。它不是 HTTP/3 或 WebTransport，浏览器 JavaScript 不能
@@ -238,6 +338,7 @@ rskynet = {
 | Crate | 职责 |
 | --- | --- |
 | `rskynet` | 门面 crate、feature 组合、标准入口和自动基础设施启动 |
+| `rskynet-plugin` | service 内插件注册、装配、Capability 与 EventBus |
 | `rskynet-core` | Actor 内核、邮箱、调度器、Future 任务、session、配置与生命周期 |
 | `rskynet-macros` | 服务、独占服务、消息、信号和集群过程宏 |
 | `rskynet-bootstrap` | 按配置清单顺序启动业务服务 |

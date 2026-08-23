@@ -3,6 +3,7 @@ mod debug_console;
 mod echo;
 mod http;
 mod ping_pong;
+mod plugin;
 mod quic;
 mod websocket;
 

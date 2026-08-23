@@ -19,6 +19,7 @@ rskynet-logger = { version = "0.1.0", path = "crates/rskynet-logger" }
 rskynet-http = { version = "0.1.0", path = "crates/rskynet-http" }
 rskynet-macros = { version = "0.1.0", path = "crates/rskynet-macros" }
 rskynet-net = { version = "0.1.0", path = "crates/rskynet-net" }
+rskynet-plugin = { version = "0.1.0", path = "crates/rskynet-plugin" }
 rskynet-quic = { version = "0.1.0", path = "crates/rskynet-quic" }
 rskynet-signal = { version = "0.1.0", path = "crates/rskynet-signal" }
 rskynet-timer = { version = "0.1.0", path = "crates/rskynet-timer" }

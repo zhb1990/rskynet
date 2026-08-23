@@ -50,6 +50,7 @@
 
 mod cluster;
 mod expand;
+mod plugin;
 mod signal;
 
 use proc_macro::TokenStream;
@@ -205,6 +206,14 @@ pub fn msg(_attr: TokenStream, _item: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn debug(_attr: TokenStream, _item: TokenStream) -> TokenStream {
     expand::stray_debug().into()
+}
+
+/// 为 service 内插件生成 `ServicePlugin`、`#[msg]` 命令路由、静态注册及可选的
+/// Dashboard 描述。属性参数写 `debug` 时公开当前插件的全部消息处理器；否则只
+/// 公开单独标了 `#[debug]` 的处理器。
+#[proc_macro_attribute]
+pub fn service_plugin(attr: TokenStream, item: TokenStream) -> TokenStream {
+    plugin::expand(attr.into(), item.into()).into()
 }
 
 /// 注册一个进程信号回调。

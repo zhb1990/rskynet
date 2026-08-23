@@ -1829,6 +1829,7 @@ dependencies = [
  "rskynet-logger",
  "rskynet-macros",
  "rskynet-net",
+ "rskynet-plugin",
  "rskynet-quic",
  "rskynet-signal",
  "rskynet-timer",
@@ -1954,6 +1955,16 @@ dependencies = [
  "rskynet-macros",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "rskynet-plugin"
+version = "0.1.0"
+dependencies = [
+ "inventory",
+ "rskynet-core",
+ "serde",
+ "toml",
 ]
 
 [[package]]
