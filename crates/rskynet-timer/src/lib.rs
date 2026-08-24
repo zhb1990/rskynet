@@ -43,7 +43,13 @@ use rskynet_core::{Builder, Ctx, Error, Payload, Result, Timer};
 
 pub use service::TimerService;
 
-use wheel::{TimerEvent, Wheel};
+use wheel::{TimerEvent, TimerKey, Wheel};
+
+/// 挂表和取消共用一条 FIFO，保证同一个 service 先挂后撤的顺序不会颠倒。
+enum TimerCommand {
+    Arm(TimerEvent),
+    Cancel(TimerKey),
+}
 
 /// 时间轮版的时间来源，注入给内核的就是它，见 [`Timer`]。
 ///
@@ -54,7 +60,7 @@ pub struct WheelTimer {
     ///
     /// `sleep` 与 `call` 超时都要挂表，而挂表的是任意 worker 线程；它们够不着
     /// 时间轮，只能排队等定时器服务代插。到期时刻在入队前已经按绝对时间算好。
-    incoming: SegQueue<TimerEvent>,
+    incoming: SegQueue<TimerCommand>,
     /// 进程启动时刻，用来把单调时钟换算成 unix 时间。
     started: Instant,
     /// 启动时刻的 unix 时间，单位毫秒。
@@ -94,8 +100,11 @@ impl WheelTimer {
 
         let mut out = Vec::new();
         // 新挂的表先插进轮子：哪怕这一 tick 没走满一格，也不能把它们攒着
-        while let Some(event) = self.incoming.pop() {
-            wheel.add(event);
+        while let Some(command) = self.incoming.pop() {
+            match command {
+                TimerCommand::Arm(event) => wheel.add(event),
+                TimerCommand::Cancel(key) => wheel.cancel(key),
+            }
         }
         if diff == 0 {
             // 也可能有刚挂上就该响的（`ticks` 小到落在本刻度）
@@ -116,16 +125,21 @@ impl WheelTimer {
 impl Timer for WheelTimer {
     /// 只是排进队列，真正插轮子由定时器服务在下一个 tick 做。到期时刻按当前刻度
     /// 算好带上，所以延后插入不会让定时器变长。
-    fn timeout(&self, handle: rskynet_core::Handle, session: u64, delay_ms: u32) {
+    fn timeout(&self, handle: rskynet_core::Handle, session: u64, delay_ms: u64) {
         // 时间轮内部仍是 10ms 一格。先算绝对毫秒截止时间再向上取整，避免在当前
         // 刻度已经走过一部分时把延迟截短。
-        let deadline_ms = self.now().saturating_add(u64::from(delay_ms));
-        let expire = deadline_ms.div_ceil(10) as u32;
-        self.incoming.push(TimerEvent {
+        let deadline_ms = self.now().saturating_add(delay_ms);
+        let expire = deadline_ms.div_ceil(10);
+        self.incoming.push(TimerCommand::Arm(TimerEvent {
             handle,
             session,
             expire,
-        });
+        }));
+    }
+
+    fn cancel(&self, handle: rskynet_core::Handle, session: u64) {
+        self.incoming
+            .push(TimerCommand::Cancel(TimerKey { handle, session }));
     }
 
     fn now(&self) -> u64 {
@@ -202,6 +216,13 @@ impl BuilderExt for Builder {
 mod tests {
     use super::*;
 
+    fn pop_armed(timer: &WheelTimer) -> TimerEvent {
+        match timer.incoming.pop().expect("定时器应当已经入队") {
+            TimerCommand::Arm(event) => event,
+            TimerCommand::Cancel(_) => panic!("预期挂表命令，却收到取消命令"),
+        }
+    }
+
     /// 时钟只会前进，unix 时间也得是个合理值
     #[test]
     fn clock_never_goes_backwards() {
@@ -220,16 +241,16 @@ mod tests {
     /// 对外延迟是毫秒，进入 10ms 时间轮时必须向上对齐，不能提前。
     #[test]
     fn millisecond_delays_round_up_to_wheel_ticks() {
-        for delay_ms in [1, 10, 11] {
+        for delay_ms in [1u64, 10, 11] {
             let timer = WheelTimer::new();
             let before_ms = timer.now();
             timer.timeout(7, 42, delay_ms);
             let after_ms = timer.now();
-            let event = timer.incoming.pop().expect("定时器应当已经入队");
-            let deadline_tick = u64::from(event.expire);
-            let requested_deadline_ms = before_ms + u64::from(delay_ms);
+            let event = pop_armed(&timer);
+            let deadline_tick = event.expire;
+            let requested_deadline_ms = before_ms + delay_ms;
             assert!(deadline_tick * 10 >= requested_deadline_ms);
-            assert!(deadline_tick * 10 < after_ms + u64::from(delay_ms) + 10);
+            assert!(deadline_tick * 10 < after_ms + delay_ms + 10);
         }
     }
 
@@ -260,5 +281,15 @@ mod tests {
         assert_eq!(fired.len(), 1, "一毫秒的表应当在 5 秒内到期");
         assert_eq!(fired[0].handle, 7);
         assert_eq!(fired[0].session, 42);
+    }
+
+    #[test]
+    fn cancel_command_removes_an_armed_timer_before_it_fires() {
+        let timer = WheelTimer::new();
+        let mut wheel = Wheel::new();
+        timer.timeout(7, 42, 1_000);
+        timer.cancel(7, 42);
+        assert!(timer.update(&mut wheel).is_empty());
+        assert!(wheel.is_empty());
     }
 }

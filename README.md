@@ -11,7 +11,7 @@ rskynet 是一个受 [skynet](https://github.com/cloudwu/skynet) 启发、使用
 - 每个服务拥有独立地址和邮箱；同一服务在任意时刻只会由一条线程执行。
 - 共享服务运行在工作窃取线程池上，服务状态可使用 `SvcCell`，无需为普通访问加锁。
 - `request` / `reply` 通过 session 配对应答，调用方可直接 `.await`。
-- 一个服务内可用 `ctx.spawn` 并发执行多个任务，`ctx.sleep_ms`、RPC 回包和外部唤醒统一进入调度器。
+- 一个服务内可用 `ctx.spawn` 并发执行多个任务，`ctx.sleep`、RPC 回包和外部唤醒统一进入调度器。
 - 支持独占线程服务，适合定时器、日志和基于 `mio` 的网络轮询。
 - 可选 TCP/UDP、TLS、QUIC、HTTP/1.1、WebSocket、Dashboard 和 Protobuf 跨节点通信。
 - TOML 驱动启动流程；具名服务和集群 handler 可在链接期自动注册。
@@ -30,7 +30,7 @@ cargo run -p rskynet-examples -- config/examples/ping_pong.toml
 
 - `ctx.request(...).await` 的请求/应答；
 - `ctx.spawn(...)` 发起服务内并发任务；
-- `ctx.sleep_ms(...)` 通过时间轮休眠；
+- `ctx.sleep(...)` 通过时间轮休眠；
 - 服务主动退出与节点自动结束。
 
 其他示例：
@@ -148,7 +148,7 @@ let reply = ctx
 // 在当前服务内启动并发任务
 let task_ctx = ctx.clone();
 ctx.spawn(async move {
-    task_ctx.sleep_ms(100).await;
+    task_ctx.sleep(100).await;
     task_ctx.log("done");
 });
 ```

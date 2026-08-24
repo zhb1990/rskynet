@@ -90,7 +90,7 @@ impl Client {
                     if let Some(address) = *board.address.lock().unwrap() {
                         break address;
                     }
-                    task_ctx.sleep_ms(10).await;
+                    task_ctx.sleep(10).await;
                 };
                 let request = rskynet_http::websocket::ClientRequestBuilder::new(
                     format!("ws://{address}/socket").parse().unwrap(),

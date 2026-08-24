@@ -150,6 +150,7 @@ impl Ctx {
             ctx: &self.inner,
             session,
             finished: false,
+            cancel_timer: false,
         };
         // 先建 Call 再发送：发送失败或 send_raw 意外 panic 时，Call 的 Drop
         // 都会注销 session，不会在表里留下孤儿。
@@ -192,6 +193,7 @@ impl Ctx {
             ctx: &self.inner,
             session,
             finished: false,
+            cancel_timer: false,
         };
         // Call 在 f 之前建立：f panic 时 Drop 会注销 session。
         f(ReplyToken::new(
@@ -250,22 +252,18 @@ impl Ctx {
     ///
     /// 挂表交给注入的 [`crate::Timer`]，到期时它投一条 `RESPONSE` 回来。挂表本身
     /// 从节点建起来那一刻就可用，哪怕推刻度的那条线程还没上线。
-    pub async fn sleep(&self, millis: u32) {
+    pub async fn sleep(&self, millis: u64) {
         self.inner.assert_ownership();
         let session = self.inner.sessions.alloc();
         let call = Call {
             ctx: &self.inner,
             session,
             finished: false,
+            cancel_timer: millis != 0,
         };
         // Timer::timeout 由外部实现，panic 时同样不能留下孤儿 session。
         self.inner.node.timeout(self.handle(), millis, session);
         let _ = call.await;
-    }
-
-    /// 按毫秒挂起，超过 `u32` 可表达范围时饱和到最大值。
-    pub async fn sleep_ms(&self, millis: u64) {
-        self.sleep(millis.min(u32::MAX as u64) as u32).await;
     }
 
     /// 让出一次调度，对照 `skynet.yield`：把后面的活儿排到当前就绪队列尾部。
@@ -426,6 +424,8 @@ struct Call<'a> {
     ctx: &'a ServiceContext,
     session: u64,
     finished: bool,
+    /// 只有 `sleep` 需要在 Future 被丢弃时从时间轮摘表；RPC Call 不碰定时器。
+    cancel_timer: bool,
 }
 
 impl Future for Call<'_> {
@@ -451,6 +451,11 @@ impl Drop for Call<'_> {
             }
             self.ctx.assert_ownership();
             self.ctx.sessions.abandon(self.session);
+            // panic 清理路径只保证 session 不泄漏，不再调用可能由外部实现的 Timer，
+            // 避免 Timer::cancel 再次 panic 导致进程 abort。迟到回包会被 session 表丢弃。
+            if self.cancel_timer && !std::thread::panicking() {
+                self.ctx.node.cancel_timeout(self.ctx.handle, self.session);
+            }
         }
     }
 }
@@ -459,7 +464,70 @@ impl Drop for Call<'_> {
 mod tests {
     use super::*;
     use crate::server::tests::{dummy_context_on, test_node};
+    use crate::{Config, Registry, Timer};
     use futures_util::task::noop_waker;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct RecordingTimer {
+        armed: Mutex<Vec<(crate::Handle, u64, u64)>>,
+        cancelled: Mutex<Vec<(crate::Handle, u64)>>,
+    }
+
+    impl Timer for RecordingTimer {
+        fn timeout(&self, handle: crate::Handle, session: u64, delay_ms: u64) {
+            self.armed.lock().unwrap().push((handle, session, delay_ms));
+        }
+
+        fn cancel(&self, handle: crate::Handle, session: u64) {
+            self.cancelled.lock().unwrap().push((handle, session));
+        }
+
+        fn now(&self) -> u64 {
+            0
+        }
+
+        fn wall_clock(&self) -> u64 {
+            0
+        }
+
+        fn start_time(&self) -> u64 {
+            0
+        }
+    }
+
+    #[test]
+    fn dropping_sleep_cancels_the_full_u64_timer_but_dropping_call_does_not() {
+        let timer = Arc::new(RecordingTimer::default());
+        let node = crate::server::Node::new(&Config::default(), Registry::new(), timer.clone());
+        let service = node
+            .handles
+            .register_with(|handle| dummy_context_on(node.clone(), handle));
+        let ctx = Ctx::new(service.clone());
+        let delay = u32::MAX as u64 + 42;
+
+        service.with_ownership(|| {
+            let waker = noop_waker();
+            let mut task_cx = Context::from_waker(&waker);
+
+            let mut sleep = Box::pin(ctx.sleep(delay));
+            assert!(sleep.as_mut().poll(&mut task_cx).is_pending());
+            let (handle, session, recorded_delay) = timer.armed.lock().unwrap()[0];
+            assert_eq!(handle, service.handle);
+            assert_eq!(recorded_delay, delay, "u64 延迟不得截断");
+            drop(sleep);
+            assert_eq!(&*timer.cancelled.lock().unwrap(), &[(handle, session)]);
+
+            let mut call = Box::pin(ctx.call(service.handle, MsgType::USER, Payload::None));
+            assert!(call.as_mut().poll(&mut task_cx).is_pending());
+            drop(call);
+            assert_eq!(
+                timer.cancelled.lock().unwrap().len(),
+                1,
+                "普通 RPC Future 不应误取消定时器"
+            );
+        });
+    }
 
     /// `call` 只能发请求类型：RESPONSE / ERROR 会在收端直接命中 session 表，
     /// 不能带着新分配的 session 冒充业务请求。

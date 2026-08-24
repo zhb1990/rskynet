@@ -28,7 +28,7 @@ const REFRESH_ICON: &[u8] = include_bytes!("../assets/icons/refresh.svg");
 const SERVER_ICON: &[u8] = include_bytes!("../assets/icons/server.svg");
 const CACHE_CONTROL: &str = "no-store, no-cache, must-revalidate";
 const DEBUG_BODY_LIMIT: usize = 256 * 1024;
-const DEFAULT_DEBUG_CALL_TIMEOUT_MS: u32 = 10_000;
+const DEFAULT_DEBUG_CALL_TIMEOUT_MS: u64 = 10_000;
 
 /// `[dashboard]` 配置。监听地址必须显式提供。
 #[derive(Debug, Clone, Deserialize)]
@@ -37,7 +37,7 @@ pub struct DashboardConfig {
     #[serde(default)]
     pub debug_console: bool,
     #[serde(default = "default_debug_call_timeout_ms")]
-    pub debug_call_timeout_ms: u32,
+    pub debug_call_timeout_ms: u64,
 }
 
 impl DashboardConfig {
@@ -65,14 +65,14 @@ impl DashboardConfig {
     }
 }
 
-fn default_debug_call_timeout_ms() -> u32 {
+fn default_debug_call_timeout_ms() -> u64 {
     DEFAULT_DEBUG_CALL_TIMEOUT_MS
 }
 
 #[derive(Debug, Clone, Copy)]
 struct DebugConfig {
     enabled: bool,
-    call_timeout_ms: u32,
+    call_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -480,7 +480,7 @@ struct DebugInvocationResult {
 async fn invoke(
     ctx: &Ctx,
     invocation: DebugInvocation,
-    call_timeout_ms: u32,
+    call_timeout_ms: u64,
 ) -> std::result::Result<DebugInvocationResult, ApiError> {
     let handle = parse_handle(&invocation.target)?;
     let descriptor = ctx

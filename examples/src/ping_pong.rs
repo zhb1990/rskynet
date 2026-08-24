@@ -5,7 +5,7 @@ use rskynet::{Ctx, Message, Payload, Result, SvcCell};
 
 enum Ask {
     Ball(u64),
-    Delayed { millis: u32, tag: String },
+    Delayed { millis: u64, tag: String },
     Shutdown,
 }
 
@@ -115,7 +115,7 @@ impl Ping {
     }
 
     async fn concurrent_asks(&self, ctx: &Ctx) -> Result<()> {
-        let delays = [30u32, 10, 20];
+        let delays = [30u64, 10, 20];
         let done: Arc<SvcCell<Vec<String>>> = Arc::new(SvcCell::default());
         for millis in delays {
             let task_ctx = ctx.clone();

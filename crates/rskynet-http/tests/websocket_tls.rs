@@ -97,7 +97,7 @@ impl Client {
                     if let Some(address) = *board.address.lock().unwrap() {
                         break address;
                     }
-                    task_ctx.sleep_ms(10).await;
+                    task_ctx.sleep(10).await;
                 };
                 let request = ClientRequestBuilder::new(
                     format!("wss://localhost:{}/socket", address.port())

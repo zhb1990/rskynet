@@ -163,13 +163,8 @@ impl RemoteContext {
     }
 
     /// 挂起指定毫秒数，不阻塞其他 cluster 请求。
-    pub async fn sleep(&self, millis: u32) {
+    pub async fn sleep(&self, millis: u64) {
         self.ctx.sleep(millis).await;
-    }
-
-    /// 挂起指定毫秒数，不阻塞其他 cluster 请求。
-    pub async fn sleep_ms(&self, millis: u64) {
-        self.ctx.sleep_ms(millis).await;
     }
 
     /// 让出一次当前服务的调度。
@@ -646,7 +641,7 @@ impl Service for ClusterService {
                     let timeout = self.config.borrow().request_timeout_ms;
                     let wake = ctx.clone();
                     ctx.spawn(async move {
-                        wake.sleep_ms(timeout).await;
+                        wake.sleep(timeout).await;
                         let _ = wake.send(
                             wake.handle(),
                             MsgType::USER,
@@ -688,7 +683,7 @@ impl ClusterService {
     fn retry(ctx: &Ctx, node: NodeId, address: String) {
         let wake = ctx.clone();
         ctx.spawn(async move {
-            wake.sleep_ms(500).await;
+            wake.sleep(500).await;
             let _ = wake.send(
                 wake.handle(),
                 MsgType::USER,

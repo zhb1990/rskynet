@@ -773,7 +773,7 @@ impl NetService {
                     if let Some(deadline_ms) = deadline_ms {
                         let wake = ctx.clone();
                         ctx.spawn(async move {
-                            wake.sleep_ms(deadline_ms.saturating_sub(wake.now())).await;
+                            wake.sleep(deadline_ms.saturating_sub(wake.now())).await;
                             let _ = wake.send(
                                 NAME,
                                 MsgType::USER,
@@ -1177,7 +1177,7 @@ impl NetService {
                 if remaining == 0 {
                     return Err("域名解析超时".to_string());
                 }
-                match select(Box::pin(replied), Box::pin(ctx.sleep_ms(remaining))).await {
+                match select(Box::pin(replied), Box::pin(ctx.sleep(remaining))).await {
                     Either::Left((replied, _)) => replied,
                     Either::Right(((), _)) => return Err("域名解析超时".to_string()),
                 }

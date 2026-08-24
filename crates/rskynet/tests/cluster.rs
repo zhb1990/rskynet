@@ -55,7 +55,7 @@ impl Stopper {
         let task_ctx = ctx.clone();
         ctx.spawn(async move {
             while !done.load(SeqCst) {
-                task_ctx.sleep_ms(10).await;
+                task_ctx.sleep(10).await;
             }
             task_ctx.abort();
         });
@@ -88,7 +88,7 @@ impl ManualDriver {
                     break;
                 }
                 assert!(task_ctx.now() < deadline, "显式 cluster handler 未生效");
-                task_ctx.sleep_ms(25).await;
+                task_ctx.sleep(25).await;
             }
             done.store(true, SeqCst);
             task_ctx.abort();
@@ -122,7 +122,7 @@ impl Driver {
                     task_ctx.now() < deadline,
                     "cluster 节点未在 5 秒内建连并完成请求"
                 );
-                task_ctx.sleep_ms(25).await;
+                task_ctx.sleep(25).await;
             }
             assert!(
                 cluster::request::<Ping, WrongResponse>(&task_ctx, node2, Ping { value: 1 })

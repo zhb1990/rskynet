@@ -57,7 +57,7 @@ impl QuicExample {
                         rskynet::log!(task_ctx, "QUIC 回声成功");
                         return Ok(());
                     }
-                    task_ctx.sleep_ms(10).await;
+                    task_ctx.sleep(10).await;
                 }
                 Err(rskynet::Error::Service("QUIC 回声超时".into()))
             }

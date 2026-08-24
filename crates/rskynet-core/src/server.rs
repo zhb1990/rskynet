@@ -1208,12 +1208,16 @@ impl Node {
     ///
     /// 零延迟不必惊动时间来源：直接回包，语义上等价于「本刻度就到期」，
     /// 也让 `ctx.yield_now()` 这条最常走的路少绕一圈。
-    pub(crate) fn timeout(&self, handle: crate::Handle, delay_ms: u32, session: u64) {
+    pub(crate) fn timeout(&self, handle: crate::Handle, delay_ms: u64, session: u64) {
         if delay_ms == 0 {
             let _ = self.send_raw(0, handle, MsgType::RESPONSE, session, Payload::None);
         } else {
             self.timer.timeout(handle, session, delay_ms);
         }
+    }
+
+    pub(crate) fn cancel_timeout(&self, handle: crate::Handle, session: u64) {
+        self.timer.cancel(handle, session);
     }
 
     /// 写日志，对照 `skynet_error`：日志本身也是一条消息，发给 logger 服务。
@@ -1285,7 +1289,9 @@ pub(crate) mod tests {
     pub(crate) struct StubTimer;
 
     impl Timer for StubTimer {
-        fn timeout(&self, _handle: crate::Handle, _session: u64, _delay_ms: u32) {}
+        fn timeout(&self, _handle: crate::Handle, _session: u64, _delay_ms: u64) {}
+
+        fn cancel(&self, _handle: crate::Handle, _session: u64) {}
 
         fn now(&self) -> u64 {
             0

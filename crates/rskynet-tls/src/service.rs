@@ -973,7 +973,7 @@ impl TlsService {
             });
         let wake = ctx.clone();
         ctx.spawn(async move {
-            wake.sleep_ms(timeout).await;
+            wake.sleep(timeout).await;
             let _ = wake.send(
                 wake.handle(),
                 MsgType::USER,

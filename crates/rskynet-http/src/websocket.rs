@@ -394,7 +394,7 @@ impl SharedSocket {
                 self.on_closed(None);
                 break;
             }
-            ctx.sleep_ms(10).await;
+            ctx.sleep(10).await;
         }
         Ok(())
     }
@@ -709,7 +709,7 @@ impl WebSocketClient {
         let wake = ctx.clone();
         let timeout = self.core.config.handshake_timeout_ms;
         ctx.spawn(async move {
-            wake.sleep_ms(timeout).await;
+            wake.sleep(timeout).await;
             let waiter = {
                 let mut state = core.state.borrow_mut();
                 let Some(pending) = state.pending.get_mut(&transport) else {

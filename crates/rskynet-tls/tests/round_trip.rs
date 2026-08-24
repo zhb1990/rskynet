@@ -67,7 +67,7 @@ impl Client {
                     if let Some(address) = *board.address.lock().unwrap() {
                         break address;
                     }
-                    task_ctx.sleep_ms(10).await;
+                    task_ctx.sleep(10).await;
                 };
                 let id = rskynet_tls::connect(
                     &task_ctx,
@@ -81,7 +81,7 @@ impl Client {
                 rskynet_tls::pause(&task_ctx, id).await?;
                 let payload = large_payload();
                 rskynet_tls::send_wait(&task_ctx, id, payload.clone()).await?;
-                task_ctx.sleep_ms(50).await;
+                task_ctx.sleep(50).await;
                 *board.paused_was_silent.lock().unwrap() =
                     board.received.lock().unwrap().is_empty();
                 rskynet_tls::start(&task_ctx, id).await?;
@@ -89,7 +89,7 @@ impl Client {
                     if board.received.lock().unwrap().as_slice() == payload {
                         break;
                     }
-                    task_ctx.sleep_ms(10).await;
+                    task_ctx.sleep(10).await;
                 }
                 let _ = rskynet_tls::close(&task_ctx, id).await;
                 Ok(())

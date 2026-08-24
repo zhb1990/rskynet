@@ -87,7 +87,7 @@ impl Client {
                     if let Some(address) = *board.address.lock().unwrap() {
                         break address;
                     }
-                    task_ctx.sleep_ms(10).await;
+                    task_ctx.sleep(10).await;
                 };
                 let id = rskynet_quic::connect(
                     &task_ctx,
@@ -100,9 +100,9 @@ impl Client {
                     if *board.unauthorized_shutdown_sent.lock().unwrap() {
                         break;
                     }
-                    task_ctx.sleep_ms(10).await;
+                    task_ctx.sleep(10).await;
                 }
-                task_ctx.sleep_ms(20).await;
+                task_ctx.sleep(20).await;
                 let stream = rskynet_quic::open_bi(&task_ctx, id).await?;
                 rskynet_quic::send(&task_ctx, id, stream, vec![b'q'; PAYLOAD_LEN])?;
                 rskynet_quic::finish(&task_ctx, id, stream).await?;
@@ -113,7 +113,7 @@ impl Client {
                     {
                         break;
                     }
-                    task_ctx.sleep_ms(10).await;
+                    task_ctx.sleep(10).await;
                 }
                 let _ = rskynet_quic::close(&task_ctx, id, 0, Vec::new()).await;
                 Ok(())
@@ -156,7 +156,7 @@ impl UnauthorizedShutdown {
                 if let Some(id) = *board.client_connection.lock().unwrap() {
                     break id;
                 }
-                task.sleep_ms(10).await;
+                task.sleep(10).await;
             };
             rskynet_quic::shutdown(&task, id).expect("攻击服务应能投递 shutdown 命令");
             *board.unauthorized_shutdown_sent.lock().unwrap() = true;
@@ -323,7 +323,7 @@ impl ClosingClient {
                 if let Some(address) = *board.address.lock().unwrap() {
                     break address;
                 }
-                task.sleep_ms(10).await;
+                task.sleep(10).await;
             };
             let id = rskynet_quic::connect(
                 &task,
@@ -338,7 +338,7 @@ impl ClosingClient {
                 if *board.terminal_event.lock().unwrap() {
                     return;
                 }
-                task.sleep_ms(10).await;
+                task.sleep(10).await;
             }
             panic!("未 start 的服务端连接也必须收到终止事件");
         });
@@ -436,7 +436,7 @@ impl RejectedClient {
                 if let Some(address) = *board.address.lock().unwrap() {
                     break address;
                 }
-                task.sleep_ms(10).await;
+                task.sleep(10).await;
             };
             let result = rskynet_quic::connect(
                 &task,
@@ -444,7 +444,7 @@ impl RejectedClient {
             )
             .await;
             assert!(result.is_err(), "错误的根证书必须使握手失败");
-            task.sleep_ms(100).await;
+            task.sleep(100).await;
             assert_eq!(
                 *board.client_events.lock().unwrap(),
                 0,

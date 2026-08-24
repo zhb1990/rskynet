@@ -16,7 +16,13 @@ pub trait Timer: Send + Sync + 'static {
     /// 到期时由实现方给 `handle` 投一条 `RESPONSE`（`session` 与请求配对），
     /// 走 [`crate::NodeRef::send`] 那条路。`delay_ms` 为 0 的情形内核直接回包，
     /// 不会走到这里。
-    fn timeout(&self, handle: crate::Handle, session: u64, delay_ms: u32);
+    fn timeout(&self, handle: crate::Handle, session: u64, delay_ms: u64);
+
+    /// 取消由 `(handle, session)` 唯一标识的定时器。
+    ///
+    /// 取消必须幂等；定时器已经到期或从未挂上时应当静默忽略。实现可以异步处理
+    /// 取消请求，但一旦请求被处理，就不应再为该定时器投递应答。
+    fn cancel(&self, handle: crate::Handle, session: u64);
 
     /// 节点启动至今的毫秒数，对照 `skynet_now`。
     fn now(&self) -> u64;

@@ -179,7 +179,7 @@ impl Client {
                     if let Some(value) = *board.address.lock().unwrap() {
                         break value;
                     }
-                    ctx.sleep_ms(10).await;
+                    ctx.sleep(10).await;
                 };
                 for body in [b"first".to_vec(), b"second".to_vec()] {
                     let request = Request::post(format!("http://{address}/echo"))
@@ -289,7 +289,7 @@ impl Client {
                     .unwrap();
                 match select(
                     Box::pin(rskynet_http::client::start(&ctx, queued)),
-                    Box::pin(ctx.sleep_ms(20)),
+                    Box::pin(ctx.sleep(20)),
                 )
                 .await
                 {

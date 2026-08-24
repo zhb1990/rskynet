@@ -161,7 +161,7 @@ impl ClusterPong {
         let shutdown_ctx = ctx.clone();
         ctx.spawn(async move {
             // 等本地应答经 cluster 编码并进入 socket 写缓冲后再关闭节点。
-            shutdown_ctx.sleep_ms(100).await;
+            shutdown_ctx.sleep(100).await;
             shutdown_ctx.abort();
         });
         ShutdownResponse {}
@@ -199,7 +199,7 @@ impl ClusterPing {
                             Ok(pong) => break pong,
                             Err(err) if ctx.now() < deadline => {
                                 rskynet::log!(ctx, "等待 pong 节点就绪：{err}");
-                                ctx.sleep_ms(100).await;
+                                ctx.sleep(100).await;
                             }
                             Err(err) => {
                                 return Err(Error::service(format!("跨节点 ping 失败：{err}")));

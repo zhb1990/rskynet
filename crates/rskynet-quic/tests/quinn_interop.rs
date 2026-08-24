@@ -45,7 +45,7 @@ impl Echo {
                 {
                     let task_ctx = ctx.clone();
                     ctx.spawn(async move {
-                        task_ctx.sleep_ms(100).await;
+                        task_ctx.sleep(100).await;
                         task_ctx.abort();
                     });
                 }

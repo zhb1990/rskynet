@@ -591,7 +591,7 @@ impl ServerBodyHandle {
                 self.core.remove_connection(self.transport);
                 return Err(HttpError::Timeout("server body idle"));
             }
-            ctx.sleep_ms(10).await;
+            ctx.sleep(10).await;
         }
     }
 
@@ -1054,7 +1054,7 @@ impl ServerCore {
         let wake = ctx.clone();
         let timeout = self.config.header_timeout_ms;
         ctx.spawn(async move {
-            wake.sleep_ms(timeout).await;
+            wake.sleep(timeout).await;
             let waiting =
                 core.state
                     .borrow()

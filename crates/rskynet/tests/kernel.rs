@@ -48,7 +48,7 @@ impl SlowEcho {
     }
 
     async fn dispatch(&self, ctx: Ctx, mut msg: Message) {
-        let millis: u32 = msg
+        let millis: u64 = msg
             .take_payload()
             .as_str()
             .and_then(|s| s.parse().ok())

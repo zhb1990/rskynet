@@ -87,7 +87,7 @@ impl Client {
                     if let Some(value) = *board.address.lock().unwrap() {
                         break value;
                     }
-                    task_ctx.sleep_ms(10).await;
+                    task_ctx.sleep(10).await;
                 };
                 let request = Request::post(format!("https://localhost:{}/", address.port()))
                     .body(b"secure".to_vec())

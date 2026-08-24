@@ -438,7 +438,7 @@ impl QuicService {
         let node = ctx.node();
         let sleeper = ctx.clone();
         ctx.spawn(async move {
-            sleeper.sleep_ms(timeout_ms).await;
+            sleeper.sleep(timeout_ms).await;
             let _ = node.send(
                 service,
                 service,
@@ -1329,7 +1329,7 @@ impl QuicService {
             let node = ctx.node();
             let sleeper = ctx.clone();
             ctx.spawn(async move {
-                sleeper.sleep_ms(timer.delay_ms).await;
+                sleeper.sleep(timer.delay_ms).await;
                 let _ = node.send(
                     service,
                     service,

@@ -426,7 +426,7 @@ impl HttpClientService {
             let wake = ctx.clone();
             let timeout = self.config.borrow().continue_timeout_ms;
             ctx.spawn(async move {
-                wake.sleep_ms(timeout).await;
+                wake.sleep(timeout).await;
                 let _ = wake.send(
                     NAME,
                     MsgType::USER,
@@ -820,7 +820,7 @@ impl HttpClientService {
     fn arm_wait_timeout(&self, ctx: &Ctx, id: u64, session: u64, body: bool, timeout: u64) {
         let wake = ctx.clone();
         ctx.spawn(async move {
-            wake.sleep_ms(timeout).await;
+            wake.sleep(timeout).await;
             let _ = wake.send(
                 NAME,
                 MsgType::USER,
@@ -1169,7 +1169,7 @@ impl HttpClientService {
             drop(config);
             drop(state);
             ctx.spawn(async move {
-                wake.sleep_ms(timeout).await;
+                wake.sleep(timeout).await;
                 let _ = wake.send(
                     NAME,
                     MsgType::USER,
