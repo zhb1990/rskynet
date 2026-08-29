@@ -18,6 +18,13 @@ rskynet 是一个受 [skynet](https://github.com/cloudwu/skynet) 启发、使用
 - 可选的 service 内组合式插件，支持按 namespace 注册、Capability 直调和 typed EventBus。
 - 支持优雅关停、崩溃报告、服务运行统计和疑似死循环检测。
 
+### BWoS 来源
+
+线程池的本地运行队列采用 [BWoS 块式工作窃取队列](crates/rskynet-core/src/bwos.rs)，
+移植自 [stdexec](https://github.com/NVIDIA/stdexec) 的 `exec/detail/bwos_lifo_queue.hpp`。其原始论文是
+*BWoS: Formally Verified Block-based Work Stealing for Parallel Processing*
+（Wang et al. 2023）。
+
 ## 快速运行
 
 克隆仓库后，可直接运行内置示例：
