@@ -238,7 +238,7 @@
     .core-parts { display: grid; grid-template-columns: repeat(3,1fr); gap: 7px; align-content: center; }
     .core-parts span { padding: 9px; border: 1px solid rgba(255,255,255,.2); font: 10px/1.4 var(--mono); text-align: center; }
 
-    .bootline { display: grid; grid-template-columns: repeat(8, 1fr); position: relative; margin: 40px 0 10px; }
+    .bootline { display: grid; grid-template-columns: repeat(9, 1fr); position: relative; margin: 40px 0 10px; }
     .bootline::before { content: ""; position: absolute; left: 5%; right: 5%; top: 22px; height: 2px; background: var(--line); }
     .boot-step { position: relative; text-align: center; min-width: 0; }
     .boot-step::before { content: ""; position: relative; z-index: 1; display: block; width: 13px; height: 13px; margin: 16px auto 20px; background: var(--paper); border: 3px solid var(--navy); border-radius: 50%; }
@@ -361,7 +361,7 @@
     <div class="topbar-inner">
       <a class="brand" href="#top" aria-label="返回顶部"><span class="brand-mark" aria-hidden="true"></span>rskynet</a>
       <nav class="topnav" aria-label="章节导航">
-        <a href="#layers">层级</a><a href="#message">消息</a><a href="#scheduler">调度</a><a href="#modules">模块</a><a href="#types">类型</a>
+        <a href="#layers">层级</a><a href="#message">消息</a><a href="#extensions">扩展</a><a href="#scheduler">调度</a><a href="#modules">模块</a>
         <a class="repo-link" href="https://github.com/zhb1990/rskynet">GitHub ↗</a>
       </nav>
     </div>
@@ -373,7 +373,7 @@
         <div>
           <div class="kicker">Actor runtime anatomy</div>
           <h1>消息驱动<span>Rust 运行时</span></h1>
-          <p class="hero-copy">rskynet 保留 skynet 的服务、邮箱、地址与 session 模型，用 Rust Future 承载服务内异步流程。沿着一次消息投递，读懂从业务 API 到工作窃取调度器的完整路径。</p>
+          <p class="hero-copy">rskynet 保留 skynet 的服务、邮箱、地址与 session 模型，用 Rust Future 承载服务内异步流程，并向上组合插件、QUIC 与可调试的强类型消息。沿着一次消息投递，读懂从业务 API 到工作窃取调度器的完整路径。</p>
           <div class="hero-actions"><a class="button" href="#message">追踪一条消息</a><a class="button secondary" href="#modules">浏览 crate 地图</a></div>
           <div class="hero-note"><span>Rust 1.85+</span><span>Edition 2024</span><span>MIT</span></div>
         </div>
@@ -455,11 +455,11 @@
 
     <section class="section" id="layers">
       <div class="wrap">
-        <div class="section-head reveal"><div class="section-tag">System layers</div><h2>四层结构，一条统一的消息通道</h2><p class="section-intro">内核只解决 Actor 身份、邮箱、调度和生命周期。时间、日志、网络乃至跨节点能力都以服务形式接入，所以专用线程与普通业务 Actor 仍共享同一种地址和消息语义。</p></div>
+        <div class="section-head reveal"><div class="section-tag">System layers</div><h2>四层结构，一条统一的消息通道</h2><p class="section-intro">内核只解决 Actor 身份、邮箱、调度和生命周期。时间、日志、网络乃至 QUIC 与跨节点能力都以服务形式接入；service 内插件则复用宿主邮箱，所以扩展能力仍服从同一种串行执行与消息语义。</p></div>
         <div class="layer-stack reveal">
-          <article class="layer"><div class="layer-label"><b>业务层</b><span>YOUR SERVICES</span></div><div class="layer-body"><div class="module-pill"><b>#[service]</b><small>具名 Actor 与消息分发</small></div><div class="module-pill"><b>Ctx</b><small>post、request、spawn、sleep</small></div><div class="module-pill"><b>Payload</b><small>字节、文本或类型擦除对象</small></div></div></article>
-          <article class="layer"><div class="layer-label"><b>协议层</b><span>OPTIONAL SERVICES</span></div><div class="layer-body"><div class="module-pill"><b>HTTP / WebSocket</b><small>状态机、流式 body、升级</small></div><div class="module-pill"><b>TLS</b><small>rustls 明密文转换</small></div><div class="module-pill"><b>Cluster</b><small>Protobuf 跨节点路由</small></div><div class="module-pill"><b>Dashboard</b><small>节点与 socket 统计</small></div></div></article>
-          <article class="layer"><div class="layer-label"><b>设施层</b><span>EXCLUSIVE ACTORS</span></div><div class="layer-body"><div class="module-pill"><b>Net</b><small>mio Poll 与 TCP/UDP</small></div><div class="module-pill"><b>Timer</b><small>10 ms 分层时间轮</small></div><div class="module-pill"><b>Logger</b><small>独占线程顺序写入</small></div><div class="module-pill"><b>Signal</b><small>关停与崩溃报告</small></div></div></article>
+          <article class="layer"><div class="layer-label"><b>业务层</b><span>YOUR SERVICES</span></div><div class="layer-body"><div class="module-pill"><b>#[service] / #[msg]</b><small>具名 Actor、variant 分发与自动应答</small></div><div class="module-pill"><b>PluginHost</b><small>namespace、Capability、typed EventBus</small></div><div class="module-pill"><b>Ctx</b><small>post、request、spawn、sleep</small></div><div class="module-pill"><b>MessageSchema</b><small>从 Rust 类型生成调试描述</small></div></div></article>
+          <article class="layer"><div class="layer-label"><b>协议层</b><span>OPTIONAL SERVICES</span></div><div class="layer-body"><div class="module-pill"><b>HTTP / WebSocket</b><small>状态机、流式 body、升级</small></div><div class="module-pill"><b>TLS / QUIC</b><small>rustls 与 quinn-proto 传输</small></div><div class="module-pill"><b>Cluster</b><small>Protobuf 跨节点路由</small></div><div class="module-pill"><b>Dashboard</b><small>统计、消息 Schema 与在线调试</small></div></div></article>
+          <article class="layer"><div class="layer-label"><b>设施层</b><span>EXCLUSIVE ACTORS</span></div><div class="layer-body"><div class="module-pill"><b>Net</b><small>mio Poll 与 TCP/UDP</small></div><div class="module-pill"><b>Timer</b><small>u64 毫秒、分层时间轮与物理取消</small></div><div class="module-pill"><b>Logger</b><small>背压、按日期/大小滚动</small></div><div class="module-pill"><b>Signal</b><small>关停与崩溃报告</small></div></div></article>
           <article class="layer"><div class="layer-label"><b>内核层</b><span>RSKYNET-CORE</span></div><div class="layer-body"><div class="module-pill"><b>HandleStorage</b><small>单调递增服务身份</small></div><div class="module-pill"><b>Mailbox</b><small>消息与就绪任务</small></div><div class="module-pill"><b>Scheduler</b><small>工作窃取 worker 池</small></div><div class="module-pill"><b>TaskSet</b><small>Future 与 Waker</small></div><div class="module-pill"><b>SessionTable</b><small>请求/响应配对</small></div></div></article>
         </div>
       </div>
@@ -497,6 +497,27 @@
           <path class="edge-dash" d="M380 350 L135 350"/><text class="caption" x="258" y="341" text-anchor="middle">take(42) + wake</text>
           <rect x="92" y="368" width="66" height="34" fill="#168c88"/><text x="125" y="390" text-anchor="middle" font-size="10" fill="white">READY</text>
         </svg></div><div class="legend"><span>消息投递</span><span>Future 唤醒</span><span>跨节点封装</span></div></article>
+      </div>
+    </section>
+
+    <section class="section" id="extensions">
+      <div class="wrap">
+        <div class="section-head reveal"><div class="section-tag">Typed extensions</div><h2>消息可描述，service 也可继续拆分</h2><p class="section-intro">过程宏现在不只按协议号分发：同一 MsgType 可以继续按 enum variant 路由，并从 Rust 类型生成请求/响应 Schema。大型 service 则能在保留一个地址与邮箱的前提下，按 namespace 装配多个插件。</p></div>
+        <div class="flow-grid">
+          <article class="panel reveal"><div class="panel-head"><h3>强类型消息与 Dashboard</h3><p>compile time → runtime inspection</p></div><div class="panel-body"><ol class="flow-list">
+            <li><span class="flow-num">01</span><div><b>MessageSchema 派生结构</b><p><code>#[derive(MessageSchema)]</code> 直接读取字段，生成请求与响应描述，不依赖 Default 或手写样例。</p></div></li>
+            <li><span class="flow-num">02</span><div><b>按 enum variant 路由</b><p><code>#[msg(TYPE, variant = Command::Query)]</code> 让一个协议号承载多种强类型命令。</p></div></li>
+            <li><span class="flow-num">03</span><div><b>显式开放调试入口</b><p><code>#[debug]</code> 只把选中的 handler 注册到当前 service；默认不暴露在线调用。</p></div></li>
+            <li><span class="flow-num">04</span><div><b>受控 send / call</b><p>Dashboard 在 loopback 且 <code>debug_console = true</code> 时才允许提交 JSON，call 默认超时 10 秒。</p></div></li>
+          </ol></div></article>
+          <article class="panel reveal"><div class="panel-head"><h3>Service 内组合式插件</h3><p>one mailbox / multiple modules</p></div><div class="panel-body"><ol class="flow-list">
+            <li><span class="flow-num">01</span><div><b>链接期收集</b><p>插件描述符静态进入 inventory，并以 namespace + name 标识；配置决定每个 service 实例实际启用哪些插件。</p></div></li>
+            <li><span class="flow-num">02</span><div><b>依赖排序与独立实例</b><p><code>PluginHost</code> 校验依赖后装配；同一插件类型在不同宿主中拥有各自状态。</p></div></li>
+            <li><span class="flow-num">03</span><div><b>两种插件间通信</b><p>需要返回值时直调类型化 Capability；无需等待的通知经 typed EventBus 回到宿主邮箱。</p></div></li>
+            <li><span class="flow-num">04</span><div><b>复用 Actor 契约</b><p>命令包装为 <code>CommandEnvelope</code> 后由宿主 dispatch，插件不会获得第二个地址、邮箱或并发执行权。</p></div></li>
+          </ol></div></article>
+        </div>
+        <div class="rule-callout reveal"><strong>边界</strong><p>service 仍是调度、故障与状态隔离边界；plugin 是同一 service 内的代码与依赖组织边界。namespace 不是 service 地址、注册名或 TOML section 名，EventBus 也不会绕过邮箱的串行执行保证。</p></div>
       </div>
     </section>
 
@@ -565,24 +586,26 @@
 
     <section class="section" id="modules">
       <div class="wrap">
-        <div class="section-head reveal"><div class="section-tag">Workspace map</div><h2>12 个 crate，各自守住一条边界</h2><p class="section-intro">门面 crate 只做 feature 组合与启动编排。内核不依赖 mio、rustls 或系统时钟；可选能力通过 Registry 注册，与业务服务使用同一套接入方式。</p></div>
+        <div class="section-head reveal"><div class="section-tag">Workspace map</div><h2>14 个 library crate，各自守住一条边界</h2><p class="section-intro">门面 crate 只做 feature 组合与启动编排。内核不依赖 mio、rustls 或系统时钟；协议服务通过 Registry 接入，service 内插件通过 PluginHost 装配，边界与生命周期各自清晰。</p></div>
         <div class="crate-map reveal">
-          <article class="crate-card facade"><span class="eyebrow">Facade</span><h3>rskynet</h3><p>统一导出 API、过程宏与可选协议；按配置推导基础设施依赖并编排启动顺序。</p><div class="deps">features → macros · timer · net · tls · http · dashboard · cluster</div></article>
+          <article class="crate-card facade"><span class="eyebrow">Facade</span><h3>rskynet</h3><p>统一导出 API、过程宏与可选协议；按配置推导基础设施依赖并编排启动顺序。</p><div class="deps">features → macros · timer · net · tls · quic · http · dashboard · cluster · plugin</div></article>
           <article class="crate-card core"><div><span class="eyebrow" style="color:#ef9a6f">Kernel</span><h3>rskynet-core</h3><p>Actor 身份、邮箱、任务、调度、session、生命周期、配置。这里没有任何内置服务。</p></div><div class="core-parts"><span>server</span><span>context</span><span>message</span><span>mq</span><span>task</span><span>session</span><span>handle</span><span>monitor</span><span>exclusive</span></div></article>
-          <article class="crate-card third"><span class="eyebrow">Compile time</span><h3>rskynet-macros</h3><p>生成 Service / Exclusive 实现，按 MsgType 解析负载并自动应答。</p></article>
+          <article class="crate-card third"><span class="eyebrow">Compile time</span><h3>rskynet-macros</h3><p>生成 Service / Exclusive / Plugin 实现，支持 variant 路由、MessageSchema、调试描述与自动应答。</p></article>
           <article class="crate-card third"><span class="eyebrow">Startup</span><h3>rskynet-bootstrap</h3><p>按 TOML 清单逐个等待业务服务完成 init，随后自身退出。</p></article>
-          <article class="crate-card third"><span class="eyebrow">Observability</span><h3>logger · signal</h3><p>顺序日志、进程信号、优雅关停、panic hook 与 minidump。</p></article>
-          <article class="crate-card quarter"><span class="eyebrow">Time</span><h3>rskynet-timer</h3><p>10 ms 分层时间轮，实现内核 Timer 抽象。</p><div class="deps">independent</div></article>
+          <article class="crate-card third"><span class="eyebrow">Observability</span><h3>logger · signal</h3><p>日志背压与按日期/大小滚动、进程信号、优雅关停、panic hook 与 minidump。</p></article>
+          <article class="crate-card quarter"><span class="eyebrow">Time</span><h3>rskynet-timer</h3><p>u64 毫秒接口与 10 ms 分层时间轮；sleep Future 被取消时从轮中物理移除事件。</p><div class="deps">independent</div></article>
           <article class="crate-card quarter"><span class="eyebrow">I/O</span><h3>rskynet-net</h3><p>mio 驱动 TCP/UDP，独占线程轮询并向 Actor 投递 SocketEvent。</p><div class="deps">base transport</div></article>
           <article class="crate-card quarter"><span class="eyebrow">Security</span><h3>rskynet-tls</h3><p>rustls 状态机复用 net socket，对上层只暴露明文事件。</p><div class="deps">→ net</div></article>
+          <article class="crate-card quarter"><span class="eyebrow">Transport</span><h3>rskynet-quic</h3><p>直接驱动 quinn-proto sans-I/O 状态机，提供双/单向 stream 与可选 datagram。</p><div class="deps">→ net UDP</div></article>
           <article class="crate-card quarter"><span class="eyebrow">Protocol</span><h3>rskynet-http</h3><p>HTTP/1.1 客户端、嵌入式服务端、流式 body 与 WebSocket。</p><div class="deps">→ net · tls?</div></article>
+          <article class="crate-card quarter"><span class="eyebrow">Composition</span><h3>rskynet-plugin</h3><p>service 内插件的静态注册、依赖装配、Capability、typed EventBus 与命令路由。</p><div class="deps">feature → plugin</div></article>
           <article class="crate-card third"><span class="eyebrow">Remote actors</span><h3>rskynet-cluster</h3><p>Protobuf envelope、seed 连接、TYPE_ID 注册与远端请求/应答。</p><div class="deps">→ net · bootstrap</div></article>
-          <article class="crate-card third"><span class="eyebrow">Inspection</span><h3>rskynet-dashboard</h3><p>读取 NodeStats 与 socket 统计，通过内嵌 HTTP 页面展示。</p><div class="deps">→ http → net</div></article>
-          <article class="crate-card third"><span class="eyebrow">Examples</span><h3>rskynet-examples</h3><p>ping/pong、TCP echo、HTTP、WebSocket、cluster 与 dashboard。</p></article>
+          <article class="crate-card third"><span class="eyebrow">Inspection</span><h3>rskynet-dashboard</h3><p>展示 Node/socket 统计和消息 Schema，并可在受控 loopback 配置下在线 send/call。</p><div class="deps">→ http → net</div></article>
+          <article class="crate-card third"><span class="eyebrow">Examples</span><h3>rskynet-examples</h3><p>ping/pong、TCP echo、QUIC、HTTP、WebSocket、cluster、plugin 与 dashboard。</p></article>
         </div>
 
         <div class="panel reveal" style="margin-top:34px"><div class="panel-head"><h3>启动依赖顺序</h3><p>只启动配置实际需要的项</p></div><div class="panel-body"><div class="bootline">
-          <div class="boot-step"><b>logger</b><small>独占</small></div><div class="boot-step"><b>signal</b><small>独占</small></div><div class="boot-step"><b>timer</b><small>时间源</small></div><div class="boot-step optional"><b>net</b><small>可选基座</small></div><div class="boot-step optional"><b>tls</b><small>可选</small></div><div class="boot-step optional"><b>http-client</b><small>可选</small></div><div class="boot-step optional"><b>cluster / dashboard</b><small>可选</small></div><div class="boot-step"><b>bootstrap</b><small>业务清单</small></div>
+          <div class="boot-step"><b>logger</b><small>独占</small></div><div class="boot-step"><b>signal</b><small>独占</small></div><div class="boot-step"><b>timer</b><small>时间源</small></div><div class="boot-step optional"><b>net</b><small>可选基座</small></div><div class="boot-step optional"><b>tls</b><small>可选</small></div><div class="boot-step optional"><b>quic</b><small>可选 UDP</small></div><div class="boot-step optional"><b>http-client</b><small>可选</small></div><div class="boot-step optional"><b>cluster / dashboard</b><small>可选</small></div><div class="boot-step"><b>bootstrap</b><small>业务清单</small></div>
         </div></div></div>
       </div>
     </section>
@@ -606,9 +629,10 @@
 
     <section class="section" id="protocols">
       <div class="wrap">
-        <div class="section-head reveal"><div class="section-tag">I/O pipelines</div><h2>协议向上组合，事件向下归一</h2><p class="section-intro">网络线程只理解 socket；TLS 把密文转成明文事件；HTTP 维护协议状态机；Cluster 把远端消息包装成 Protobuf 帧。每层只持有自己需要的状态。</p></div>
+        <div class="section-head reveal"><div class="section-tag">I/O pipelines</div><h2>协议向上组合，事件向下归一</h2><p class="section-intro">网络线程只理解 socket；TLS 把密文转成明文事件；QUIC 在 UDP 之上驱动 quinn-proto；HTTP 维护协议状态机；Cluster 把远端消息包装成 Protobuf 帧。每层只持有自己需要的状态。</p></div>
         <div class="protocol-lanes reveal">
           <div class="lane"><div class="lane-name">TCP / UDP</div><div class="lane-cell"><b>业务 Command</b><small>connect / listen / send</small></div><div class="lane-cell"><b>NetService</b><small>socket slab</small></div><div class="lane-cell"><b>mio::Poll</b><small>独占线程</small></div><div class="lane-cell"><b>SocketEvent</b><small>data / close / error</small></div><div class="lane-cell"><b>目标 Actor</b><small>MsgType::SOCKET</small></div></div>
+          <div class="lane"><div class="lane-name">QUIC</div><div class="lane-cell"><b>stream / datagram</b><small>open · send · finish</small></div><div class="lane-cell"><b>QuicService</b><small>连接与 stream 状态</small></div><div class="lane-cell"><b>quinn-proto</b><small>sans-I/O QUIC</small></div><div class="lane-cell"><b>NetService</b><small>UDP reactor</small></div><div class="lane-cell"><b>QuicEvent</b><small>业务 Actor</small></div></div>
           <div class="lane"><div class="lane-name">HTTPS</div><div class="lane-cell"><b>HTTP Request</b><small>BodySpec</small></div><div class="lane-cell"><b>ureq-proto</b><small>HTTP/1.1 状态机</small></div><div class="lane-cell"><b>TlsService</b><small>rustls records</small></div><div class="lane-cell"><b>NetService</b><small>TCP bytes</small></div><div class="lane-cell"><b>IncomingBody</b><small>流式消费</small></div></div>
           <div class="lane"><div class="lane-name">WebSocket</div><div class="lane-cell"><b>HTTP Upgrade</b><small>handshake</small></div><div class="lane-cell"><b>WebSocket</b><small>frame codec</small></div><div class="lane-cell"><b>TLS?</b><small>可选传输</small></div><div class="lane-cell"><b>NetService</b><small>backpressure</small></div><div class="lane-cell"><b>Sender / Stream</b><small>业务收发</small></div></div>
           <div class="lane"><div class="lane-name">Cluster</div><div class="lane-cell"><b>ClusterMessage</b><small>TYPE_ID</small></div><div class="lane-cell"><b>Envelope</b><small>request_id + target</small></div><div class="lane-cell"><b>length frame</b><small>上限 8 MiB</small></div><div class="lane-cell"><b>NetService</b><small>seed TCP</small></div><div class="lane-cell"><b>RemoteContext</b><small>handler Future</small></div></div>
@@ -618,7 +642,7 @@
 
     <section class="section" id="start">
       <div class="wrap">
-        <div class="section-head reveal"><div class="section-tag">From config to actor</div><h2>配置声明“要什么”，门面推导“先起什么”</h2><p class="section-intro">标准入口先安装崩溃处理器，再读取唯一的 TOML 路径，通过 inventory 收集链接进二进制的具名服务。未知顶层键会直接报错，扩展配置必须放在各自 section 中。</p></div>
+        <div class="section-head reveal"><div class="section-tag">From config to actor</div><h2>配置声明“要什么”，门面推导“先起什么”</h2><p class="section-intro">标准入口先安装崩溃处理器，再读取唯一的 TOML 路径，通过 inventory 收集链接进二进制的具名服务。未知顶层键会直接报错，扩展配置必须放在各自 section 中；例如 [quic] 会自动拉起底层 net。</p></div>
         <div class="code-grid reveal">
           <div class="code-panel"><div class="code-title"><span>config/examples/ping_pong.toml</span><span>TOML</span></div><pre><span class="cm"># 共享 worker 数；必须大于 0</span>
 thread = 4
@@ -633,7 +657,7 @@ services = [
 <span class="cm"># 出现此 section 才会启动网络层</span>
 [net]
 event_capacity = 1024</pre></div>
-          <div class="config-explain"><div class="config-row"><b>1 / crash::install()</b><p>覆盖启动、运行与关停阶段；内核遵循 fail-fast，不恢复 panic。</p></div><div class="config-row"><b>2 / Registry::from_auto()</b><p>过程宏把构造函数提交到链接期 inventory，重复名字在启动前失败。</p></div><div class="config-row"><b>3 / Builder::with_builtins()</b><p>按 feature 注册内置服务，并注入 Timer 实现。</p></div><div class="config-row"><b>4 / dependency expansion</b><p>例如 dashboard 自动要求 http 与 net；https 自动要求 http、tls 与 net。</p></div><div class="config-row"><b>5 / bootstrap manifest</b><p>业务服务严格按清单顺序等待 init 完成，便于建立具名依赖。</p></div></div>
+          <div class="config-explain"><div class="config-row"><b>1 / crash::install()</b><p>覆盖启动、运行与关停阶段；内核遵循 fail-fast，不恢复 panic。</p></div><div class="config-row"><b>2 / Registry::from_auto()</b><p>过程宏把构造函数提交到链接期 inventory，重复名字在启动前失败。</p></div><div class="config-row"><b>3 / Builder::with_builtins()</b><p>按 feature 注册内置服务，并注入支持 u64 毫秒与取消的 Timer 实现。</p></div><div class="config-row"><b>4 / dependency expansion</b><p>quic 自动要求 net；dashboard 要求 http 与 net；https 要求 http、tls 与 net。</p></div><div class="config-row"><b>5 / bootstrap manifest</b><p>基础设施按 net → tls → quic → http-client → cluster → dashboard 展开，业务服务再严格按清单顺序 init。</p></div></div>
         </div>
       </div>
     </section>

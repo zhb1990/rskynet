@@ -16,6 +16,7 @@ plugins = [
     { name = "command" },
     { name = "audit" },
     { name = "counter" },
+    { name = "lua", config = { script = "examples/plugin_async.lua" } },
 ]
 
 [bootstrap]

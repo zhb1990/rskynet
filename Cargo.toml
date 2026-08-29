@@ -41,6 +41,7 @@ minidump-processor = "=0.25.0"
 minidump-unwind = { version = "=0.25.0", features = ["debuginfo-unwind"] }
 minidumper = "0.9"
 mio = { version = "1", features = ["os-poll", "net"] }
+mlua = { version = "0.11.6", features = ["lua55", "vendored", "async", "send"] }
 parking_lot = "0.12"
 prost = "0.14"
 bytes = "1"

@@ -10,6 +10,8 @@ publish = false
 
 [dependencies]
 rskynet = { path = "../crates/rskynet", features = ["cluster", "dashboard", "websocket", "quic", "plugin"] }
+mlua = { workspace = true }
 prost = { workspace = true }
 serde = { workspace = true }
+toml = { workspace = true }
 rcgen = "0.14"

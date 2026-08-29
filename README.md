@@ -42,7 +42,7 @@ cargo run -p rskynet-examples -- config/examples/ping_pong.toml
 | HTTP | `cargo run -p rskynet-examples -- config/examples/http.toml` | 在随机本地端口完成一次 HTTP POST 回显后退出 |
 | WebSocket | `cargo run -p rskynet-examples -- config/examples/websocket.toml` | 完成一次 WebSocket 文本回显后退出 |
 | Dashboard | `cargo run -p rskynet-examples -- config/examples/dashboard.toml` | 在 `http://127.0.0.1:8080/` 展示节点状态 |
-| Service 插件 | `cargo run -p rskynet-examples -- config/examples/plugin.toml` | 演示插件注册、Capability 调用和 EventBus 广播 |
+| Service 插件 | `cargo run -p rskynet-examples -- config/examples/plugin.toml` | 演示插件注册、Capability、EventBus，以及 mlua 5.5 异步调用 |
 
 TCP echo 和 Dashboard 会持续运行，可按 `Ctrl+C` 关停。
 
@@ -270,6 +270,11 @@ serde 反序列化/序列化以及 `MessageSchema`，对象负载仍需声明 `b
 ```bash
 cargo run -p rskynet-examples -- config/examples/plugin.toml
 ```
+
+这个示例还启用了一个 mlua 5.5 插件：Rust 插件 handler 使用 `call_async` 进入
+Lua coroutine，Lua 再调用 Rust 注册的异步 `rskynet_sleep`。休眠期间当前 worker
+可以继续调度其他任务，定时器唤醒后 Lua 从调用点恢复并把结果返回 Rust。脚本路径由
+插件配置的 `config.script` 指定，示例脚本为 `examples/plugin_async.lua`。
 
 ## 配置与启动顺序
 
